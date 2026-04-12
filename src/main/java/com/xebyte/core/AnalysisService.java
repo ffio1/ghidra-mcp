@@ -4439,7 +4439,7 @@ public class AnalysisService {
                          + "set_function_prototype individually for each function.",
              category = "analysis")
     public Response bulkFixReturnTypes(
-            @Param(value = "fixes", source = ParamSource.BODY,
+            @Param(value = "fixes",
                    description = "JSON array of objects: [{\"address\":\"00401000\",\"return_type\":\"int *\"}, ...]") String fixesJson,
             @Param(value = "program", defaultValue = "") String programName) {
 
