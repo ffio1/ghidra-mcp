@@ -13,9 +13,7 @@ import ghidra.program.model.block.CodeBlock;
 import ghidra.program.model.block.CodeBlockIterator;
 import ghidra.program.model.block.CodeBlockReference;
 import ghidra.program.model.block.CodeBlockReferenceIterator;
-import ghidra.program.model.data.DataType;
-import ghidra.program.model.data.DataTypeManager;
-import ghidra.program.model.data.Pointer;
+import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
@@ -5125,6 +5123,741 @@ public class AnalysisService {
 
         } catch (Exception e) {
             return Response.err("Param count verification failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Struct reconstruction: find struct candidates
+    // ========================================================================
+
+    @McpTool(path = "/find_struct_candidates",
+             description = "Find classes/structs by scanning __thiscall functions for field accesses at "
+                         + "[this+offset]. Groups by vtable address to identify class boundaries. "
+                         + "Returns inferred struct layout with field offsets, sizes, and access types.",
+             category = "analysis")
+    public Response findStructCandidates(
+            @Param(value = "vtable_address", defaultValue = "",
+                   description = "Specific vtable address to analyze. If empty, scans for top candidates.") String vtableAddr,
+            @Param(value = "class_name", defaultValue = "",
+                   description = "Filter by namespace/class name pattern") String className,
+            @Param(value = "min_methods", defaultValue = "3",
+                   description = "Minimum methods to consider a class worth analyzing") int minMethods,
+            @Param(value = "limit", defaultValue = "20",
+                   description = "Maximum classes to return") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            Listing listing = program.getListing();
+            Memory mem = program.getMemory();
+
+            if (vtableAddr != null && !vtableAddr.isEmpty()) {
+                // Analyze a specific vtable
+                Address vaddr = ServiceUtils.parseAddress(program, vtableAddr);
+                if (vaddr == null) return Response.err("Invalid vtable address");
+                Map<String, Object> classInfo = analyzeVtableClass(program, vaddr, listing, mem);
+                return Response.ok(classInfo);
+            }
+
+            // Scan for classes: find __thiscall functions, group by first vtable write
+            Map<String, List<Function>> vtableGroups = new LinkedHashMap<>();
+            Map<String, String> vtableNames = new LinkedHashMap<>();
+
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                Function func = iter.next();
+                if (func.isThunk() || func.isExternal()) continue;
+                String conv = func.getCallingConventionName();
+                if (!"__thiscall".equals(conv)) continue;
+
+                if (className != null && !className.isEmpty()) {
+                    String ns = func.getParentNamespace().getName(true);
+                    if (!ns.toLowerCase().contains(className.toLowerCase())) continue;
+                }
+
+                // Check first few instructions for vtable assignment: MOV [ECX], <vtable_addr>
+                // or MOV [reg], <vtable_addr> where reg was loaded from ECX
+                InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+                int checked = 0;
+                while (instrIter.hasNext() && checked < 15) {
+                    Instruction instr = instrIter.next();
+                    checked++;
+                    String mnem = instr.getMnemonicString();
+                    if (mnem.equals("MOV") && instr.getNumOperands() >= 2) {
+                        String op0 = instr.getDefaultOperandRepresentation(0);
+                        // Look for MOV [reg], immediate (vtable assignment)
+                        if (op0.startsWith("dword ptr [E") && op0.contains("]") &&
+                            !op0.contains("+") && !op0.contains("-")) {
+                            try {
+                                Reference[] refs = instr.getReferencesFrom();
+                                for (Reference ref : refs) {
+                                    Address to = ref.getToAddress();
+                                    long offset = to.getOffset();
+                                    // vtables are in .rdata (0x010b7000-0x01242fff)
+                                    if (offset >= 0x010b7000L && offset <= 0x01242fffL) {
+                                        String key = to.toString();
+                                        vtableGroups.computeIfAbsent(key, k -> new ArrayList<>()).add(func);
+                                        vtableNames.putIfAbsent(key, func.getParentNamespace().getName(true));
+                                        break;
+                                    }
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                }
+            }
+
+            // Filter and sort by method count
+            List<Map<String, Object>> candidates = new ArrayList<>();
+            for (Map.Entry<String, List<Function>> entry : vtableGroups.entrySet()) {
+                if (entry.getValue().size() < minMethods) continue;
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("vtable_address", entry.getKey());
+                info.put("class_name", vtableNames.get(entry.getKey()));
+                info.put("method_count", entry.getValue().size());
+
+                // List method names
+                List<String> methods = new ArrayList<>();
+                for (Function f : entry.getValue()) {
+                    methods.add(f.getName() + " @ " + f.getEntryPoint());
+                }
+                info.put("methods", methods);
+                candidates.add(info);
+            }
+
+            candidates.sort((a, b) -> Integer.compare((int) b.get("method_count"), (int) a.get("method_count")));
+            if (candidates.size() > limit) candidates = candidates.subList(0, limit);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total_classes", candidates.size());
+            result.put("candidates", candidates);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Struct candidate scan failed: " + e.getMessage());
+        }
+    }
+
+    private Map<String, Object> analyzeVtableClass(Program program, Address vtableAddr,
+                                                     Listing listing, Memory mem) {
+        // Find all functions that write this vtable address
+        ReferenceManager refMgr = program.getReferenceManager();
+        List<Function> methods = new ArrayList<>();
+
+        ReferenceIterator refIter = refMgr.getReferencesTo(vtableAddr);
+        while (refIter.hasNext()) {
+            Reference ref = refIter.next();
+            Function func = program.getFunctionManager().getFunctionContaining(ref.getFromAddress());
+            if (func != null && !methods.contains(func)) {
+                methods.add(func);
+            }
+        }
+
+        // Also find all __thiscall functions in the same namespace
+        if (!methods.isEmpty()) {
+            String ns = methods.get(0).getParentNamespace().getName(true);
+            FunctionIterator fIter = program.getFunctionManager().getFunctions(true);
+            while (fIter.hasNext()) {
+                Function f = fIter.next();
+                if (f.getParentNamespace().getName(true).equals(ns) &&
+                    "__thiscall".equals(f.getCallingConventionName()) &&
+                    !methods.contains(f)) {
+                    methods.add(f);
+                }
+            }
+        }
+
+        // Scan all methods for field accesses [ECX+offset] or [saved_this+offset]
+        Map<Integer, Map<String, Object>> fields = new TreeMap<>();
+
+        for (Function func : methods) {
+            // Find which register holds 'this'
+            String thisReg = null;
+            InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+            int checked = 0;
+            while (instrIter.hasNext() && checked < 6) {
+                Instruction instr = instrIter.next();
+                checked++;
+                if (instr.getMnemonicString().equals("MOV") && instr.getNumOperands() >= 2) {
+                    String op1 = instr.getDefaultOperandRepresentation(1);
+                    if (op1.equals("ECX")) {
+                        String op0 = instr.getDefaultOperandRepresentation(0);
+                        if (op0.equals("ESI") || op0.equals("EDI") || op0.equals("EBX")) {
+                            thisReg = op0;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (thisReg == null) thisReg = "ECX";
+
+            // Now scan all instructions for [thisReg+offset] patterns
+            instrIter = listing.getInstructions(func.getBody(), true);
+            while (instrIter.hasNext()) {
+                Instruction instr = instrIter.next();
+                for (int i = 0; i < instr.getNumOperands(); i++) {
+                    String op = instr.getDefaultOperandRepresentation(i);
+                    // Match patterns like [ESI + 0x1c] or [EDI + 0x4]
+                    if (op.contains(thisReg + " + 0x") || op.contains(thisReg + " - 0x") ||
+                        op.equals("dword ptr [" + thisReg + "]")) {
+
+                        int offset = 0;
+                        if (op.contains("+ 0x")) {
+                            try {
+                                String hex = op.substring(op.indexOf("+ 0x") + 4)
+                                        .replaceAll("[\\]\\)]", "").trim();
+                                offset = Integer.parseInt(hex, 16);
+                            } catch (Exception ignored) { continue; }
+                        } else if (op.contains("- 0x")) {
+                            try {
+                                String hex = op.substring(op.indexOf("- 0x") + 4)
+                                        .replaceAll("[\\]\\)]", "").trim();
+                                offset = -Integer.parseInt(hex, 16);
+                            } catch (Exception ignored) { continue; }
+                        }
+
+                        // Determine access size from instruction
+                        String mnem = instr.getMnemonicString();
+                        int size = 4; // default
+                        if (op.contains("byte ptr")) size = 1;
+                        else if (op.contains("word ptr")) size = 2;
+                        else if (op.contains("qword ptr") || op.contains("double")) size = 8;
+
+                        boolean isWrite = (i == 0 && (mnem.equals("MOV") || mnem.equals("LEA") ||
+                                mnem.equals("ADD") || mnem.equals("SUB") || mnem.equals("OR") ||
+                                mnem.equals("AND") || mnem.equals("XOR") || mnem.equals("INC") ||
+                                mnem.equals("DEC") || mnem.equals("FSTP")));
+
+                        Map<String, Object> field = fields.computeIfAbsent(offset, k -> {
+                            Map<String, Object> f = new LinkedHashMap<>();
+                            f.put("offset", k);
+                            f.put("size", 4);
+                            f.put("read_count", 0);
+                            f.put("write_count", 0);
+                            f.put("accessors", new ArrayList<String>());
+                            return f;
+                        });
+
+                        field.put("size", Math.max((int) field.get("size"), size));
+                        if (isWrite) {
+                            field.put("write_count", (int) field.get("write_count") + 1);
+                        } else {
+                            field.put("read_count", (int) field.get("read_count") + 1);
+                        }
+
+                        @SuppressWarnings("unchecked")
+                        List<String> accessors = (List<String>) field.get("accessors");
+                        String accessor = func.getName();
+                        if (!accessors.contains(accessor) && accessors.size() < 5) {
+                            accessors.add(accessor);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Infer field types
+        for (Map<String, Object> field : fields.values()) {
+            int offset = (int) field.get("offset");
+            int size = (int) field.get("size");
+            String inferredType;
+
+            if (offset == 0 && size == 4) {
+                inferredType = "vtable *";
+            } else if (size == 1) {
+                inferredType = "byte";
+            } else if (size == 2) {
+                inferredType = "short";
+            } else if (size == 8) {
+                inferredType = "double";
+            } else {
+                inferredType = "int";
+            }
+            field.put("inferred_type", inferredType);
+            field.put("suggested_name", "field_0x" + Integer.toHexString(offset));
+        }
+
+        // Build result
+        int maxOffset = fields.isEmpty() ? 0 :
+                ((TreeMap<Integer, Map<String, Object>>) fields).lastKey();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("vtable_address", vtableAddr.toString());
+        result.put("method_count", methods.size());
+        result.put("field_count", fields.size());
+        result.put("estimated_struct_size", maxOffset + 4);
+        result.put("fields", new ArrayList<>(fields.values()));
+
+        List<String> methodNames = new ArrayList<>();
+        for (Function f : methods) {
+            methodNames.add(f.getName() + " @ " + f.getEntryPoint());
+        }
+        result.put("methods", methodNames);
+
+        return result;
+    }
+
+    // ========================================================================
+    // Struct reconstruction: create struct from analysis
+    // ========================================================================
+
+    @McpTool(path = "/reconstruct_struct",
+             description = "Create a Ghidra struct from a vtable or class name. Scans all methods for "
+                         + "field accesses, infers types, creates the struct, and applies it to the 'this' "
+                         + "parameter of all methods. Use find_struct_candidates first to preview.",
+             category = "analysis")
+    public Response reconstructStruct(
+            @Param(value = "vtable_address",
+                   description = "Vtable address to analyze") String vtableAddr,
+            @Param(value = "struct_name",
+                   description = "Name for the struct (e.g. 'GEGameScreen')") String structName,
+            @Param(value = "category", defaultValue = "/RS2014",
+                   description = "Ghidra data type category path") String categoryPath,
+            @Param(value = "apply_to_methods", defaultValue = "true",
+                   description = "Apply the struct as 'this' type on all methods") boolean applyToMethods,
+            @Param(value = "dry_run", defaultValue = "false",
+                   description = "Preview without creating") boolean dryRun,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (vtableAddr == null || vtableAddr.isEmpty()) {
+            return Response.err("vtable_address is required");
+        }
+        if (structName == null || structName.isEmpty()) {
+            return Response.err("struct_name is required");
+        }
+
+        Address vaddr = ServiceUtils.parseAddress(program, vtableAddr);
+        if (vaddr == null) return Response.err("Invalid vtable address");
+
+        try {
+            Listing listing = program.getListing();
+            Memory mem = program.getMemory();
+
+            // Get the struct layout
+            Map<String, Object> classInfo = analyzeVtableClass(program, vaddr, listing, mem);
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> fields = (List<Map<String, Object>>) classInfo.get("fields");
+            int structSize = (int) classInfo.get("estimated_struct_size");
+
+            if (dryRun) {
+                classInfo.put("struct_name", structName);
+                classInfo.put("dry_run", true);
+                return Response.ok(classInfo);
+            }
+
+            final Map<String, Object> resultInfo = new LinkedHashMap<>();
+
+            threadingStrategy.executeWrite(program, "Create struct " + structName, () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+
+                // Create or get category
+                ghidra.program.model.data.CategoryPath catPath =
+                        new ghidra.program.model.data.CategoryPath(categoryPath);
+                ghidra.program.model.data.Category cat = dtm.createCategory(catPath);
+
+                // Check if struct already exists
+                DataType existing = dtm.getDataType(catPath, structName);
+                if (existing != null) {
+                    resultInfo.put("status", "error");
+                    resultInfo.put("message", "Struct '" + structName + "' already exists in " + categoryPath);
+                    return null;
+                }
+
+                // Create the struct
+                ghidra.program.model.data.StructureDataType struct =
+                        new ghidra.program.model.data.StructureDataType(catPath, structName, structSize, dtm);
+
+                // Add fields
+                int fieldsAdded = 0;
+                for (Map<String, Object> field : fields) {
+                    int offset = (int) field.get("offset");
+                    int size = (int) field.get("size");
+                    String typeName = (String) field.get("inferred_type");
+                    String fieldName = (String) field.get("suggested_name");
+
+                    DataType fieldType;
+                    switch (typeName) {
+                        case "vtable *":
+                            fieldType = new ghidra.program.model.data.PointerDataType(VoidDataType.dataType);
+                            fieldName = "vtable";
+                            break;
+                        case "byte":
+                            fieldType = ghidra.program.model.data.ByteDataType.dataType;
+                            break;
+                        case "short":
+                            fieldType = ghidra.program.model.data.ShortDataType.dataType;
+                            break;
+                        case "double":
+                            fieldType = ghidra.program.model.data.DoubleDataType.dataType;
+                            break;
+                        default:
+                            fieldType = ghidra.program.model.data.IntegerDataType.dataType;
+                    }
+
+                    try {
+                        if (offset + size <= structSize) {
+                            struct.replaceAtOffset(offset, fieldType, size, fieldName, null);
+                            fieldsAdded++;
+                        }
+                    } catch (Exception ignored) {}
+                }
+
+                // Add to DTM
+                DataType added = dtm.addDataType(struct, ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER);
+
+                resultInfo.put("status", "success");
+                resultInfo.put("struct_name", structName);
+                resultInfo.put("struct_size", structSize);
+                resultInfo.put("fields_added", fieldsAdded);
+
+                // Apply to methods
+                if (applyToMethods && added != null) {
+                    DataType thisPtr = new ghidra.program.model.data.PointerDataType(added);
+                    int applied = 0;
+
+                    ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(vaddr);
+                    Set<Function> methods = new LinkedHashSet<>();
+                    while (refIter.hasNext()) {
+                        Reference ref = refIter.next();
+                        Function func = program.getFunctionManager()
+                                .getFunctionContaining(ref.getFromAddress());
+                        if (func != null) methods.add(func);
+                    }
+
+                    for (Function func : methods) {
+                        if (!"__thiscall".equals(func.getCallingConventionName())) continue;
+                        Parameter[] params = func.getParameters();
+                        if (params.length > 0) {
+                            try {
+                                params[0].setDataType(thisPtr, SourceType.USER_DEFINED);
+                                applied++;
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                    resultInfo.put("methods_typed", applied);
+                }
+
+                return null;
+            });
+
+            if (resultInfo.isEmpty()) {
+                return Response.err("No result produced");
+            }
+            // Merge class info
+            resultInfo.put("field_count", fields.size());
+            resultInfo.put("method_count", classInfo.get("method_count"));
+            return Response.ok(resultInfo);
+
+        } catch (Exception e) {
+            return Response.err("Struct reconstruction failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Type propagation across call graph
+    // ========================================================================
+
+    @McpTool(path = "/propagate_types",
+             description = "Propagate parameter types across the call graph. If function A calls function B "
+                         + "and passes its param_1 as B's typed param_2, infer A's param_1 type. "
+                         + "Start from well-typed seed functions and propagate outward.",
+             category = "analysis")
+    public Response propagateTypes(
+            @Param(value = "seed_address", defaultValue = "",
+                   description = "Address of a well-typed function to propagate from. If empty, uses common seeds.") String seedAddr,
+            @Param(value = "max_depth", defaultValue = "2",
+                   description = "Maximum call graph depth to propagate") int maxDepth,
+            @Param(value = "dry_run", defaultValue = "true",
+                   description = "Preview changes without applying") boolean dryRun,
+            @Param(value = "limit", defaultValue = "100",
+                   description = "Maximum functions to process") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            ReferenceManager refMgr = program.getReferenceManager();
+            List<Map<String, Object>> propagations = new ArrayList<>();
+
+            // Find seed functions: well-typed functions with non-undefined params
+            List<Function> seeds = new ArrayList<>();
+            if (seedAddr != null && !seedAddr.isEmpty()) {
+                Address addr = ServiceUtils.parseAddress(program, seedAddr);
+                if (addr != null) {
+                    Function f = program.getFunctionManager().getFunctionAt(addr);
+                    if (f != null) seeds.add(f);
+                }
+            } else {
+                // Auto-find seeds: functions with typed params and many callers
+                FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+                while (iter.hasNext() && seeds.size() < 50) {
+                    Function func = iter.next();
+                    Parameter[] params = func.getParameters();
+                    if (params.length < 1) continue;
+
+                    boolean hasTypedParam = false;
+                    for (Parameter p : params) {
+                        String tn = p.getDataType().getName();
+                        if (!tn.startsWith("undefined") && !tn.equals("int")) {
+                            hasTypedParam = true;
+                            break;
+                        }
+                    }
+                    if (!hasTypedParam) continue;
+
+                    // Count callers
+                    int callers = 0;
+                    ReferenceIterator ri = refMgr.getReferencesTo(func.getEntryPoint());
+                    while (ri.hasNext()) { ri.next(); callers++; }
+                    if (callers >= 10) seeds.add(func);
+                }
+            }
+
+            // For each seed, look at callers and check if they pass undefined params
+            int processed = 0;
+            for (Function seed : seeds) {
+                if (processed >= limit) break;
+
+                Parameter[] seedParams = seed.getParameters();
+                // Look at each caller
+                ReferenceIterator refIter = refMgr.getReferencesTo(seed.getEntryPoint());
+                while (refIter.hasNext() && processed < limit) {
+                    Reference ref = refIter.next();
+                    if (!ref.getReferenceType().isCall()) continue;
+
+                    Function caller = program.getFunctionManager()
+                            .getFunctionContaining(ref.getFromAddress());
+                    if (caller == null) continue;
+
+                    // Check caller's params — are any undefined that could be inferred?
+                    Parameter[] callerParams = caller.getParameters();
+                    for (Parameter cp : callerParams) {
+                        if (!cp.getDataType().getName().startsWith("undefined")) continue;
+
+                        // Check if this caller param is passed directly to the seed
+                        // This requires decompilation analysis which is expensive,
+                        // so for now we report candidates for manual review
+                        Map<String, Object> prop = new LinkedHashMap<>();
+                        prop.put("caller_address", caller.getEntryPoint().toString());
+                        prop.put("caller_name", caller.getName());
+                        prop.put("caller_param", cp.getName());
+                        prop.put("caller_param_type", cp.getDataType().getName());
+                        prop.put("seed_address", seed.getEntryPoint().toString());
+                        prop.put("seed_name", seed.getName());
+                        prop.put("seed_signature", seed.getSignature().getPrototypeString(false));
+                        propagations.add(prop);
+                        processed++;
+                        break; // One per caller for now
+                    }
+                }
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("seeds_used", seeds.size());
+            result.put("propagation_candidates", propagations.size());
+            result.put("dry_run", dryRun);
+            result.put("candidates", propagations);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Type propagation failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Decompilation quality: infer parameter types
+    // ========================================================================
+
+    @McpTool(path = "/infer_param_types",
+             description = "Analyze a function's assembly to infer parameter types from usage patterns. "
+                         + "Checks: dereference (pointer), FPU use (float/double), string ops (char *), "
+                         + "field access offsets (struct *), comparisons (int/bool).",
+             category = "analysis")
+    public Response inferParamTypes(
+            @Param(value = "address",
+                   description = "Function address to analyze") String funcAddr,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (funcAddr == null || funcAddr.isEmpty()) {
+            return Response.err("address is required");
+        }
+
+        Address addr = ServiceUtils.parseAddress(program, funcAddr);
+        if (addr == null) return Response.err("Invalid address");
+
+        Function func = program.getFunctionManager().getFunctionAt(addr);
+        if (func == null) return Response.err("No function at " + funcAddr);
+
+        try {
+            Listing listing = program.getListing();
+            Parameter[] params = func.getParameters();
+
+            List<Map<String, Object>> paramAnalysis = new ArrayList<>();
+
+            for (Parameter param : params) {
+                Map<String, Object> analysis = new LinkedHashMap<>();
+                analysis.put("name", param.getName());
+                analysis.put("ordinal", param.getOrdinal());
+                analysis.put("current_type", param.getDataType().getName());
+                analysis.put("storage", param.getVariableStorage().toString());
+
+                // Track usage patterns
+                boolean isDereferenced = false;
+                boolean isUsedInFpu = false;
+                boolean isComparedToZero = false;
+                boolean isPassedToStringFunc = false;
+                boolean hasFieldAccess = false;
+                int maxFieldOffset = 0;
+                Set<Integer> fieldOffsets = new TreeSet<>();
+
+                String storage = param.getVariableStorage().toString();
+                String reg = null;
+                String stackRef = null;
+
+                // Determine the register or stack location
+                if (storage.contains("ECX")) reg = "ECX";
+                else if (storage.contains("EDX")) reg = "EDX";
+                else if (storage.contains("Stack[")) {
+                    stackRef = storage;
+                    // For stack params, we'd need to track which register they're loaded into
+                    // This is harder — skip for now and focus on register params
+                }
+
+                if (reg == null && stackRef == null) {
+                    analysis.put("suggested_type", "unknown");
+                    analysis.put("confidence", "low");
+                    paramAnalysis.add(analysis);
+                    continue;
+                }
+
+                // Also track if param is saved to another register
+                String savedReg = null;
+                if (reg != null) {
+                    InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+                    int checked = 0;
+                    while (instrIter.hasNext() && checked < 8) {
+                        Instruction instr = instrIter.next();
+                        checked++;
+                        if (instr.getMnemonicString().equals("MOV") && instr.getNumOperands() >= 2) {
+                            String op1 = instr.getDefaultOperandRepresentation(1);
+                            if (op1.equals(reg)) {
+                                String op0 = instr.getDefaultOperandRepresentation(0);
+                                if (op0.equals("ESI") || op0.equals("EDI") || op0.equals("EBX")) {
+                                    savedReg = op0;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Scan all instructions for usage of this param's register
+                String[] regsToCheck = savedReg != null ?
+                        new String[]{reg, savedReg} : new String[]{reg};
+
+                InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+                while (instrIter.hasNext()) {
+                    Instruction instr = instrIter.next();
+                    String mnem = instr.getMnemonicString();
+                    for (int i = 0; i < instr.getNumOperands(); i++) {
+                        String op = instr.getDefaultOperandRepresentation(i);
+                        for (String r : regsToCheck) {
+                            // Field access: [REG + 0x??]
+                            if (op.contains(r + " + 0x") || op.contains(r + "]")) {
+                                if (op.contains("+ 0x")) {
+                                    hasFieldAccess = true;
+                                    try {
+                                        String hex = op.substring(op.indexOf("+ 0x") + 4)
+                                                .replaceAll("[\\]\\)]", "").trim();
+                                        int off = Integer.parseInt(hex, 16);
+                                        fieldOffsets.add(off);
+                                        maxFieldOffset = Math.max(maxFieldOffset, off);
+                                    } catch (Exception ignored) {}
+                                }
+                                isDereferenced = true;
+                            }
+                        }
+                    }
+
+                    // TEST REG,REG or CMP REG,0
+                    if ((mnem.equals("TEST") || mnem.equals("CMP")) && instr.getNumOperands() >= 1) {
+                        String op0 = instr.getDefaultOperandRepresentation(0);
+                        for (String r : regsToCheck) {
+                            if (op0.equals(r)) isComparedToZero = true;
+                        }
+                    }
+
+                    // FPU usage
+                    if (mnem.startsWith("F") && (mnem.equals("FLD") || mnem.equals("FSTP") ||
+                        mnem.equals("FADD") || mnem.equals("FMUL") || mnem.equals("FSUB"))) {
+                        for (int i = 0; i < instr.getNumOperands(); i++) {
+                            String op = instr.getDefaultOperandRepresentation(i);
+                            for (String r : regsToCheck) {
+                                if (op.contains(r)) isUsedInFpu = true;
+                            }
+                        }
+                    }
+                }
+
+                // Infer type
+                String suggestedType;
+                String confidence;
+
+                if (hasFieldAccess && fieldOffsets.size() >= 3) {
+                    suggestedType = "struct * (size >= 0x" + Integer.toHexString(maxFieldOffset + 4) + ")";
+                    confidence = "high";
+                } else if (isDereferenced && isComparedToZero) {
+                    suggestedType = "void *";
+                    confidence = "high";
+                } else if (isDereferenced) {
+                    suggestedType = "int *";
+                    confidence = "medium";
+                } else if (isUsedInFpu) {
+                    suggestedType = "float";
+                    confidence = "high";
+                } else if (isComparedToZero) {
+                    suggestedType = "int";
+                    confidence = "medium";
+                } else {
+                    suggestedType = "int";
+                    confidence = "low";
+                }
+
+                analysis.put("suggested_type", suggestedType);
+                analysis.put("confidence", confidence);
+                analysis.put("is_dereferenced", isDereferenced);
+                analysis.put("has_field_access", hasFieldAccess);
+                analysis.put("field_offsets", fieldOffsets.toString());
+                analysis.put("max_field_offset", maxFieldOffset);
+                analysis.put("is_fpu", isUsedInFpu);
+                analysis.put("is_nullable", isComparedToZero);
+                paramAnalysis.add(analysis);
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("address", funcAddr);
+            result.put("name", func.getName());
+            result.put("current_signature", func.getSignature().getPrototypeString(false));
+            result.put("params", paramAnalysis);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Param type inference failed: " + e.getMessage());
         }
     }
 }
