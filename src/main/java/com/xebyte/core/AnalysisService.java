@@ -5752,8 +5752,8 @@ public class AnalysisService {
                         checked++;
                         if (instr.getMnemonicString().equals("MOV") && instr.getNumOperands() >= 2) {
                             String op1 = instr.getDefaultOperandRepresentation(1);
-                            if (op1.equals(reg)) {
-                                String op0 = instr.getDefaultOperandRepresentation(0);
+                            String op0 = instr.getDefaultOperandRepresentation(0);
+                            if (op1 != null && op0 != null && op1.equals(reg)) {
                                 if (op0.equals("ESI") || op0.equals("EDI") || op0.equals("EBX")) {
                                     savedReg = op0;
                                 }
@@ -5772,6 +5772,7 @@ public class AnalysisService {
                     String mnem = instr.getMnemonicString();
                     for (int i = 0; i < instr.getNumOperands(); i++) {
                         String op = instr.getDefaultOperandRepresentation(i);
+                        if (op == null) continue;
                         for (String r : regsToCheck) {
                             // Field access: [REG + 0x??]
                             if (op.contains(r + " + 0x") || op.contains(r + "]")) {
@@ -5793,8 +5794,10 @@ public class AnalysisService {
                     // TEST REG,REG or CMP REG,0
                     if ((mnem.equals("TEST") || mnem.equals("CMP")) && instr.getNumOperands() >= 1) {
                         String op0 = instr.getDefaultOperandRepresentation(0);
-                        for (String r : regsToCheck) {
-                            if (op0.equals(r)) isComparedToZero = true;
+                        if (op0 != null) {
+                            for (String r : regsToCheck) {
+                                if (op0.equals(r)) isComparedToZero = true;
+                            }
                         }
                     }
 
@@ -5803,6 +5806,7 @@ public class AnalysisService {
                         mnem.equals("FADD") || mnem.equals("FMUL") || mnem.equals("FSUB"))) {
                         for (int i = 0; i < instr.getNumOperands(); i++) {
                             String op = instr.getDefaultOperandRepresentation(i);
+                            if (op == null) continue;
                             for (String r : regsToCheck) {
                                 if (op.contains(r)) isUsedInFpu = true;
                             }
