@@ -4056,16 +4056,20 @@ public class AnalysisService {
      * which is more reliable than max alone).
      */
     @McpTool(path = "/find_vmp_stubs",
-             description = "Scan all functions for VMProtect stub pattern (PUSH EDX / CALL vmp_handler / INT3, "
-                         + "body ≤ max_body_size bytes). Returns each stub with its address, current name, "
-                         + "VMP handler target address, and inferred argument count (mode and max from ADD ESP,N "
-                         + "at call sites). Useful for identifying encrypted IAT imports in VMProtect-packed binaries.",
+             description = "Scan for VMProtect stub patterns. Finds two types: "
+                         + "(1) PUSH EDX / CALL vmp_handler stubs (encrypted IAT imports, body ≤ max_body_size bytes), "
+                         + "and (2) JMP trampoline shims — single E9 JMP functions in non-.text segments that are "
+                         + "called FROM .text segment code (VMProtect-hidden API calls). "
+                         + "Returns each stub with its address, current name, VMP handler target, stub type, "
+                         + "and inferred argument count. Use type filter to scan for only one pattern.",
              category = "analysis")
     public Response findVmpStubs(
             @Param(value = "max_body_size", defaultValue = "8",
-                   description = "Maximum function body size in bytes (stubs are typically 5-7 bytes)") int maxBodySize,
+                   description = "Maximum function body size in bytes for PUSH/CALL stubs (typically 5-7 bytes)") int maxBodySize,
             @Param(value = "exclude_named", defaultValue = "false",
                    description = "If true, exclude already-named functions (omit memcpy, sprintf, etc. already identified)") boolean excludeNamed,
+            @Param(value = "type", defaultValue = "all",
+                   description = "Stub type filter: 'push_call' for PUSH EDX/CALL only, 'jmp_trampoline' for JMP shims only, 'all' for both") String typeFilter,
             @Param(value = "program", defaultValue = "",
                    description = "Target program name (omit to use the active program)") String programName) {
 
@@ -4078,6 +4082,19 @@ public class AnalysisService {
             Listing listing = program.getListing();
             ReferenceManager refMgr = program.getReferenceManager();
 
+            boolean scanPushCall = typeFilter.equals("all") || typeFilter.equals("push_call");
+            boolean scanJmpTrampoline = typeFilter.equals("all") || typeFilter.equals("jmp_trampoline");
+
+            // Determine .text segment address range for JMP trampoline filtering
+            long textStart = 0, textEnd = 0;
+            for (MemoryBlock block : mem.getBlocks()) {
+                if (block.getName().equals(".text")) {
+                    textStart = block.getStart().getOffset();
+                    textEnd = block.getEnd().getOffset();
+                    break;
+                }
+            }
+
             List<Map<String, Object>> stubs = new ArrayList<>();
 
             FunctionIterator iter = program.getFunctionManager().getFunctions(true);
@@ -4085,51 +4102,82 @@ public class AnalysisService {
                 Function func = iter.next();
                 Address start = func.getEntryPoint();
                 long bodySize = func.getBody().getNumAddresses();
-
-                // Filter by body size (stubs are tiny)
-                if (bodySize > maxBodySize || bodySize < 5) continue;
-
-                // Check for PUSH EDX (0x52) at byte 0, CALL rel32 (0xE8) at byte 1
-                byte b0, b1;
-                try {
-                    b0 = mem.getByte(start);
-                    b1 = mem.getByte(start.add(1));
-                } catch (Exception e) {
-                    continue;
-                }
-                if (b0 != 0x52 || b1 != (byte) 0xE8) continue;
+                long startOffset = start.getOffset();
 
                 String funcName = func.getName();
                 boolean isDefaultName = funcName.startsWith("FUN_") || funcName.startsWith("Method_")
-                        || funcName.startsWith("Unknown") || funcName.startsWith("REC_");
+                        || funcName.startsWith("Unknown") || funcName.startsWith("REC_")
+                        || funcName.startsWith("thunk_FUN_");
 
                 if (excludeNamed && !isDefaultName) continue;
 
-                // Resolve VMP handler target from the CALL instruction's outbound reference
+                byte b0;
+                try {
+                    b0 = mem.getByte(start);
+                } catch (Exception e) {
+                    continue;
+                }
+
+                String stubType = null;
+
+                // --- Pattern 1: PUSH EDX (0x52) / CALL rel32 (0xE8) ---
+                if (scanPushCall && b0 == 0x52 && bodySize >= 5 && bodySize <= maxBodySize) {
+                    try {
+                        byte b1 = mem.getByte(start.add(1));
+                        if (b1 == (byte) 0xE8) stubType = "push_call";
+                    } catch (Exception ignored) {}
+                }
+
+                // --- Pattern 2: JMP rel32 (0xE9) trampoline, 5 bytes, outside .text, called from .text ---
+                if (stubType == null && scanJmpTrampoline && b0 == (byte) 0xE9 && bodySize == 5) {
+                    // Must be outside .text segment
+                    if (textEnd > 0 && (startOffset < textStart || startOffset > textEnd)) {
+                        // Check if any caller is inside .text
+                        boolean hasTextCaller = false;
+                        ReferenceIterator refIter = refMgr.getReferencesTo(start);
+                        while (refIter.hasNext()) {
+                            Reference ref = refIter.next();
+                            long fromOffset = ref.getFromAddress().getOffset();
+                            if (fromOffset >= textStart && fromOffset <= textEnd) {
+                                hasTextCaller = true;
+                                break;
+                            }
+                        }
+                        if (hasTextCaller) stubType = "jmp_trampoline";
+                    }
+                }
+
+                if (stubType == null) continue;
+
+                // Resolve VMP handler target
                 String vmpTarget = null;
                 try {
-                    Instruction callInstr = listing.getInstructionAt(start.add(1));
-                    if (callInstr != null) {
-                        for (Reference ref : callInstr.getReferencesFrom()) {
+                    Address instrAddr = stubType.equals("push_call") ? start.add(1) : start;
+                    Instruction instr = listing.getInstructionAt(instrAddr);
+                    if (instr != null) {
+                        for (Reference ref : instr.getReferencesFrom()) {
                             if (ref.getReferenceType().isCall() || ref.getReferenceType().isJump()) {
                                 vmpTarget = ref.getToAddress().toString();
                                 break;
                             }
                         }
                     }
-                } catch (Exception ignored) { /* leave null */ }
+                } catch (Exception ignored) {}
 
                 // Infer argument count from ADD ESP,N at call sites
-                // Use the mode (most common value) over all call sites to avoid outlier ADD ESP
-                // from delayed stack cleanup in complex callers.
                 Map<Integer, Integer> argCountFreq = new LinkedHashMap<>();
                 int callSiteCount = 0;
+                int textCallerCount = 0;
 
                 ReferenceIterator refIter = refMgr.getReferencesTo(start);
                 while (refIter.hasNext()) {
                     Reference ref = refIter.next();
-                    if (!ref.getReferenceType().isCall()) continue;
+                    if (!ref.getReferenceType().isCall() && !ref.getReferenceType().isJump()) continue;
                     callSiteCount++;
+                    long fromOffset = ref.getFromAddress().getOffset();
+                    if (textEnd > 0 && fromOffset >= textStart && fromOffset <= textEnd) {
+                        textCallerCount++;
+                    }
                     try {
                         Instruction callInstr = listing.getInstructionAt(ref.getFromAddress());
                         if (callInstr == null) continue;
@@ -4142,7 +4190,7 @@ public class AnalysisService {
                         int n = Integer.parseInt(cleanVal, 16);
                         int argc = n / 4;
                         argCountFreq.merge(argc, 1, Integer::sum);
-                    } catch (Exception ignored) { /* skip this call site */ }
+                    } catch (Exception ignored) {}
                 }
 
                 // Compute mode and max
@@ -4159,18 +4207,31 @@ public class AnalysisService {
                 info.put("address", start.toString());
                 info.put("name", funcName);
                 info.put("is_named", !isDefaultName);
+                info.put("stub_type", stubType);
                 info.put("body_size", bodySize);
                 info.put("vmp_handler", vmpTarget);
                 info.put("arg_count_mode", modeArgCount == -1 ? null : modeArgCount);
                 info.put("arg_count_max", maxArgCount == -1 ? null : maxArgCount);
                 info.put("call_site_count", callSiteCount);
+                if (stubType.equals("jmp_trampoline")) {
+                    info.put("text_caller_count", textCallerCount);
+                }
                 stubs.add(info);
             }
 
             stubs.sort(Comparator.comparing(m -> (String) m.get("address")));
 
+            // Compute counts by type
+            int pushCallCount = 0, jmpCount = 0;
+            for (Map<String, Object> s : stubs) {
+                if ("push_call".equals(s.get("stub_type"))) pushCallCount++;
+                else jmpCount++;
+            }
+
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("total", stubs.size());
+            result.put("push_call_count", pushCallCount);
+            result.put("jmp_trampoline_count", jmpCount);
             result.put("stubs", stubs);
             return Response.ok(result);
 
