@@ -4049,6 +4049,135 @@ public class AnalysisService {
 
         return responseRef.get();
     }
+
+    /**
+     * Scan all functions for VMProtect stub patterns (PUSH EDX / CALL vmp_handler / INT3).
+     * Infers argument count from ADD ESP,N cleanup at call sites (mode over all call sites,
+     * which is more reliable than max alone).
+     */
+    @McpTool(path = "/find_vmp_stubs",
+             description = "Scan all functions for VMProtect stub pattern (PUSH EDX / CALL vmp_handler / INT3, "
+                         + "body ≤ max_body_size bytes). Returns each stub with its address, current name, "
+                         + "VMP handler target address, and inferred argument count (mode and max from ADD ESP,N "
+                         + "at call sites). Useful for identifying encrypted IAT imports in VMProtect-packed binaries.",
+             category = "analysis")
+    public Response findVmpStubs(
+            @Param(value = "max_body_size", defaultValue = "8",
+                   description = "Maximum function body size in bytes (stubs are typically 5-7 bytes)") int maxBodySize,
+            @Param(value = "exclude_named", defaultValue = "false",
+                   description = "If true, exclude already-named functions (omit memcpy, sprintf, etc. already identified)") boolean excludeNamed,
+            @Param(value = "program", defaultValue = "",
+                   description = "Target program name (omit to use the active program)") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            Memory mem = program.getMemory();
+            Listing listing = program.getListing();
+            ReferenceManager refMgr = program.getReferenceManager();
+
+            List<Map<String, Object>> stubs = new ArrayList<>();
+
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                Function func = iter.next();
+                Address start = func.getEntryPoint();
+                long bodySize = func.getBody().getNumAddresses();
+
+                // Filter by body size (stubs are tiny)
+                if (bodySize > maxBodySize || bodySize < 5) continue;
+
+                // Check for PUSH EDX (0x52) at byte 0, CALL rel32 (0xE8) at byte 1
+                byte b0, b1;
+                try {
+                    b0 = mem.getByte(start);
+                    b1 = mem.getByte(start.add(1));
+                } catch (Exception e) {
+                    continue;
+                }
+                if (b0 != 0x52 || b1 != (byte) 0xE8) continue;
+
+                String funcName = func.getName();
+                boolean isDefaultName = funcName.startsWith("FUN_") || funcName.startsWith("Method_")
+                        || funcName.startsWith("Unknown") || funcName.startsWith("REC_");
+
+                if (excludeNamed && !isDefaultName) continue;
+
+                // Resolve VMP handler target from the CALL instruction's outbound reference
+                String vmpTarget = null;
+                try {
+                    Instruction callInstr = listing.getInstructionAt(start.add(1));
+                    if (callInstr != null) {
+                        for (Reference ref : callInstr.getReferencesFrom()) {
+                            if (ref.getReferenceType().isCall() || ref.getReferenceType().isJump()) {
+                                vmpTarget = ref.getToAddress().toString();
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception ignored) { /* leave null */ }
+
+                // Infer argument count from ADD ESP,N at call sites
+                // Use the mode (most common value) over all call sites to avoid outlier ADD ESP
+                // from delayed stack cleanup in complex callers.
+                Map<Integer, Integer> argCountFreq = new LinkedHashMap<>();
+                int callSiteCount = 0;
+
+                ReferenceIterator refIter = refMgr.getReferencesTo(start);
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (!ref.getReferenceType().isCall()) continue;
+                    callSiteCount++;
+                    try {
+                        Instruction callInstr = listing.getInstructionAt(ref.getFromAddress());
+                        if (callInstr == null) continue;
+                        Instruction next = callInstr.getNext();
+                        if (next == null || !next.getMnemonicString().equals("ADD")) continue;
+                        String op0 = next.getDefaultOperandRepresentation(0);
+                        String op1 = next.getDefaultOperandRepresentation(1);
+                        if (!op0.equals("ESP")) continue;
+                        String cleanVal = op1.startsWith("0x") ? op1.substring(2) : op1;
+                        int n = Integer.parseInt(cleanVal, 16);
+                        int argc = n / 4;
+                        argCountFreq.merge(argc, 1, Integer::sum);
+                    } catch (Exception ignored) { /* skip this call site */ }
+                }
+
+                // Compute mode and max
+                int modeArgCount = -1, modeFreq = 0, maxArgCount = -1;
+                for (Map.Entry<Integer, Integer> entry : argCountFreq.entrySet()) {
+                    if (entry.getValue() > modeFreq) {
+                        modeFreq = entry.getValue();
+                        modeArgCount = entry.getKey();
+                    }
+                    if (entry.getKey() > maxArgCount) maxArgCount = entry.getKey();
+                }
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("address", start.toString());
+                info.put("name", funcName);
+                info.put("is_named", !isDefaultName);
+                info.put("body_size", bodySize);
+                info.put("vmp_handler", vmpTarget);
+                info.put("arg_count_mode", modeArgCount == -1 ? null : modeArgCount);
+                info.put("arg_count_max", maxArgCount == -1 ? null : maxArgCount);
+                info.put("call_site_count", callSiteCount);
+                stubs.add(info);
+            }
+
+            stubs.sort(Comparator.comparing(m -> (String) m.get("address")));
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total", stubs.size());
+            result.put("stubs", stubs);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("VMP stub scan failed: " + e.getMessage());
+        }
+    }
 }
 
 

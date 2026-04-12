@@ -14,6 +14,7 @@ import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
 import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.LocalSymbolMap;
+import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.symbol.SymbolTable;
@@ -730,7 +731,15 @@ public class FunctionService {
     /**
      * Rename a function by its address.
      */
-    @McpTool(path = "/rename_function_by_address", method = "POST", description = "Rename function at specific address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/rename_function_by_address", method = "POST",
+             description = "Rename function at specific address. Optionally specify a namespace to "
+                         + "correctly place the symbol in Ghidra's namespace tree (e.g. namespace=\"MyClass::Helper\" "
+                         + "with new_name=\"ProcessData\"). If namespace contains '::' separators, "
+                         + "intermediate namespaces are created automatically. Pass namespace=\"\" or omit to "
+                         + "keep the function in its current namespace (legacy behavior). "
+                         + "On programs with multiple address spaces (e.g., embedded targets), prefix addresses "
+                         + "with the space name (mem:1000) to avoid ambiguous resolution.",
+             category = "function")
     public Response renameFunctionByAddress(
             @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -739,6 +748,11 @@ public class FunctionService {
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String functionAddrStr,
             @Param(value = "new_name", source = ParamSource.BODY) String newName,
+            @Param(value = "namespace", source = ParamSource.BODY, defaultValue = "",
+                   description = "Target namespace path (e.g. \"MyNamespace::Class\", \"Utils::Handler\", or \"\" for global). "
+                               + "Intermediate namespaces are created if they don't exist. "
+                               + "When provided, uses setNameAndNamespace() to correctly re-parent the symbol "
+                               + "in the Symbol Tree — unlike a plain rename which only changes the display name.") String namespacePath,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -764,10 +778,30 @@ public class FunctionService {
                 }
 
                 String oldName = func.getName();
-                func.setName(newName, SourceType.USER_DEFINED);
+
+                if (namespacePath != null && !namespacePath.trim().isEmpty()) {
+                    // Build or find the target namespace, creating intermediate nodes as needed
+                    SymbolTable symTable = program.getSymbolTable();
+                    Namespace ns = program.getGlobalNamespace();
+                    for (String part : namespacePath.split("::")) {
+                        if (part.isEmpty()) continue;
+                        Namespace child = symTable.getNamespace(part, ns);
+                        if (child == null) {
+                            child = symTable.createNameSpace(ns, part, SourceType.USER_DEFINED);
+                        }
+                        ns = child;
+                    }
+                    func.getSymbol().setNameAndNamespace(newName, ns, SourceType.USER_DEFINED);
+                    resultMsg.append("Success: Renamed function at ").append(functionAddrStr)
+                            .append(" from '").append(oldName).append("' to '")
+                            .append(namespacePath).append("::").append(newName).append("'");
+                } else {
+                    func.setName(newName, SourceType.USER_DEFINED);
+                    resultMsg.append("Success: Renamed function at ").append(functionAddrStr)
+                            .append(" from '").append(oldName).append("' to '").append(newName).append("'");
+                }
+
                 success.set(true);
-                resultMsg.append("Success: Renamed function at ").append(functionAddrStr)
-                        .append(" from '").append(oldName).append("' to '").append(newName).append("'");
                 return null;
             });
         } catch (Exception e) {
@@ -789,7 +823,11 @@ public class FunctionService {
     }
 
     public Response renameFunctionByAddress(String functionAddrStr, String newName) {
-        return renameFunctionByAddress(functionAddrStr, newName, null);
+        return renameFunctionByAddress(functionAddrStr, newName, null, null);
+    }
+
+    public Response renameFunctionByAddress(String functionAddrStr, String newName, String programName) {
+        return renameFunctionByAddress(functionAddrStr, newName, null, programName);
     }
 
     // ========================================================================

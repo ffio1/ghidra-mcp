@@ -438,6 +438,67 @@ public class XrefCallGraphService {
         return Response.text(sb.toString());
     }
 
+    /**
+     * Get callers for multiple functions in one round-trip.
+     * Accepts a JSON array or comma-separated list of addresses.
+     */
+    @McpTool(path = "/batch_get_callers", method = "POST", description = "Get callers for multiple functions in one call. Pass a JSON array of addresses. Returns a map of address -> list of {caller_name, caller_address}. Much cheaper than N individual get_function_callers calls.", category = "xref")
+    public Response batchGetCallers(
+            @Param(value = "addresses", source = ParamSource.BODY) Object addressesObj,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        List<String> addresses = new ArrayList<>();
+        if (addressesObj instanceof List) {
+            for (Object a : (List<?>) addressesObj) { if (a != null) addresses.add(a.toString()); }
+        } else if (addressesObj instanceof String) {
+            String s = ((String) addressesObj).trim();
+            if (s.startsWith("[")) s = s.substring(1);
+            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
+            for (String part : s.split(",")) {
+                String addr = part.trim().replaceAll("^\"|\"$", "");
+                if (!addr.isEmpty()) addresses.add(addr);
+            }
+        }
+        if (addresses.isEmpty()) return Response.err("addresses array is required");
+
+        FunctionManager funcMgr = program.getFunctionManager();
+        ReferenceManager refMgr = program.getReferenceManager();
+        Map<String, Object> resultMap = new LinkedHashMap<>();
+
+        for (String addrStr : addresses) {
+            try {
+                Address addr = ServiceUtils.parseAddress(program, addrStr);
+                if (addr == null) { resultMap.put(addrStr, List.of()); continue; }
+
+                Function target = funcMgr.getFunctionAt(addr);
+                Address lookupAddr = (target != null) ? target.getEntryPoint() : addr;
+
+                Set<Function> seen = new HashSet<>();
+                List<Map<String, Object>> callers = new ArrayList<>();
+                ReferenceIterator refIter = refMgr.getReferencesTo(lookupAddr);
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (!ref.getReferenceType().isCall()) continue;
+                    Function caller = funcMgr.getFunctionContaining(ref.getFromAddress());
+                    if (caller == null || !seen.add(caller)) continue;
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("caller_name", caller.getName(true));
+                    entry.put("caller_address", caller.getEntryPoint().toString(false));
+                    callers.add(entry);
+                }
+                callers.sort((a, b) -> a.get("caller_name").toString().compareTo(b.get("caller_name").toString()));
+                resultMap.put(addrStr, callers);
+            } catch (Exception e) {
+                resultMap.put(addrStr, List.of());
+            }
+        }
+
+        return Response.ok(resultMap);
+    }
+
     // -----------------------------------------------------------------------
     // Call Graph Methods
     // -----------------------------------------------------------------------

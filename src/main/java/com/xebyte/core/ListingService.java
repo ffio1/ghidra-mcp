@@ -386,6 +386,254 @@ public class ListingService {
         ));
     }
 
+    /**
+     * Parse a comma-separated name_filter into a trimmed array. Returns empty array
+     * for null or empty input (no filtering).
+     */
+    private static String[] parseNameFilter(String nameFilter) {
+        if (nameFilter == null || nameFilter.isEmpty()) return new String[0];
+        String[] prefixes = nameFilter.split(",");
+        int n = 0;
+        for (int i = 0; i < prefixes.length; i++) {
+            String trimmed = prefixes[i].trim();
+            if (!trimmed.isEmpty()) prefixes[n++] = trimmed;
+        }
+        if (n == prefixes.length) return prefixes;
+        String[] out = new String[n];
+        System.arraycopy(prefixes, 0, out, 0, n);
+        return out;
+    }
+
+    /**
+     * Check whether a function matches any of the given name prefixes.
+     * Matching is case-insensitive and checks both the simple name and the
+     * fully-qualified (namespace-prefixed) name. A prefix can therefore target
+     * a namespace (e.g. "GRScript::"), a simple-name prefix (e.g. "FUN_"), or
+     * a fully-qualified prefix (e.g. "GRScript::Helper_").
+     */
+    private static boolean matchesNameFilter(Function func, String[] prefixes) {
+        if (prefixes.length == 0) return true;
+        String simpleName = func.getName();
+        String qualName = func.getName(true);
+        String simpleLower = simpleName.toLowerCase();
+        String qualLower = qualName.toLowerCase();
+        for (String prefix : prefixes) {
+            String p = prefix.toLowerCase();
+            if (simpleLower.startsWith(p) || qualLower.startsWith(p)) return true;
+        }
+        return false;
+    }
+
+    @McpTool(path = "/list_functions_in_range", description = "List functions whose entry point falls within [start_address, end_address). Much faster than list_functions for agents working a specific address range.", category = "listing")
+    public Response listFunctionsInRange(
+            @Param(value = "start_address", description = "Start of range, inclusive (hex, e.g. \"00cc0000\")") String startAddr,
+            @Param(value = "end_address", description = "End of range, exclusive (hex, e.g. \"00d00000\")") String endAddr,
+            @Param(value = "offset", defaultValue = "0") int offset,
+            @Param(value = "limit", defaultValue = "500") int limit,
+            @Param(value = "name_filter", description = "Only return functions whose simple or fully-qualified name starts with this prefix (case-insensitive). Comma-separate multiple prefixes, e.g. \"FUN_,Unknown::,GRScript::Helper_\". Leave empty to return all functions.", defaultValue = "") String nameFilter,
+            @Param(value = "min_size", description = "Minimum function body size in bytes (0 = no minimum)", defaultValue = "0") int minSize,
+            @Param(value = "max_size", description = "Maximum function body size in bytes (0 = no maximum)", defaultValue = "0") int maxSize,
+            @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address start = ServiceUtils.parseAddress(program, startAddr);
+        if (start == null) return Response.err("Invalid start_address: " + ServiceUtils.getLastParseError());
+
+        Address end = ServiceUtils.parseAddress(program, endAddr);
+        if (end == null) return Response.err("Invalid end_address: " + ServiceUtils.getLastParseError());
+
+        String[] prefixes = parseNameFilter(nameFilter);
+
+        List<Map<String, Object>> functions = new ArrayList<>();
+        int skipped = 0;
+        int added = 0;
+
+        for (Function func : program.getFunctionManager().getFunctions(start, true)) {
+            Address entry = func.getEntryPoint();
+            if (entry.compareTo(end) >= 0) break;
+
+            if (!matchesNameFilter(func, prefixes)) continue;
+
+            long size = func.getBody().getNumAddresses();
+            if (minSize > 0 && size < minSize) continue;
+            if (maxSize > 0 && size > maxSize) continue;
+
+            if (skipped < offset) { skipped++; continue; }
+            if (added >= limit) break;
+
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.putAll(ServiceUtils.addressToJson(entry, program));
+            item.put("name", func.getName(true));
+            item.put("size", size);
+            functions.add(item);
+            added++;
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+                "functions", functions,
+                "count", added,
+                "offset", offset,
+                "limit", limit,
+                "start_address", start.toString(false),
+                "end_address", end.toString(false)
+        ));
+    }
+
+    @McpTool(path = "/count_functions_in_range", description = "Count functions in an address range, optionally filtered by name prefix. Cheap probe — use before committing a full sweep.", category = "listing")
+    public Response countFunctionsInRange(
+            @Param(value = "start_address", description = "Start of range, inclusive (hex, e.g. \"00cc0000\")") String startAddr,
+            @Param(value = "end_address", description = "End of range, exclusive (hex, e.g. \"00d00000\")") String endAddr,
+            @Param(value = "name_filter", description = "Only count functions whose simple or fully-qualified name starts with this prefix (case-insensitive). Comma-separate multiple prefixes, e.g. \"FUN_,Unknown::,GRScript::Helper_\". Leave empty to count all functions in the range.", defaultValue = "") String nameFilter,
+            @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address start = ServiceUtils.parseAddress(program, startAddr);
+        if (start == null) return Response.err("Invalid start_address: " + ServiceUtils.getLastParseError());
+
+        Address end = ServiceUtils.parseAddress(program, endAddr);
+        if (end == null) return Response.err("Invalid end_address: " + ServiceUtils.getLastParseError());
+
+        String[] prefixes = parseNameFilter(nameFilter);
+
+        int total = 0;
+        int unnamed = 0;
+
+        for (Function func : program.getFunctionManager().getFunctions(start, true)) {
+            if (func.getEntryPoint().compareTo(end) >= 0) break;
+            if (!matchesNameFilter(func, prefixes)) continue;
+            total++;
+            if (func.getName().startsWith("FUN_")) unnamed++;
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("count", total);
+        result.put("start_address", start.toString(false));
+        result.put("end_address", end.toString(false));
+        if (prefixes.length > 0) result.put("name_filter", nameFilter);
+        else result.put("unnamed_count", unnamed);
+
+        return Response.ok(result);
+    }
+
+    @McpTool(path = "/get_vtable_at", description = "Read a vtable at the given address: returns slot index, pointer value, and current function name for each entry. Useful for mapping class virtual method tables in 32-bit and 64-bit binaries.", category = "listing")
+    public Response getVtableAt(
+            @Param(value = "address", description = "Address of the vtable (hex)") String addressStr,
+            @Param(value = "slot_count", description = "Number of vtable slots to read", defaultValue = "32") int slotCount,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address vtableAddr = ServiceUtils.parseAddress(program, addressStr);
+        if (vtableAddr == null) return Response.err("Invalid address: " + ServiceUtils.getLastParseError());
+
+        int ptrSize = program.getDefaultPointerSize();
+        if (ptrSize != 4 && ptrSize != 8) return Response.err("Unsupported pointer size: " + ptrSize);
+
+        ghidra.program.model.mem.Memory memory = program.getMemory();
+        FunctionManager funcMgr = program.getFunctionManager();
+
+        List<Map<String, Object>> slots = new ArrayList<>();
+        for (int i = 0; i < slotCount; i++) {
+            try {
+                Address slotAddr = vtableAddr.add((long) i * ptrSize);
+                long fnPtr;
+                if (ptrSize == 4) {
+                    fnPtr = memory.getInt(slotAddr) & 0xFFFFFFFFL;
+                } else {
+                    fnPtr = memory.getLong(slotAddr);
+                }
+                Address fnAddr = program.getAddressFactory().getDefaultAddressSpace().getAddress(fnPtr);
+                Function fn = funcMgr.getFunctionAt(fnAddr);
+                Map<String, Object> slot = new LinkedHashMap<>();
+                slot.put("slot", i);
+                slot.put("pointer", String.format("%08x", fnPtr));
+                slot.put("name", fn != null ? fn.getName(true) : "(no function)");
+                slots.add(slot);
+            } catch (Exception e) {
+                // Hit unmapped memory — vtable ends here
+                break;
+            }
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+                "vtable_address", vtableAddr.toString(false),
+                "slots_read", slots.size(),
+                "ptr_size", ptrSize,
+                "slots", slots
+        ));
+    }
+
+    @McpTool(path = "/find_functions_referencing_string", description = "Find all functions that reference strings matching a regex pattern. Returns function name, address, and the matching string(s). Fast path to naming functions by their log/error messages.", category = "listing")
+    public Response findFunctionsReferencingString(
+            @Param(value = "pattern", description = "Regex pattern to match against string values (case-insensitive)") String patternStr,
+            @Param(value = "offset", defaultValue = "0") int offset,
+            @Param(value = "limit", defaultValue = "100") int limit,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (patternStr == null || patternStr.isEmpty()) return Response.err("pattern is required");
+
+        Pattern pat;
+        try {
+            pat = Pattern.compile(patternStr, Pattern.CASE_INSENSITIVE);
+        } catch (Exception e) {
+            return Response.err("Invalid regex: " + e.getMessage());
+        }
+
+        FunctionManager funcMgr = program.getFunctionManager();
+        ghidra.program.model.symbol.ReferenceManager refMgr = program.getReferenceManager();
+
+        // Map from function entry → {function, list of matching strings}
+        Map<Address, Map<String, Object>> byFunction = new LinkedHashMap<>();
+
+        DataIterator dataIt = program.getListing().getDefinedData(true);
+        while (dataIt.hasNext()) {
+            Data data = dataIt.next();
+            if (data == null || !ServiceUtils.isStringData(data)) continue;
+            String value = data.getValue() != null ? data.getValue().toString() : "";
+            if (!pat.matcher(value).find()) continue;
+
+            // Find functions that reference this string's address
+            ghidra.program.model.symbol.ReferenceIterator refs = refMgr.getReferencesTo(data.getAddress());
+            while (refs.hasNext()) {
+                ghidra.program.model.symbol.Reference ref = refs.next();
+                Function fn = funcMgr.getFunctionContaining(ref.getFromAddress());
+                if (fn == null) continue;
+                Address key = fn.getEntryPoint();
+                if (!byFunction.containsKey(key)) {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("name", fn.getName(true));
+                    entry.put("address", key.toString(false));
+                    entry.put("strings", new ArrayList<String>());
+                    byFunction.put(key, entry);
+                }
+                @SuppressWarnings("unchecked")
+                List<String> strings = (List<String>) byFunction.get(key).get("strings");
+                if (!strings.contains(value)) strings.add(value);
+            }
+        }
+
+        List<Map<String, Object>> results = new ArrayList<>(byFunction.values());
+        int total = results.size();
+        int from = Math.min(offset, total);
+        int to = Math.min(from + limit, total);
+
+        return Response.ok(JsonHelper.mapOf(
+                "matches", results.subList(from, to),
+                "total", total,
+                "pattern", patternStr,
+                "offset", offset,
+                "limit", limit
+        ));
+    }
+
     @McpTool(path = "/search_strings", description = "Search strings by regex pattern.", category = "listing")
     public Response searchStrings(
             @Param(value = "search_term", description = "Regex search pattern") String query,

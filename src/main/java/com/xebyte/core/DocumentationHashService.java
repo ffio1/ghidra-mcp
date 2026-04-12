@@ -1116,4 +1116,89 @@ public class DocumentationHashService {
             return Response.err(e.getMessage());
         }
     }
+
+    /**
+     * Compare a function in the source program with a function at a known address in a reference
+     * program. Returns the reference function's resolved name, structural similarity score (0–1),
+     * and callee names from the reference. Designed for VMProtect stub identification: find the
+     * equivalent caller in the unprotected reference binary, pass its address here, and get the
+     * callee name that reveals what the stub wraps.
+     */
+    @McpTool(path = "/compare_function_with_program",
+             description = "Compare an unknown function in the source program with a function at a known "
+                         + "address in a reference program (e.g. an unprotected older version). Returns "
+                         + "the reference function's name, structural similarity score (0.0–1.0), and its "
+                         + "callee names — ideal for identifying VMProtect stubs by cross-version comparison. "
+                         + "On programs with multiple address spaces, prefix addresses with the space name "
+                         + "(mem:1000).",
+             category = "documentation")
+    public Response compareFunctionWithProgram(
+            @Param(value = "address", paramType = "address",
+                   description = "Address of the unknown function in the source program") String sourceAddress,
+            @Param(value = "reference_address", paramType = "address",
+                   description = "Address of the corresponding function in the reference program") String refAddress,
+            @Param(value = "reference_program",
+                   description = "Name of the reference program (e.g. 'binary_older_version.exe')") String refProgramName,
+            @Param(value = "program", defaultValue = "",
+                   description = "Source program name (omit to use the active program)") String sourceProgramName) {
+
+        ServiceUtils.ProgramOrError peSource = ServiceUtils.getProgramOrError(programProvider, sourceProgramName);
+        if (peSource.hasError()) return peSource.error();
+        Program progSource = peSource.program();
+
+        if (refProgramName == null || refProgramName.trim().isEmpty())
+            return Response.err("reference_program is required");
+        ServiceUtils.ProgramOrError peRef = ServiceUtils.getProgramOrError(programProvider, refProgramName);
+        if (peRef.hasError()) return peRef.error();
+        Program progRef = peRef.program();
+
+        try {
+            Address addrSource = ServiceUtils.parseAddress(progSource, sourceAddress);
+            if (addrSource == null) return Response.err(ServiceUtils.getLastParseError());
+
+            Address addrRef = ServiceUtils.parseAddress(progRef, refAddress);
+            if (addrRef == null) return Response.err(ServiceUtils.getLastParseError());
+
+            Function funcSource = progSource.getFunctionManager().getFunctionAt(addrSource);
+            if (funcSource == null) return Response.err("No function at address: " + sourceAddress);
+
+            Function funcRef = progRef.getFunctionManager().getFunctionAt(addrRef);
+            if (funcRef == null) return Response.err("No function at reference_address: " + refAddress);
+
+            // Structural similarity via BinaryComparisonService
+            BinaryComparisonService.FunctionSignature sigSource =
+                    BinaryComparisonService.computeFunctionSignature(progSource, funcSource, new ConsoleTaskMonitor());
+            BinaryComparisonService.FunctionSignature sigRef =
+                    BinaryComparisonService.computeFunctionSignature(progRef, funcRef, new ConsoleTaskMonitor());
+            double similarity = BinaryComparisonService.computeSimilarity(sigSource, sigRef);
+
+            // Callee names from the reference function (these reveal what the stub wraps)
+            List<String> refCallees = new ArrayList<>();
+            for (Function callee : funcRef.getCalledFunctions(new ConsoleTaskMonitor())) {
+                refCallees.add(callee.getName(true));
+            }
+            Collections.sort(refCallees);
+
+            // Confidence tier
+            String confidence;
+            if (similarity >= 0.9)      confidence = "high";
+            else if (similarity >= 0.7) confidence = "medium";
+            else if (similarity >= 0.5) confidence = "low";
+            else                        confidence = "unlikely_match";
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("source_address", addrSource.toString());
+            result.put("source_name", funcSource.getName());
+            result.put("reference_address", addrRef.toString());
+            result.put("reference_name", funcRef.getName(true));
+            result.put("similarity_score", Math.round(similarity * 1000.0) / 1000.0);
+            result.put("confidence", confidence);
+            result.put("reference_body_size", funcRef.getBody().getNumAddresses());
+            result.put("reference_callees", refCallees);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Comparison failed: " + e.getMessage());
+        }
+    }
 }
