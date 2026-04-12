@@ -4278,7 +4278,7 @@ public class AnalysisService {
                 // Only care about 'undefined' return (not void, not typed)
                 if (retType == null) continue;
                 String retName = retType.getName();
-                if (!retName.equals("undefined")) continue;
+                if (!retName.startsWith("undefined")) continue;
 
                 String funcName = func.getName();
                 if (pattern != null && !pattern.matcher(funcName).find()) continue;
