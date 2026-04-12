@@ -21,11 +21,7 @@ import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.Varnode;
-import ghidra.program.model.symbol.Reference;
-import ghidra.program.model.symbol.ReferenceIterator;
-import ghidra.program.model.symbol.ReferenceManager;
-import ghidra.program.model.symbol.SourceType;
-import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.*;
 
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
@@ -5859,6 +5855,410 @@ public class AnalysisService {
         } catch (Exception e) {
             return Response.err("Param type inference failed: " + e.getMessage());
         }
+    }
+
+    // ========================================================================
+    // Global variable analysis: analyze a DAT_ address
+    // ========================================================================
+
+    @McpTool(path = "/analyze_global",
+             description = "Analyze a global variable (DAT_ address) by examining all reads and writes. "
+                         + "Infers type from store/load instructions, suggests a name from usage context "
+                         + "(which functions write it, how readers use the value).",
+             category = "analysis")
+    public Response analyzeGlobal(
+            @Param(value = "address",
+                   description = "Address of the global variable (e.g. 0x0135f54c)") String addrStr,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (addrStr == null || addrStr.isEmpty()) {
+            return Response.err("address is required");
+        }
+
+        Address addr = ServiceUtils.parseAddress(program, addrStr);
+        if (addr == null) return Response.err("Invalid address");
+
+        try {
+            Listing listing = program.getListing();
+            ReferenceManager refMgr = program.getReferenceManager();
+            Memory mem = program.getMemory();
+
+            // Get current label/name
+            Symbol sym = program.getSymbolTable().getPrimarySymbol(addr);
+            String currentName = sym != null ? sym.getName() : "unnamed";
+
+            // Read current value at address
+            String currentValue = "unknown";
+            try {
+                int val = mem.getInt(addr);
+                currentValue = "0x" + Integer.toHexString(val) + " (" + val + ")";
+            } catch (Exception ignored) {}
+
+            // Collect all references
+            List<Map<String, Object>> writes = new ArrayList<>();
+            List<Map<String, Object>> reads = new ArrayList<>();
+
+            // Track type evidence
+            boolean hasFloatStore = false;
+            boolean hasFloatLoad = false;
+            boolean hasPointerStore = false;
+            boolean onlyBoolValues = true;
+            boolean hasVtableValue = false;
+            Set<String> writerFunctions = new LinkedHashSet<>();
+            Set<String> readerFunctions = new LinkedHashSet<>();
+
+            ReferenceIterator refIter = refMgr.getReferencesTo(addr);
+            while (refIter.hasNext()) {
+                Reference ref = refIter.next();
+                Address fromAddr = ref.getFromAddress();
+                Function func = program.getFunctionManager().getFunctionContaining(fromAddr);
+                String funcName = func != null ? func.getName() : "unknown";
+                String funcNs = func != null ? func.getParentNamespace().getName(true) : "";
+
+                Instruction instr = listing.getInstructionAt(fromAddr);
+                if (instr == null) continue;
+
+                String mnem = instr.getMnemonicString();
+                boolean isWrite = ref.getReferenceType().isWrite();
+
+                // Detect writes vs reads from instruction pattern
+                if (!isWrite) {
+                    // Check if this instruction writes to the address
+                    if (mnem.equals("MOV") || mnem.equals("FSTP") || mnem.equals("AND") ||
+                        mnem.equals("OR") || mnem.equals("XOR") || mnem.equals("INC") ||
+                        mnem.equals("DEC")) {
+                        if (instr.getNumOperands() >= 1) {
+                            String op0 = instr.getDefaultOperandRepresentation(0);
+                            if (op0.contains(addrStr.replace("0x", "").toUpperCase()) ||
+                                op0.contains(addrStr.replace("0x", "").toLowerCase())) {
+                                isWrite = true;
+                            }
+                        }
+                    }
+                }
+
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("from_address", fromAddr.toString());
+                entry.put("function", funcNs.isEmpty() ? funcName : funcNs + "::" + funcName);
+                entry.put("instruction", instr.toString());
+
+                if (isWrite || mnem.equals("FSTP") || mnem.equals("MOV")) {
+                    // Check what's being stored
+                    if (mnem.equals("FSTP")) {
+                        hasFloatStore = true;
+                        entry.put("store_type", "float");
+                    } else if (mnem.equals("MOV") && instr.getNumOperands() >= 2) {
+                        String op0 = instr.getDefaultOperandRepresentation(0);
+                        String op1 = instr.getDefaultOperandRepresentation(1);
+
+                        // Check if op0 is our address (write) or op1 is (read)
+                        boolean isStoreToAddr = op0.contains("[") && !op1.contains("[");
+                        if (isStoreToAddr) {
+                            // Analyze stored value
+                            if (op1.startsWith("0x")) {
+                                try {
+                                    long val = Long.parseLong(op1.substring(2), 16);
+                                    if (val != 0 && val != 1) onlyBoolValues = false;
+                                    if (val >= 0x010b7000L && val <= 0x01242fffL) {
+                                        hasVtableValue = true;
+                                        entry.put("store_type", "vtable_ptr");
+                                    } else if (val >= 0x00401000L && val <= 0x010b61ffL) {
+                                        entry.put("store_type", "code_ptr");
+                                        hasPointerStore = true;
+                                    } else {
+                                        entry.put("store_type", "immediate");
+                                    }
+                                } catch (Exception e) {
+                                    entry.put("store_type", "immediate");
+                                }
+                            } else if (op1.equals("EAX") || op1.equals("ECX") || op1.equals("EDX") ||
+                                       op1.equals("ESI") || op1.equals("EDI") || op1.equals("EBX")) {
+                                entry.put("store_type", "register");
+                                hasPointerStore = true; // Could be pointer
+                                onlyBoolValues = false;
+                            }
+                            isWrite = true;
+                        }
+                    }
+                }
+
+                if (mnem.equals("FLD") || mnem.equals("FMUL") || mnem.equals("FADD") ||
+                    mnem.equals("FSUB") || mnem.equals("FCOMP")) {
+                    hasFloatLoad = true;
+                }
+
+                if (isWrite) {
+                    writes.add(entry);
+                    writerFunctions.add(funcNs.isEmpty() ? funcName : funcNs + "::" + funcName);
+                } else {
+                    reads.add(entry);
+                    readerFunctions.add(funcNs.isEmpty() ? funcName : funcNs + "::" + funcName);
+                }
+            }
+
+            // Infer type
+            String inferredType;
+            if (hasFloatStore || hasFloatLoad) {
+                inferredType = "float";
+            } else if (hasVtableValue) {
+                inferredType = "void * (vtable)";
+            } else if (onlyBoolValues && !writes.isEmpty()) {
+                inferredType = "bool";
+            } else if (hasPointerStore) {
+                inferredType = "void *";
+            } else {
+                inferredType = "int";
+            }
+
+            // Infer name suggestion
+            String nameSuggestion = null;
+            if (writerFunctions.size() == 1) {
+                String writer = writerFunctions.iterator().next();
+                if (writer.contains("Init") || writer.contains("Constructor")) {
+                    nameSuggestion = "g_" + writer.replaceAll("::.*", "") + "_instance";
+                } else if (writer.contains("GetSingleton")) {
+                    nameSuggestion = "g_" + writer.replaceAll("::.*", "") + "_singleton";
+                }
+            }
+            if (inferredType.equals("bool")) {
+                nameSuggestion = "g_flag_" + addrStr.replace("0x", "");
+            }
+
+            // Cap output size
+            if (writes.size() > 20) writes = writes.subList(0, 20);
+            if (reads.size() > 20) reads = reads.subList(0, 20);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("address", addrStr);
+            result.put("current_name", currentName);
+            result.put("current_value", currentValue);
+            result.put("inferred_type", inferredType);
+            result.put("name_suggestion", nameSuggestion);
+            result.put("write_count", writerFunctions.size());
+            result.put("read_count", readerFunctions.size());
+            result.put("total_xrefs", writerFunctions.size() + readerFunctions.size());
+            result.put("writer_functions", new ArrayList<>(writerFunctions));
+            result.put("reader_functions", new ArrayList<>(readerFunctions));
+            result.put("writes", writes);
+            result.put("reads", reads);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Global analysis failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Global variable analysis: find unnamed globals
+    // ========================================================================
+
+    @McpTool(path = "/find_unnamed_globals",
+             description = "Find DAT_ global variables with default names, sorted by xref count. "
+                         + "High-xref globals are the most impactful to name and type.",
+             category = "analysis")
+    public Response findUnnamedGlobals(
+            @Param(value = "min_xrefs", defaultValue = "5",
+                   description = "Minimum xref count to include") int minXrefs,
+            @Param(value = "segment", defaultValue = ".data",
+                   description = "Memory segment to scan (.data, .rdata, or both)") String segment,
+            @Param(value = "limit", defaultValue = "100",
+                   description = "Maximum results") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            ReferenceManager refMgr = program.getReferenceManager();
+            Memory mem = program.getMemory();
+            SymbolTable symTable = program.getSymbolTable();
+
+            List<Map<String, Object>> candidates = new ArrayList<>();
+
+            // Iterate symbols in the target segment(s)
+            SymbolIterator symIter = symTable.getAllSymbols(true);
+            while (symIter.hasNext()) {
+                Symbol sym = symIter.next();
+                String name = sym.getName();
+                if (!name.startsWith("DAT_")) continue;
+
+                Address addr = sym.getAddress();
+                MemoryBlock block = mem.getBlock(addr);
+                if (block == null) continue;
+
+                String blockName = block.getName();
+                if (segment.equals("both")) {
+                    if (!blockName.equals(".data") && !blockName.equals(".rdata")) continue;
+                } else {
+                    if (!blockName.equals(segment)) continue;
+                }
+
+                // Count xrefs
+                int xrefCount = 0;
+                ReferenceIterator refIter = refMgr.getReferencesTo(addr);
+                while (refIter.hasNext()) {
+                    refIter.next();
+                    xrefCount++;
+                }
+
+                if (xrefCount < minXrefs) continue;
+
+                // Quick type inference from current data
+                String quickType = "int";
+                try {
+                    Data data = program.getListing().getDataAt(addr);
+                    if (data != null) {
+                        String dtName = data.getDataType().getName();
+                        if (!dtName.startsWith("undefined")) {
+                            quickType = dtName;
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("address", addr.toString());
+                info.put("name", name);
+                info.put("segment", blockName);
+                info.put("xref_count", xrefCount);
+                info.put("current_type", quickType);
+                candidates.add(info);
+            }
+
+            candidates.sort((a, b) -> Integer.compare((int) b.get("xref_count"), (int) a.get("xref_count")));
+            if (candidates.size() > limit) candidates = candidates.subList(0, limit);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total", candidates.size());
+            result.put("candidates", candidates);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Unnamed globals scan failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Global variable analysis: bulk rename globals
+    // ========================================================================
+
+    @McpTool(path = "/bulk_rename_globals",
+             description = "Batch rename and retype global variables (DAT_ addresses). "
+                         + "Pass a JSON array of {address, name, type?} objects.",
+             category = "analysis")
+    public Response bulkRenameGlobals(
+            @Param(value = "renames",
+                   description = "JSON array: [{\"address\":\"0135f54c\",\"name\":\"g_ServiceManager\",\"type\":\"void *\"}, ...]"
+                   ) String renamesJson,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (renamesJson == null || renamesJson.isEmpty()) {
+            return Response.err("renames parameter is required");
+        }
+
+        // Parse JSON
+        List<Map<String, String>> renames = new ArrayList<>();
+        try {
+            String trimmed = renamesJson.trim();
+            if (trimmed.startsWith("[")) trimmed = trimmed.substring(1);
+            if (trimmed.endsWith("]")) trimmed = trimmed.substring(0, trimmed.length() - 1);
+            String[] entries = trimmed.split("\\}\\s*,\\s*\\{");
+            for (String entry : entries) {
+                entry = entry.replaceAll("[\\{\\}]", "").trim();
+                Map<String, String> fields = new LinkedHashMap<>();
+                for (String field : entry.split(",")) {
+                    field = field.trim();
+                    int colonIdx = field.indexOf(':');
+                    if (colonIdx > 0) {
+                        String key = field.substring(0, colonIdx).trim().replaceAll("\"", "");
+                        String val = field.substring(colonIdx + 1).trim().replaceAll("\"", "");
+                        fields.put(key, val);
+                    }
+                }
+                if (fields.containsKey("address") && fields.containsKey("name")) {
+                    renames.add(fields);
+                }
+            }
+        } catch (Exception e) {
+            return Response.err("Failed to parse JSON: " + e.getMessage());
+        }
+
+        final List<Map<String, Object>> results = new ArrayList<>();
+
+        try {
+            threadingStrategy.executeWrite(program, "Bulk rename globals", () -> {
+                SymbolTable symTable = program.getSymbolTable();
+
+                for (Map<String, String> rename : renames) {
+                    String addrStr = rename.get("address");
+                    String newName = rename.get("name");
+                    String typeStr = rename.get("type");
+
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("address", addrStr);
+
+                    Address addr = ServiceUtils.parseAddress(program, addrStr);
+                    if (addr == null) {
+                        entry.put("status", "error");
+                        entry.put("message", "Invalid address");
+                        results.add(entry);
+                        continue;
+                    }
+
+                    try {
+                        // Rename
+                        Symbol sym = symTable.getPrimarySymbol(addr);
+                        String oldName = sym != null ? sym.getName() : "unnamed";
+
+                        if (sym != null) {
+                            sym.setName(newName, SourceType.USER_DEFINED);
+                        } else {
+                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
+                        }
+
+                        // Retype if specified
+                        if (typeStr != null && !typeStr.isEmpty()) {
+                            DataType newType = resolveDataType(program, typeStr);
+                            if (newType != null) {
+                                Listing listing = program.getListing();
+                                listing.clearCodeUnits(addr, addr.add(newType.getLength() - 1), false);
+                                listing.createData(addr, newType);
+                                entry.put("new_type", newType.getName());
+                            }
+                        }
+
+                        entry.put("status", "success");
+                        entry.put("old_name", oldName);
+                        entry.put("new_name", newName);
+                    } catch (Exception e) {
+                        entry.put("status", "error");
+                        entry.put("message", e.getMessage());
+                    }
+                    results.add(entry);
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Bulk rename failed: " + e.getMessage());
+        }
+
+        int ok = 0;
+        for (Map<String, Object> r : results) if ("success".equals(r.get("status"))) ok++;
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("total", results.size());
+        result.put("success_count", ok);
+        result.put("error_count", results.size() - ok);
+        result.put("results", results);
+        return Response.ok(result);
     }
 }
 
