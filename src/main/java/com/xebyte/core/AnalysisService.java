@@ -26,6 +26,7 @@ import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.ReferenceManager;
+import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 
 import ghidra.util.Msg;
@@ -4238,6 +4239,366 @@ public class AnalysisService {
         } catch (Exception e) {
             return Response.err("VMP stub scan failed: " + e.getMessage());
         }
+    }
+
+    // ========================================================================
+    // Decompilation quality: find bad return types
+    // ========================================================================
+
+    @McpTool(path = "/find_bad_return_types",
+             description = "Find functions with 'undefined' return type that have many callers — these cause "
+                         + "CONCAT44/extraout_EDX artifacts in the decompiler. Returns candidates sorted by "
+                         + "caller count (highest impact first). Fix with set_function_prototype.",
+             category = "analysis")
+    public Response findBadReturnTypes(
+            @Param(value = "min_callers", defaultValue = "3",
+                   description = "Minimum number of callers to include (higher = higher impact fixes)") int minCallers,
+            @Param(value = "limit", defaultValue = "100",
+                   description = "Maximum results to return") int limit,
+            @Param(value = "name_pattern", defaultValue = "",
+                   description = "Optional name filter regex (e.g. 'Get' to find getters)") String namePattern,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            ReferenceManager refMgr = program.getReferenceManager();
+            Pattern pattern = (namePattern != null && !namePattern.isEmpty())
+                    ? Pattern.compile(namePattern, Pattern.CASE_INSENSITIVE) : null;
+
+            List<Map<String, Object>> candidates = new ArrayList<>();
+
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                Function func = iter.next();
+                DataType retType = func.getReturnType();
+
+                // Only care about 'undefined' return (not void, not typed)
+                if (retType == null) continue;
+                String retName = retType.getName();
+                if (!retName.equals("undefined")) continue;
+
+                String funcName = func.getName();
+                if (pattern != null && !pattern.matcher(funcName).find()) continue;
+
+                // Count callers
+                int callerCount = 0;
+                ReferenceIterator refIter = refMgr.getReferencesTo(func.getEntryPoint());
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (ref.getReferenceType().isCall()) callerCount++;
+                }
+
+                if (callerCount < minCallers) continue;
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("address", func.getEntryPoint().toString());
+                info.put("name", funcName);
+                info.put("namespace", func.getParentNamespace().getName(true));
+                info.put("caller_count", callerCount);
+                info.put("body_size", func.getBody().getNumAddresses());
+                info.put("current_signature", func.getSignature().getPrototypeString(false));
+                candidates.add(info);
+            }
+
+            candidates.sort((a, b) -> Integer.compare((int) b.get("caller_count"), (int) a.get("caller_count")));
+            if (candidates.size() > limit) candidates = candidates.subList(0, limit);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total", candidates.size());
+            result.put("min_callers_used", minCallers);
+            result.put("candidates", candidates);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Bad return type scan failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Decompilation quality: find register param functions
+    // ========================================================================
+
+    @McpTool(path = "/find_register_params",
+             description = "Find functions that use ESI/EDI/EBX as implicit parameters — first instruction "
+                         + "reads a register not set by standard calling conventions. These decompile with "
+                         + "phantom stack params. Returns each with the register used and caller count.",
+             category = "analysis")
+    public Response findRegisterParams(
+            @Param(value = "min_callers", defaultValue = "2",
+                   description = "Minimum callers to include") int minCallers,
+            @Param(value = "limit", defaultValue = "100",
+                   description = "Maximum results") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            Memory mem = program.getMemory();
+            Listing listing = program.getListing();
+            ReferenceManager refMgr = program.getReferenceManager();
+
+            // Registers that are NOT standard calling convention params (ESI, EDI, EBX)
+            // but are sometimes used as implicit params
+            String[] targetRegs = {"ESI", "EDI", "EBX"};
+
+            List<Map<String, Object>> candidates = new ArrayList<>();
+
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                Function func = iter.next();
+                Address start = func.getEntryPoint();
+
+                // Skip tiny/thunk functions
+                long bodySize = func.getBody().getNumAddresses();
+                if (bodySize < 10) continue;
+
+                // Look at first few instructions for register reads
+                String implicitReg = null;
+                try {
+                    Instruction instr = listing.getInstructionAt(start);
+                    // Skip common prologue (PUSH EBP; MOV EBP,ESP; ...)
+                    int skipCount = 0;
+                    while (instr != null && skipCount < 6) {
+                        String mnem = instr.getMnemonicString();
+                        if (mnem.equals("PUSH") || mnem.equals("MOV") || mnem.equals("SUB") ||
+                            mnem.equals("AND") || mnem.equals("LEA")) {
+                            // Check if this instruction READS (not writes) a non-standard register
+                            String rep = instr.toString();
+                            for (String reg : targetRegs) {
+                                // TEST REG,REG or CMP [REG+x] or MOV x,[REG] patterns
+                                // But NOT PUSH REG (that's saving, not using as param)
+                                if (mnem.equals("PUSH") && rep.contains(reg)) {
+                                    // PUSH ESI is just saving — skip
+                                    continue;
+                                }
+                            }
+                            instr = instr.getNext();
+                            skipCount++;
+                            continue;
+                        }
+                        if (mnem.equals("TEST") || mnem.equals("CMP")) {
+                            String op0 = instr.getDefaultOperandRepresentation(0);
+                            for (String reg : targetRegs) {
+                                if (op0.equals(reg)) {
+                                    implicitReg = reg;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                } catch (Exception ignored) {}
+
+                if (implicitReg == null) continue;
+
+                // Count callers
+                int callerCount = 0;
+                ReferenceIterator refIter = refMgr.getReferencesTo(start);
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (ref.getReferenceType().isCall()) callerCount++;
+                }
+
+                if (callerCount < minCallers) continue;
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("address", start.toString());
+                info.put("name", func.getName());
+                info.put("namespace", func.getParentNamespace().getName(true));
+                info.put("implicit_register", implicitReg);
+                info.put("caller_count", callerCount);
+                info.put("current_signature", func.getSignature().getPrototypeString(false));
+                candidates.add(info);
+            }
+
+            candidates.sort((a, b) -> Integer.compare((int) b.get("caller_count"), (int) a.get("caller_count")));
+            if (candidates.size() > limit) candidates = candidates.subList(0, limit);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total", candidates.size());
+            result.put("candidates", candidates);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Register param scan failed: " + e.getMessage());
+        }
+    }
+
+    // ========================================================================
+    // Decompilation quality: bulk fix return types
+    // ========================================================================
+
+    @McpTool(path = "/bulk_fix_return_types",
+             description = "Batch-set return types on multiple functions without rewriting full prototypes. "
+                         + "Pass a JSON array of {address, return_type} objects. Much faster than calling "
+                         + "set_function_prototype individually for each function.",
+             category = "analysis")
+    public Response bulkFixReturnTypes(
+            @Param(value = "fixes", source = ParamSource.BODY,
+                   description = "JSON array of objects: [{\"address\":\"00401000\",\"return_type\":\"int *\"}, ...]") String fixesJson,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (fixesJson == null || fixesJson.isEmpty()) {
+            return Response.err("fixes parameter is required (JSON array of {address, return_type})");
+        }
+
+        // Parse the JSON array manually (simple format)
+        List<String[]> fixes = new ArrayList<>();
+        try {
+            // Strip outer brackets
+            String trimmed = fixesJson.trim();
+            if (trimmed.startsWith("[")) trimmed = trimmed.substring(1);
+            if (trimmed.endsWith("]")) trimmed = trimmed.substring(0, trimmed.length() - 1);
+
+            // Split by }, {
+            String[] entries = trimmed.split("\\}\\s*,\\s*\\{");
+            for (String entry : entries) {
+                entry = entry.replaceAll("[\\{\\}]", "").trim();
+                String addr = null, retType = null;
+                for (String field : entry.split(",")) {
+                    field = field.trim();
+                    if (field.contains("address")) {
+                        addr = field.split(":")[1].trim().replaceAll("\"", "");
+                    } else if (field.contains("return_type")) {
+                        retType = field.split(":", 2)[1].trim().replaceAll("\"", "");
+                    }
+                }
+                if (addr != null && retType != null) {
+                    fixes.add(new String[]{addr, retType});
+                }
+            }
+        } catch (Exception e) {
+            return Response.err("Failed to parse fixes JSON: " + e.getMessage());
+        }
+
+        if (fixes.isEmpty()) {
+            return Response.err("No valid {address, return_type} entries found in input");
+        }
+
+        final List<Map<String, Object>> results = new ArrayList<>();
+
+        try {
+            threadingStrategy.executeWrite(program, "Bulk fix return types", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+
+                for (String[] fix : fixes) {
+                    String addrStr = fix[0];
+                    String retTypeStr = fix[1];
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("address", addrStr);
+
+                    Address addr = ServiceUtils.parseAddress(program, addrStr);
+                    if (addr == null) {
+                        entry.put("status", "error");
+                        entry.put("message", "Invalid address");
+                        results.add(entry);
+                        continue;
+                    }
+
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        entry.put("status", "error");
+                        entry.put("message", "No function at address");
+                        results.add(entry);
+                        continue;
+                    }
+
+                    // Parse the return type
+                    DataType newRetType = null;
+                    // Handle common types directly
+                    switch (retTypeStr.trim()) {
+                        case "void":
+                            newRetType = ghidra.program.model.data.VoidDataType.dataType;
+                            break;
+                        case "int":
+                            newRetType = ghidra.program.model.data.IntegerDataType.dataType;
+                            break;
+                        case "uint":
+                        case "unsigned int":
+                            newRetType = ghidra.program.model.data.UnsignedIntegerDataType.dataType;
+                            break;
+                        case "int *":
+                        case "int*":
+                            newRetType = new ghidra.program.model.data.PointerDataType(
+                                    ghidra.program.model.data.IntegerDataType.dataType);
+                            break;
+                        case "void *":
+                        case "void*":
+                            newRetType = new ghidra.program.model.data.PointerDataType(
+                                    ghidra.program.model.data.VoidDataType.dataType);
+                            break;
+                        case "char *":
+                        case "char*":
+                            newRetType = new ghidra.program.model.data.PointerDataType(
+                                    ghidra.program.model.data.CharDataType.dataType);
+                            break;
+                        case "bool":
+                            newRetType = ghidra.program.model.data.BooleanDataType.dataType;
+                            break;
+                        case "float":
+                            newRetType = ghidra.program.model.data.FloatDataType.dataType;
+                            break;
+                        case "double":
+                            newRetType = ghidra.program.model.data.DoubleDataType.dataType;
+                            break;
+                        default:
+                            // Try to find in DTM
+                            Iterator<DataType> dtIter = dtm.getAllDataTypes();
+                            while (dtIter.hasNext()) {
+                                DataType dt = dtIter.next();
+                                if (dt.getName().equals(retTypeStr)) {
+                                    newRetType = dt;
+                                    break;
+                                }
+                            }
+                    }
+
+                    if (newRetType == null) {
+                        entry.put("status", "error");
+                        entry.put("message", "Unknown type: " + retTypeStr);
+                        results.add(entry);
+                        continue;
+                    }
+
+                    try {
+                        String oldRet = func.getReturnType().getName();
+                        func.setReturnType(newRetType, SourceType.USER_DEFINED);
+                        entry.put("status", "success");
+                        entry.put("name", func.getName());
+                        entry.put("old_return", oldRet);
+                        entry.put("new_return", newRetType.getName());
+                    } catch (Exception e) {
+                        entry.put("status", "error");
+                        entry.put("message", e.getMessage());
+                    }
+                    results.add(entry);
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Bulk fix failed: " + e.getMessage());
+        }
+
+        int successCount = 0;
+        for (Map<String, Object> r : results) {
+            if ("success".equals(r.get("status"))) successCount++;
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("total", results.size());
+        result.put("success_count", successCount);
+        result.put("error_count", results.size() - successCount);
+        result.put("results", results);
+        return Response.ok(result);
     }
 }
 

@@ -7,6 +7,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
@@ -1666,27 +1667,120 @@ public class FunctionService {
 
                 String oldStorage = targetVar.getVariableStorage().toString();
 
-                // Ghidra's variable storage API has limited programmatic access
-                // The proper way to change variable storage is through the decompiler UI
-                resultMsg.append("Note: Programmatic variable storage control is limited in Ghidra.\n\n");
-                resultMsg.append("Current variable information:\n");
-                resultMsg.append("  Variable: ").append(variableName).append("\n");
-                resultMsg.append("  Function: ").append(func.getName()).append(" @ ").append(functionAddrStr).append("\n");
-                resultMsg.append("  Current storage: ").append(oldStorage).append("\n");
-                resultMsg.append("  Requested storage: ").append(storageSpec).append("\n\n");
-                resultMsg.append("To change variable storage:\n");
-                resultMsg.append("1. Open the function in Ghidra's Decompiler window\n");
-                resultMsg.append("2. Right-click on the variable '").append(variableName).append("'\n");
-                resultMsg.append("3. Select 'Edit Data Type' or 'Retype Variable'\n");
-                resultMsg.append("4. Manually adjust the storage location\n\n");
-                resultMsg.append("Alternative approach:\n");
-                resultMsg.append("- Use run_script() to execute a custom Ghidra script\n");
-                resultMsg.append("- The script can use high-level Pcode/HighVariable API\n");
-                resultMsg.append("- See FixEBPRegisterReuse.java for an example\n");
+                // Check if this is a parameter — register storage for params
+                // requires custom storage mode and replaceParameters
+                boolean isParam = (targetVar instanceof Parameter);
+
+                // Try to resolve the storage spec as a register
+                ghidra.program.model.lang.Register reg =
+                        program.getLanguage().getRegister(storageSpec.trim().toUpperCase());
+
+                if (reg != null) {
+                    // Register-based storage
+                    VariableStorage newStorage = new VariableStorage(program, reg);
+
+                    if (isParam) {
+                        // For parameters, we need to use custom storage mode
+                        Parameter param = (Parameter) targetVar;
+                        int ordinal = param.getOrdinal();
+                        DataType dt = param.getDataType();
+
+                        // Enable custom storage if not already
+                        func.setCustomVariableStorage(true);
+
+                        // Build new parameter list with updated storage
+                        Parameter[] oldParams = func.getParameters();
+                        List<Variable> newParams = new ArrayList<>();
+                        for (Parameter p : oldParams) {
+                            if (p.getOrdinal() == ordinal) {
+                                ParameterImpl newParam = new ParameterImpl(
+                                        variableName, dt, newStorage, program);
+                                newParams.add(newParam);
+                            } else {
+                                newParams.add(p);
+                            }
+                        }
+                        func.replaceParameters(newParams,
+                                Function.FunctionUpdateType.CUSTOM_STORAGE, true,
+                                SourceType.USER_DEFINED);
+
+                        resultMsg.append("Success: Set parameter '").append(variableName)
+                                .append("' storage from ").append(oldStorage)
+                                .append(" to ").append(reg.getName());
+                    } else {
+                        // For locals, remove old and add new with register storage
+                        DataType dt = targetVar.getDataType();
+                        String name = targetVar.getName();
+                        func.removeVariable(targetVar);
+                        LocalVariableImpl newVar = new LocalVariableImpl(
+                                name, 0, dt, newStorage, program);
+                        func.addLocalVariable(newVar, SourceType.USER_DEFINED);
+
+                        resultMsg.append("Success: Set local '").append(variableName)
+                                .append("' storage from ").append(oldStorage)
+                                .append(" to ").append(reg.getName());
+                    }
+                } else {
+                    // Try stack storage: "Stack[0x10]" or "0x10" or "-0x4"
+                    try {
+                        String cleaned = storageSpec.trim()
+                                .replaceAll("(?i)stack\\[", "")
+                                .replaceAll("]", "")
+                                .replaceAll("\\s", "");
+                        int stackOffset;
+                        if (cleaned.startsWith("-")) {
+                            stackOffset = -Integer.parseInt(
+                                    cleaned.substring(1).replaceFirst("0x", ""), 16);
+                        } else {
+                            stackOffset = Integer.parseInt(
+                                    cleaned.replaceFirst("0x", ""), 16);
+                        }
+
+                        DataType dt = targetVar.getDataType();
+                        String name = targetVar.getName();
+                        VariableStorage newStorage = new VariableStorage(
+                                program, stackOffset, dt.getLength());
+
+                        if (isParam) {
+                            Parameter param = (Parameter) targetVar;
+                            int ordinal = param.getOrdinal();
+                            func.setCustomVariableStorage(true);
+                            Parameter[] oldParams = func.getParameters();
+                            List<Variable> newParams = new ArrayList<>();
+                            for (Parameter p : oldParams) {
+                                if (p.getOrdinal() == ordinal) {
+                                    newParams.add(new ParameterImpl(
+                                            variableName, dt, newStorage, program));
+                                } else {
+                                    newParams.add(p);
+                                }
+                            }
+                            func.replaceParameters(newParams,
+                                    Function.FunctionUpdateType.CUSTOM_STORAGE, true,
+                                    SourceType.USER_DEFINED);
+                        } else {
+                            func.removeVariable(targetVar);
+                            func.addLocalVariable(new LocalVariableImpl(
+                                    name, 0, dt, newStorage, program),
+                                    SourceType.USER_DEFINED);
+                        }
+
+                        resultMsg.append("Success: Set '").append(variableName)
+                                .append("' storage from ").append(oldStorage)
+                                .append(" to Stack[0x")
+                                .append(Integer.toHexString(stackOffset)).append("]");
+                    } catch (NumberFormatException nfe) {
+                        resultMsg.append("Error: '").append(storageSpec)
+                                .append("' is not a valid register name or stack offset. "
+                                        + "Use register name (ESI, EDI, EBX, ECX, EDX, EAX) "
+                                        + "or stack offset (Stack[0x10], -0x4)");
+                        return null;
+                    }
+                }
 
                 success.set(true);
-                Msg.info(this, "Variable storage query for: " + variableName + " in " + func.getName() +
-                         " (current: " + oldStorage + ", requested: " + storageSpec + ")");
+                Msg.info(this, "Variable storage changed for: " + variableName + " in " + func.getName() +
+                         " (was: " + oldStorage + ", now: " + storageSpec + ")");
                 return null;
             });
         } catch (Exception e) {
