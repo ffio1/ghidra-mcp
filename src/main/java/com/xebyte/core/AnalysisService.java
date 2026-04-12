@@ -5708,10 +5708,13 @@ public class AnalysisService {
 
             for (Parameter param : params) {
                 Map<String, Object> analysis = new LinkedHashMap<>();
-                analysis.put("name", param.getName());
+                try {
+                analysis.put("name", param.getName() != null ? param.getName() : "param_?");
                 analysis.put("ordinal", param.getOrdinal());
-                analysis.put("current_type", param.getDataType().getName());
-                analysis.put("storage", param.getVariableStorage().toString());
+                analysis.put("current_type", param.getDataType() != null ? param.getDataType().getName() : "unknown");
+                String storageStr = param.getVariableStorage() != null ?
+                        param.getVariableStorage().toString() : "unknown";
+                analysis.put("storage", storageStr);
 
                 // Track usage patterns
                 boolean isDereferenced = false;
@@ -5722,7 +5725,7 @@ public class AnalysisService {
                 int maxFieldOffset = 0;
                 Set<Integer> fieldOffsets = new TreeSet<>();
 
-                String storage = param.getVariableStorage().toString();
+                String storage = storageStr;
                 String reg = null;
                 String stackRef = null;
 
@@ -5731,11 +5734,38 @@ public class AnalysisService {
                 else if (storage.contains("EDX")) reg = "EDX";
                 else if (storage.contains("Stack[")) {
                     stackRef = storage;
-                    // For stack params, we'd need to track which register they're loaded into
-                    // This is harder — skip for now and focus on register params
+                    // Find which register the stack param is loaded into
+                    // Parse stack offset from "Stack[0x8]:4" format
+                    String stackOffsetHex = null;
+                    try {
+                        int start = storage.indexOf("[") + 1;
+                        int end = storage.indexOf("]");
+                        stackOffsetHex = storage.substring(start, end).trim();
+                    } catch (Exception ignored) {}
+
+                    if (stackOffsetHex != null) {
+                        // Scan prologue for MOV reg, [EBP+offset]
+                        InstructionIterator scanIter = listing.getInstructions(func.getBody(), true);
+                        int scanned = 0;
+                        while (scanIter.hasNext() && scanned < 20) {
+                            Instruction si = scanIter.next();
+                            scanned++;
+                            if (si.getMnemonicString().equals("MOV") && si.getNumOperands() >= 2) {
+                                String sop0 = si.getDefaultOperandRepresentation(0);
+                                String sop1 = si.getDefaultOperandRepresentation(1);
+                                if (sop0 != null && sop1 != null && sop1.contains("EBP + " + stackOffsetHex)) {
+                                    if (sop0.equals("EAX") || sop0.equals("ECX") || sop0.equals("EDX") ||
+                                        sop0.equals("ESI") || sop0.equals("EDI") || sop0.equals("EBX")) {
+                                        reg = sop0;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
-                if (reg == null && stackRef == null) {
+                if (reg == null) {
                     analysis.put("suggested_type", "unknown");
                     analysis.put("confidence", "low");
                     paramAnalysis.add(analysis);
@@ -5846,6 +5876,9 @@ public class AnalysisService {
                 analysis.put("max_field_offset", maxFieldOffset);
                 analysis.put("is_fpu", isUsedInFpu);
                 analysis.put("is_nullable", isComparedToZero);
+                } catch (Exception paramEx) {
+                    analysis.put("error", paramEx.getMessage());
+                }
                 paramAnalysis.add(analysis);
             }
 
