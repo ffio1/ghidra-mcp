@@ -5015,6 +5015,118 @@ public class AnalysisService {
             return Response.err("Undefined params scan failed: " + e.getMessage());
         }
     }
+
+    // ========================================================================
+    // Decompilation quality: verify parameter counts
+    // ========================================================================
+
+    @McpTool(path = "/verify_param_counts",
+             description = "Find functions where the parameter count doesn't match RET N + calling convention. "
+                         + "For __stdcall, RET N / 4 = stack args. For __thiscall, add 1 (ECX). "
+                         + "For __fastcall, add 2 (ECX+EDX). Reports mismatches sorted by caller count.",
+             category = "analysis")
+    public Response verifyParamCounts(
+            @Param(value = "min_callers", defaultValue = "1",
+                   description = "Minimum callers to include") int minCallers,
+            @Param(value = "limit", defaultValue = "200",
+                   description = "Maximum results") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            Listing listing = program.getListing();
+            ReferenceManager refMgr = program.getReferenceManager();
+
+            List<Map<String, Object>> mismatches = new ArrayList<>();
+            int verifiedOk = 0;
+
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                Function func = iter.next();
+                if (func.isThunk() || func.isExternal()) continue;
+                long bodySize = func.getBody().getNumAddresses();
+                if (bodySize < 3) continue;
+
+                String convention = func.getCallingConventionName();
+                if (convention == null || convention.equals("__cdecl") || convention.equals("unknown")) {
+                    continue;
+                }
+
+                // Find RET N
+                int retCleanup = -1;
+                InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+                while (instrIter.hasNext()) {
+                    Instruction instr = instrIter.next();
+                    if (instr.getMnemonicString().equals("RET")) {
+                        if (instr.getNumOperands() > 0) {
+                            try {
+                                String op = instr.getDefaultOperandRepresentation(0);
+                                String clean = op.startsWith("0x") ? op.substring(2) : op;
+                                retCleanup = Integer.parseInt(clean, 16);
+                            } catch (Exception e) { retCleanup = 0; }
+                        } else {
+                            retCleanup = 0;
+                        }
+                        break;
+                    }
+                }
+
+                if (retCleanup < 0) continue;
+
+                int stackArgs = retCleanup / 4;
+                int expectedParams;
+                switch (convention) {
+                    case "__thiscall": expectedParams = 1 + stackArgs; break;
+                    case "__fastcall": expectedParams = 2 + stackArgs; break;
+                    case "__stdcall": expectedParams = stackArgs; break;
+                    default: continue;
+                }
+
+                int currentParams = func.getParameterCount();
+                if (currentParams == expectedParams) {
+                    verifiedOk++;
+                    continue;
+                }
+
+                // Count callers
+                int callerCount = 0;
+                ReferenceIterator refIter = refMgr.getReferencesTo(func.getEntryPoint());
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (ref.getReferenceType().isCall()) callerCount++;
+                }
+                if (callerCount < minCallers) continue;
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("address", func.getEntryPoint().toString());
+                info.put("name", func.getName());
+                info.put("namespace", func.getParentNamespace().getName(true));
+                info.put("convention", convention);
+                info.put("ret_cleanup", retCleanup);
+                info.put("current_params", currentParams);
+                info.put("expected_params", expectedParams);
+                info.put("diff", expectedParams - currentParams);
+                info.put("caller_count", callerCount);
+                info.put("current_signature", func.getSignature().getPrototypeString(false));
+                mismatches.add(info);
+            }
+
+            mismatches.sort((a, b) -> Integer.compare((int) b.get("caller_count"), (int) a.get("caller_count")));
+            if (mismatches.size() > limit) mismatches = mismatches.subList(0, limit);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total_mismatches", mismatches.size());
+            result.put("verified_ok", verifiedOk);
+            result.put("mismatches", mismatches);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Param count verification failed: " + e.getMessage());
+        }
+    }
 }
 
 
