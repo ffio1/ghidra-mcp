@@ -6297,19 +6297,125 @@ public class AnalysisService {
         result.put("results", results);
         return Response.ok(result);
     }
+
+    // ========================================================================
+    // Parameter count: verify __cdecl param counts from call sites
+    // ========================================================================
+
+    @McpTool(path = "/verify_cdecl_param_counts",
+             description = "Verify __cdecl function param counts by checking ADD ESP,N at call sites. "
+                         + "Since __cdecl callers clean the stack, the ADD ESP value is authoritative. "
+                         + "Reports mismatches sorted by caller count.",
+             category = "analysis")
+    public Response verifyCdeclParamCounts(
+            @Param(value = "min_callers", defaultValue = "2",
+                   description = "Minimum callers to include") int minCallers,
+            @Param(value = "limit", defaultValue = "200",
+                   description = "Maximum results") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            Listing listing = program.getListing();
+            ReferenceManager refMgr = program.getReferenceManager();
+
+            List<Map<String, Object>> mismatches = new ArrayList<>();
+            int verifiedOk = 0;
+
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext()) {
+                Function func = iter.next();
+                if (func.isThunk() || func.isExternal()) continue;
+
+                String convention = func.getCallingConventionName();
+                if (convention == null || !convention.equals("__cdecl")) continue;
+
+                // Check call sites for ADD ESP,N
+                Map<Integer, Integer> cleanupFreq = new LinkedHashMap<>();
+                int callSiteCount = 0;
+
+                ReferenceIterator refIter = refMgr.getReferencesTo(func.getEntryPoint());
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (!ref.getReferenceType().isCall()) continue;
+                    callSiteCount++;
+
+                    try {
+                        Instruction callInstr = listing.getInstructionAt(ref.getFromAddress());
+                        if (callInstr == null) continue;
+
+                        // Look at next 1-3 instructions for ADD ESP,N
+                        Instruction next = callInstr.getNext();
+                        for (int scan = 0; scan < 3 && next != null; scan++) {
+                            String mnem = next.getMnemonicString();
+                            if (mnem.equals("ADD") && next.getNumOperands() >= 2) {
+                                String op0 = next.getDefaultOperandRepresentation(0);
+                                String op1 = next.getDefaultOperandRepresentation(1);
+                                if (op0 != null && op1 != null && op0.equals("ESP")) {
+                                    String cleanVal = op1.startsWith("0x") ? op1.substring(2) : op1;
+                                    try {
+                                        int n = Integer.parseInt(cleanVal, 16);
+                                        int argc = n / 4;
+                                        cleanupFreq.merge(argc, 1, Integer::sum);
+                                    } catch (Exception ignored) {}
+                                    break;
+                                }
+                            }
+                            // Stop if we hit another CALL, RET, or JMP
+                            if (mnem.equals("CALL") || mnem.equals("RET") || mnem.equals("JMP")) break;
+                            next = next.getNext();
+                        }
+                    } catch (Exception ignored) {}
+                }
+
+                if (callSiteCount < minCallers) continue;
+                if (cleanupFreq.isEmpty()) continue;
+
+                // Find mode (most common cleanup value)
+                int modeArgc = -1, modeFreq = 0;
+                for (Map.Entry<Integer, Integer> entry : cleanupFreq.entrySet()) {
+                    if (entry.getValue() > modeFreq) {
+                        modeFreq = entry.getValue();
+                        modeArgc = entry.getKey();
+                    }
+                }
+
+                if (modeArgc < 0) continue;
+
+                int currentParams = func.getParameterCount();
+                if (currentParams == modeArgc) {
+                    verifiedOk++;
+                    continue;
+                }
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("address", func.getEntryPoint().toString());
+                info.put("name", func.getName());
+                info.put("namespace", func.getParentNamespace().getName(true));
+                info.put("current_params", currentParams);
+                info.put("expected_params", modeArgc);
+                info.put("cleanup_bytes", modeArgc * 4);
+                info.put("caller_count", callSiteCount);
+                info.put("agreement", modeFreq + "/" + callSiteCount);
+                info.put("all_cleanups", cleanupFreq.toString());
+                info.put("current_signature", func.getSignature().getPrototypeString(false));
+                mismatches.add(info);
+            }
+
+            mismatches.sort((a, b) -> Integer.compare((int) b.get("caller_count"), (int) a.get("caller_count")));
+            if (mismatches.size() > limit) mismatches = mismatches.subList(0, limit);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("total_mismatches", mismatches.size());
+            result.put("verified_ok", verifiedOk);
+            result.put("mismatches", mismatches);
+            return Response.ok(result);
+
+        } catch (Exception e) {
+            return Response.err("Cdecl param count verification failed: " + e.getMessage());
+        }
+    }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
