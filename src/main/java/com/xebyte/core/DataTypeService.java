@@ -467,10 +467,23 @@ public class DataTypeService {
     /**
      * Create a new structure data type with specified fields
      */
-    @McpTool(path = "/create_struct", method = "POST", description = "Create a structure data type", category = "datatype")
+    @McpTool(path = "/create_struct", method = "POST",
+             description = "Create a structure data type. Fields format: JSON array of objects with "
+                         + "name, type, and optional offset. Example: "
+                         + "[{\"name\":\"vtable\",\"type\":\"pointer\",\"offset\":0},"
+                         + "{\"name\":\"refCount\",\"type\":\"int\",\"offset\":4},"
+                         + "{\"name\":\"flags\",\"type\":\"byte\",\"offset\":8}]. "
+                         + "Supported types: int, uint, byte, short, char, float, double, bool, pointer, "
+                         + "long, void, or any existing data type name. "
+                         + "If offset is omitted, fields are appended sequentially.",
+             category = "datatype")
     public Response createStruct(
-            @Param(value = "name", source = ParamSource.BODY) String name,
-            @Param(value = "fields", source = ParamSource.BODY, fieldsJson = true) String fieldsJson,
+            @Param(value = "name") String name,
+            @Param(value = "fields") String fieldsJson,
+            @Param(value = "category", defaultValue = "/",
+                   description = "Data type category path (e.g. /RS2014)") String categoryPath,
+            @Param(value = "size", defaultValue = "0",
+                   description = "Explicit struct size in bytes. 0 = auto from fields.") int explicitSize,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -499,9 +512,11 @@ public class DataTypeService {
             DataTypeManager dtm = program.getDataTypeManager();
 
             // Check if struct already exists
-            DataType existingType = dtm.getDataType("/" + name);
+            String catStr = (categoryPath != null && !categoryPath.isEmpty()) ? categoryPath : "/";
+            ghidra.program.model.data.CategoryPath catPath = new ghidra.program.model.data.CategoryPath(catStr);
+            DataType existingType = dtm.getDataType(catPath, name);
             if (existingType != null) {
-                return Response.text("Structure with name '" + name + "' already exists");
+                return Response.text("Structure with name '" + name + "' already exists in " + catStr);
             }
 
             // Pre-resolve all field types before entering the transaction
@@ -528,14 +543,15 @@ public class DataTypeService {
                     }
                 }
             }
-            final int structInitSize = requiredSize;
+            final int structInitSize = explicitSize > 0 ? explicitSize : requiredSize;
 
             // Create the structure on Swing EDT thread (required for transactions)
+            final ghidra.program.model.data.CategoryPath finalCatPath = catPath;
             SwingUtilities.invokeAndWait(() -> {
                 int txId = program.startTransaction("Create Structure: " + name);
                 try {
                     ghidra.program.model.data.StructureDataType struct =
-                        new ghidra.program.model.data.StructureDataType(name, structInitSize);
+                        new ghidra.program.model.data.StructureDataType(finalCatPath, name, structInitSize, dtm);
 
                     for (Map.Entry<FieldDefinition, DataType> entry : resolvedTypes.entrySet()) {
                         FieldDefinition field = entry.getKey();
@@ -587,9 +603,13 @@ public class DataTypeService {
         return resultMsg.length() > 0 ? Response.text(resultMsg.toString()) : Response.err("Unknown failure");
     }
 
-    // Backward compatibility overload
+    // Backward compatibility overloads
+    public Response createStruct(String name, String fieldsJson, String programName) {
+        return createStruct(name, fieldsJson, "/", 0, programName);
+    }
+
     public Response createStruct(String name, String fieldsJson) {
-        return createStruct(name, fieldsJson, null);
+        return createStruct(name, fieldsJson, "/", 0, null);
     }
 
     /**
