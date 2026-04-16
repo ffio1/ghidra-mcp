@@ -4,6 +4,221 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
+## v5.3.2 - 2026-04-15 (hotfix)
+
+Second hotfix on the v5.3.x line, shipped after a multi-hour overnight
+test session exposed three bugs that v5.3.1 didn't catch. Each was
+reproducible and live-verified fixed. No new features, no breaking
+changes. Semver PATCH bump.
+
+### fun-doc
+
+#### Fixed
+
+- **Pass 2 (`FULL:comments`) never ran for codex or claude** — [fun_doc.py:3960](fun-doc/fun_doc.py#L3960)
+  gated the two-pass flow on `tool_calls_made > 0`. Both providers use
+  `_wrap_result` which sets `tool_calls: -1` ("unknown, trust run") since
+  neither the codex nor the claude SDKs report per-turn tool counts.
+  `-1 > 0` was False, so Pass 2 was skipped on every codex/claude run.
+  Pass 2 is the phase that adds plate comments and EOL markers, which is
+  typically what pushes a function from ~55-65% to 80%+. Without it,
+  both providers plateaued and re-entered the selector forever.
+  Changed the gate to `!= 0`.
+
+  Live verification (2026-04-15 14:18–14:23, 5 runs across both providers):
+  ```
+  InitializeVideoState            codex   59→100  (+41)  FULL:comments  completed
+  ResetNpcMenuState               claude  59→100  (+41)  FULL:comments  completed
+  CreateMissileCheckingSkillFlags codex   61→100  (+39)  FULL:comments  completed
+  InitializeExpansionAudio        claude  61→ 92  (+31)  FULL:comments  completed
+  ReinitializeExpansionAudio      codex   61→ 91  (+30)  FULL:comments  completed
+  ```
+  Average delta: **+36.4%** vs. yesterday's +13-25%. Five for five reached
+  the `good_enough_score` (80) on the first attempt.
+
+- **Infinite re-pick loops on no-progress runs** — Selector had no
+  mechanism to blacklist a function that keeps completing with zero
+  progress. Observed pattern on 2026-04-15:
+  ```
+  RenderResourceBarProgress       codex  ×46 runs, all +0%
+  CLIENT_UpdateUnitDisplayEffects codex  ×68 + claude ×18, all +0%
+  IsPathTargetMonsterBoss         codex  ×24 runs, 23 at +0% then +10
+  UpdateRoomLevelTracker          claude ×28 runs, pattern [+0,-7,+7,+0×25]
+  CheckNetworkSessionTimeout      claude ×27 runs, pattern [-8,+8,+0×25]
+  CLIENT_UpdateUnitDisplayEffects claude ×18 runs, all +0%
+  ```
+  Guard #2 (no-progress downgrade) requires `tool_calls_made == 0`, so
+  `-1` from codex/claude never triggered it. `consecutive_fails` only
+  tracks hard failures, not stagnant completions. `partial_runs >= 3`
+  only deprioritizes 10× — still pickable when nothing else is available.
+  `recovery_pass_done` only fires for `complexity_tier == "massive"`.
+
+  Fix: new `stagnation_runs` counter in [fun_doc.py:4256](fun-doc/fun_doc.py#L4256),
+  incremented on `(completed|partial) and delta <= 1` (covers +0%, +1%,
+  and all regressions). Reset on `delta >= 5`. Selector excludes funcs
+  with `stagnation_runs >= 3` unless pinned. Cleared by `scan --refresh`,
+  `refresh_candidate_scores` (dashboard "Refresh Top N"), or pinning.
+
+- **Claude false `BLOCKED:` false-positive from ToolSearch confusion** —
+  The `_invoke_claude` system prompt at [fun_doc.py:3105](fun-doc/fun_doc.py#L3105)
+  instructed the agent to "Use ToolSearch to load the ghidra-mcp MCP
+  tools if they are not yet available". But `ToolSearch` is for *deferred*
+  tools (ones listed in `<system-reminder>` but not loaded). ghidra-mcp
+  tools are statically registered via `~/.claude.json` → `mcpServers.ghidra`
+  and are **immediately callable** under `mcp__ghidra-mcp__<name>`. They
+  never appear as deferred.
+
+  Following the old prompt, claude would burn 5-12 turns trying
+  `ToolSearch` with various queries, get empty results each time, then
+  declare "BLOCKED: the required MCP tools are not available in this
+  runtime". Observed 11 false-positive `BLOCKED:` results out of 213
+  claude runs (≈5%) on 2026-04-15. Score deltas on those runs were
+  typically 0% or negative (because a rename had landed but the follow-up
+  type/prototype work gave up).
+
+  Fix: new system-prompt append tells claude the tools are already
+  registered and to call them directly by the short or fully-qualified
+  name, and explicitly says *do not* use ToolSearch for ghidra-mcp tools.
+  Prevents the whole class of false-BLOCKED outcomes.
+
+### Test coverage
+
+- **3 new selector invariant tests** for `stagnation_runs`:
+  - `test_stagnation_runs_excluded_at_threshold` (checks `== 3` and `> 3`)
+  - `test_stagnation_runs_bypassed_by_pin`
+  - `test_stagnation_runs_does_not_affect_unflagged` (0, 1, 2, missing)
+- **Total offline test count**: 27 Python + 25 Java (was 24 + 25 in v5.3.1)
+
+### Why this release exists
+
+The v5.3.1 release was shipped in the afternoon with confidence that it
+covered all the observed issues. It didn't. The codex Pass-2 bug was
+live during v5.3.1 and triggered the multi-hour loops on codex workers
+that same evening. v5.3.2 is the real "stable multi-provider workloads
+finish successfully" release.
+
+**Provider parity**: before v5.3.2, only minimax could reliably reach
+`good_enough_score` on `use_two_pass`-eligible functions because only
+minimax reported tool counts truthfully. After v5.3.2, all three
+providers (minimax, codex, claude) reach good_enough_score on the first
+attempt for the same class of function. Live-measured average score
+delta parity: minimax ≈ +20%, codex ≈ +36%, claude ≈ +36% in the post-fix
+session.
+
+---
+
+## v5.3.1 - 2026-04-14 (hotfix)
+
+Stability and observability hotfix on top of v5.3.0. Ships after a multi-hour live test session that uncovered several issues the v5.3.0 release didn't fully address. All three AI providers (minimax, codex, claude) verified under concurrent 6-worker load; zero failures across 63 runs in the final test session.
+
+### Ghidra Plugin
+
+#### Fixed
+
+- **`decompileFunctionNoRetry` cap lowered to 12 s** (was 60 s) — `FunctionService` now uses `NO_RETRY_DECOMPILE_TIMEOUT_SECONDS = 12` on all scoring/analysis code paths. Math: composite handlers like `/analyze_for_documentation` chain up to 4 sequential decompiles (primary → nested `analyze_function_completeness` → `validateParameterTypeQuality` fallback), so 4 × 12 = 48 s worst case, comfortably under the 60 s client HTTP timeout and well below Ghidra's 20 s Swing-deadlock threshold per individual call. Pathological functions exceeding 12 s are treated as "too complex to score" and blacklisted via the new fun-doc one-shot flag — an acceptable trade since they would otherwise pin the HTTP thread pool.
+
+- **Four more MCP handler call sites routed through `decompileFunctionNoRetry`** — v5.3.0 only wired one path (`batch_analyze_completeness`). Remaining retry-wrapped callers discovered and fixed:
+  - `AnalysisService.analyzeFunctionComplete` at line 2058
+  - `AnalysisService.validateParameterTypeQuality` fallback at line 3607 (reachable from `analyze_function_completeness` when the primary decompile fails)
+  - `AnalysisService.analyzeForDocumentation` primary decompile at line 3953
+  - `DocumentationHashService.getFunctionDocumentation` at line 359
+
+  Under v5.3.0 these paths still escalated 60 → 120 → 180 s per call. A single pathological function could pin an HTTP thread for up to 6 minutes and leak `DecompInterface` contexts on abandoned retries. Live test confirmed: zero `Decompilation attempt` log lines and zero `UnableToSwingException: Timed-out waiting for Swing thread lock` errors across a 125-minute 6-worker session with 35,653 completed tasks.
+
+### fun-doc
+
+#### Fixed
+
+- **Opus empty-output parser trust** — When opus runs on massive-complexity functions it sometimes burns its entire output-token budget on `tool_use` blocks and never emits a trailing text block with a `DONE:` marker. The work is committed to Ghidra, but fun-doc's parser saw the empty `output` string, hit the `else: result = "failed"` branch at [fun_doc.py:3827](fun-doc/fun_doc.py#L3827), and re-queued the function — paying the cost twice. Observed ~$15/function of wasted opus invocations before the fix. Parser now treats `empty output + tool_calls_made >= 5` as `completed` and lets Guard #2b (score regression check) catch genuine no-ops.
+
+- **Recovery-pass one-shot flag (`recovery_pass_done`)** — Massive-complexity functions receive exactly one complexity-forced recovery pass; the flag is set on completion and the selector excludes flagged functions from future picks until an explicit refresh clears it. Stops the "re-queue forever below `good_enough_score`" loop. Cleared by `scan --refresh`, dashboard's `Refresh Top N`, or manual pinning.
+
+- **Decompile-timeout one-shot flag (`decompile_timeout`)** — Complement to the Java 12 s cap. When a decompile-heavy Ghidra endpoint hits a read timeout, `fetch_function_data` sets `func.decompile_timeout = True` and the selector skips it. Turns three `consecutive_fails` cycles (~180 s wasted per pathological function) into one 60 s miss. Implemented via a new `threading.local` tracker inside `ghidra_get`/`ghidra_post` that flags `ReadTimeout` specifically.
+
+- **Bridge empty-string schema-default filter** — Codex's MCP client passes schema default values (including empty strings) to every tool call. Ghidra handlers treat empty strings as "missing" and fail on required params. Bridge now filters `v is None or v == ""` from kwargs. Matches minimax's direct-HTTP behavior. Bundled as hygiene; not the primary cause of codex failures (see codex config fix below).
+
+- **ContextVar debug logging** — Replaced `threading.local()` with `contextvars.ContextVar[dict]` in the debug module. Defensive refactor: `ContextVar` propagates correctly across `asyncio` tasks, generators, and `asyncio.to_thread` executor boundaries where `threading.local` can silently break. Offline E2E test verifies cross-context propagation.
+
+- **Claude `ToolResultBlock` capture** — `_invoke_claude`'s message-handler loop only iterated `AssistantMessage.content` blocks. Per `claude_agent_sdk._internal.message_parser`, `ToolResultBlock` arrives in `UserMessage.content` (the Anthropic API convention is "user sends tool results back"). The existing `ToolResultBlock` handler inside `AssistantMessage` was dead code, so `_debug_log_tool_call()` was never reached on the claude path. Refactored to iterate both `AssistantMessage` and `UserMessage` content blocks; TextBlock capture stays gated on AssistantMessage (UserMessage text is the outgoing prompt). Live-verified with a real claude session: 2 tool calls captured end-to-end with correct correlation and JSONL output.
+
+- **Dashboard worker pane reconnect** — On page refresh the local `workerPanes` map starts empty. The `worker_status` event fires on reconnect with the server-authoritative list but the old handler did `if (!pane) return` — updating existing panes only. Result: running workers reappeared with title `? #abcde` instead of `codex #abcde`. Fix: `worker_status` now calls `getOrCreatePane(w.id, w.provider, w.binary)` for unknown workers and refreshes the title on existing panes.
+
+### Codex configuration
+
+- **`~/.codex/config.toml` tool approval list** — Not a code change, but critical for codex to work with the Ghidra MCP at all. The user's codex config had `approval_mode = "approve"` for only 37 tools; the other 162 Ghidra MCP tools defaulted to `ask` which in headless/SDK mode = reject. This caused a silent 35% failure rate on codex runs (observed: all 7 `get_function_callers` failures in one session). Session fix added entries for the remaining tools. Future installs should either populate the full approval list or use a newer codex SDK with wildcard approval.
+
+### Test coverage
+
+- **6 new selector invariant tests** in `tests/performance/test_selector_invariants.py`:
+  - `test_recovery_pass_done_excluded_when_not_pinned`
+  - `test_recovery_pass_done_bypassed_by_pin`
+  - `test_recovery_pass_done_does_not_affect_unflagged_functions`
+  - `test_decompile_timeout_excluded_when_not_pinned`
+  - `test_decompile_timeout_bypassed_by_pin`
+  - `test_decompile_timeout_does_not_affect_unflagged`
+
+- **24 Python + 25 Java offline tests** all green on every commit in this release.
+
+### Live verification (final test session)
+
+```
+63 runs across 6 parallel workers (4×minimax, 1×codex, 1×claude)
+  minimax: 37 runs, +20.9% avg score delta, 0 failures
+  codex:   18 runs, +24.6% avg score delta, 0 failures
+  claude:   8 runs, +16.1% avg score delta, 0 failures
+
+Ghidra pool: 3/3 active, 0 queued, 35,653 completed tasks over 125 min uptime
+Memory:      255/592 MB, healthy GC (heap grew and shrank, no leak)
+Retries:     0 since test start (v5.3.0 baseline: hundreds per pathological function)
+SLOW:        0 warnings since test start
+Deadlocks:   0 since test start
+```
+
+---
+
+## v5.3.0 - 2026-04-14
+
+### Ghidra Plugin
+
+#### Added
+
+- **`/mcp/health` endpoint** — Returns HTTP server pool stats, uptime, memory, and active request count. Used by the fun-doc dashboard and by regression tests to observe server saturation.
+- **HTTP thread pool (pool size = 3)** — `GhidraMCPPlugin` now uses a fixed thread pool for HTTP request handling instead of the default single-threaded executor. Size 3 is a deliberate compromise: large enough that a slow write doesn't block every read, small enough to avoid saturating Ghidra's Event Dispatch Thread (sizes ≥ 8 triggered `Swing.runNow` deadlocks via `ToolTaskManager.taskCompleted`).
+- **Annotation scanner offline test suite** — `src/test/java/com/xebyte/offline/` adds 11 pure-reflection tests that run without Ghidra: schema generation shape, path uniqueness, HTTP method validity, `tests/endpoints.json` parity (scanner ⊆ catalog), param parity, and `total_endpoints` consistency. Partial implementation of #112.
+- **`RegenerateEndpointsJson` utility** — Opt-in test (`mvn test -Dtest=RegenerateEndpointsJson -Dregenerate=true`) that rewrites `tests/endpoints.json` from the annotation scanner, preserving hand-authored descriptions and hand-registered routes like `/mcp/health` and `/check_connection`.
+
+#### Fixed
+
+- **`AnalysisService.batch_analyze_completeness` partial-results bug** — When one function's decompile timed out, the batch threw and discarded every successful result in the same request. Now inserts an error marker for the failed function and continues the loop. `PER_CHUNK_TIMEOUT_SEC` raised to 90 s to give the 60 s internal decompile cap a 30 s buffer.
+- **`FunctionService.decompileFunctionNoRetry`** — New single-attempt decompile helper used by the scoring path. The retry-wrapped `decompileFunction` escalated 60 → 120 → 180 s and leaked `DecompInterface` contexts when the scoring timeout fired mid-retry, eventually OOMing the JVM.
+- **`tests/endpoints.json` drift** — The annotation scanner catalog parity test found and fixed 5 missing endpoints (`/analysis_status`, `/import_file`, `/reanalyze`, `/set_image_base`, `/set_variables`), 10 HTTP method mismatches, ~50 missing `@Param` entries, and a missing `/mcp/health` row. `total_endpoints`: 193 → 199.
+
+### fun-doc
+
+#### Added
+
+- **Priority queue system** — Replaces the old pin-one-at-a-time model. `priority_queue.json` stores a FIFO work queue. Auto-dequeues functions when they hit `good_enough_score` (configurable per-binary, default 80). Dashboard surfaces the queue with scan progress, handoff counter, and stale-skip counter.
+- **Complexity handoff** — Workers can hand a function to a more capable provider when the current model's completeness plateaus. Default cascade: minimax → claude (disabled by default, set `complexity_handoff_max`).
+- **Debug mode** — Per-function JSONL tool-call logs under `fun-doc/debug/<function_key>.jsonl`. Captures every MCP call, its truncated args, and result. Ship with `fun-doc/analyze_debug.py` CLI for post-hoc pattern analysis (consecutive same-tool runs, failed retries, repeated args).
+- **Atomic state writes** — `_atomic_write_state()` uses temp + fsync + `os.replace` + `.bak` rotation. Fixes the lost-update race where multiple workers saving whole-state from their in-memory copies clobbered each other's per-function updates.
+- **`update_function_state(key, func)`** — Per-function atomic read-modify-write under `_state_lock`. Replaces every per-function `save_state(state)` call in the processing path.
+- **Pagination-aware function list fetch** — `_fetch_function_list` now pages through `list_functions_enhanced` in 10k chunks. Previously silently truncated binaries above 10,000 functions (`glide3x.dll`, `libcrypto-1_1.dll`).
+- **Regression test suite** under `tests/performance/` — 30 tests across selector invariants, state atomicity, HTTP concurrency contract, listing consistency, batch scoring consistency, and `/mcp/health` shape. Most skip gracefully without a live Ghidra server; `test_selector_invariants.py` and `test_state_atomicity.py` run fully offline.
+
+#### Fixed
+
+- **Cold-start lane infinite re-processing loop** — `_sync_func_state` didn't stamp `last_processed`, so the selector kept re-picking already-scored functions. Worst seen: SafeDelete stuck at 83% across hundreds of iterations.
+- **"Stale at X%" misleading message** — The cached score was captured after `_sync_func_state` had already overwritten it, so the log always showed the live value. Captures `original_cached_score` before sync now.
+- **`RETRY_SIZE` vs client timeout math** — Retry batch was 10 × 90 s = 900 s > 600 s client budget. Reduced to `RETRY_SIZE = 3` (270 s, fits with 330 s margin).
+- **`tests/conftest.py` IPv6 fallback** — Default base URL changed from `http://localhost:8089` to `http://127.0.0.1:8089`. Windows dual-stack `localhost` resolution tries IPv6 first, times out after exactly 2 s, then falls back to IPv4 — adding ~2000 ms to every test request.
+
+### Docs
+
+- `CLAUDE.md` Testing section now documents offline vs. integration test commands and the `RegenerateEndpointsJson` escape hatch.
+- Tool count updated: 193 → 199 (README, CLAUDE.md, endpoints.json).
+
+---
+
 ## v5.2.0 - 2026-04-11
 
 ### Ghidra Plugin

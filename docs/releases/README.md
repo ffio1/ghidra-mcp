@@ -4,7 +4,41 @@ This directory contains version-specific release documentation for the Ghidra MC
 
 ## Available Releases
 
-### v5.2.0 (Latest)
+### v5.3.2 (Latest) — hotfix
+
+- **Second v5.3.x hotfix** shipped after overnight 2026-04-15 test session exposed three bugs v5.3.1 missed
+- **Pass 2 (`FULL:comments`) now runs for codex and claude** — gate changed from `tool_calls_made > 0` to `!= 0` so the `-1` (unknown) sentinel returned by SDKs that don't report per-turn tool counts no longer silently skips the comments pass. This was why codex/claude score deltas plateaued at ~60% — Pass 2 is what adds the plate comment + EOL markers that push scores above `good_enough_score`.
+- **`stagnation_runs` one-shot blacklist** — new selector flag that catches any function completing with `delta <= 1` three runs in a row. Stops infinite re-pick loops regardless of provider. Observed stopping 200+ stuck-loop runs in the first session after deployment.
+- **Claude `BLOCKED:` false-positive fix** — system prompt now tells claude to call `mcp__ghidra-mcp__<tool>` directly instead of using `ToolSearch` (which returned empty because ghidra tools are statically-registered, not deferred). Eliminates the ~5% false-blocked rate observed in v5.3.1.
+- Live-verified across 5 codex + claude runs: average score delta **+36.4%**, 5/5 reached good_enough_score on first attempt (was +13-25% average in v5.3.1).
+- 27 Python + 25 Java offline tests green.
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details.
+
+### v5.3.1 — hotfix
+
+- **Stability hotfix** for v5.3.0 after live multi-worker testing session
+- `NO_RETRY_DECOMPILE_TIMEOUT = 12s` on all MCP scoring handler paths — eliminates EDT saturation deadlocks on pathological functions (was 60s with retry escalation 60→120→180)
+- 4 additional MCP handler call sites routed through `decompileFunctionNoRetry` (AnalysisService.java:2058, 3607, 3953 and DocumentationHashService.java:359)
+- **fun-doc**: opus empty-output parser trust, recovery-pass one-shot blacklist, decompile-timeout one-shot blacklist, ContextVar debug logging, claude `ToolResultBlock` capture via `UserMessage` handling, dashboard worker pane reconnect fix
+- **bridge**: empty-string schema-default filter (codex hygiene)
+- 6 new selector invariant tests
+- Live-verified: 63 runs × 3 providers × 6 parallel workers with zero failures, zero retries, zero deadlocks over 125 min
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details
+
+### v5.3.0
+
+- **Stability + Observability Release** - HTTP thread pool fix, `/mcp/health`, offline test suite, fun-doc queue system
+- `/mcp/health` endpoint: pool stats, uptime, memory, active request count — used by dashboard and regression tests
+- HTTP thread pool (size 3): fixes EDT saturation deadlocks at pool >= 8, unblocks reads behind slow writes
+- Offline annotation-scanner test suite under `src/test/java/com/xebyte/offline/`: catches `@McpTool` / `endpoints.json` drift at `mvn test` time without needing Ghidra
+- `AnalysisService.batch_analyze_completeness` partial-results fix: one bad function no longer discards the whole batch
+- `FunctionService.decompileFunctionNoRetry`: single-attempt decompile used by scoring path (fixes `DecompInterface` leak on retry escalation)
+- fun-doc priority queue with auto-dequeue on `good_enough_score`, complexity handoff (minimax → claude), debug-mode JSONL traces
+- Atomic `state.json` writes via temp + fsync + os.replace + .bak rotation (fixes lost-update race across parallel workers)
+- 199 MCP tools (up from 193: added `/analysis_status`, `/import_file`, `/reanalyze`, `/set_image_base`, `/set_variables`, `/mcp/health`)
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details
+
+### v5.2.0
 
 - **Major Feature Release** - Completeness scoring redesign, naming convention enforcement, fun-doc automation engine
 - Log-scaled budget scoring system with tiered plate comment quality

@@ -40,6 +40,19 @@ public class FunctionService {
 
     private static final int DECOMPILE_TIMEOUT_SECONDS = 60;  // Increased from 30s to 60s for large functions
 
+    // Shorter cap for the no-retry scoring/analysis path. Keeps EDT-holding
+    // decompiles under Ghidra's 20-second Swing deadlock threshold so internal
+    // task-manager jobs (GTreeRestoreTreeStateTask, TableUpdateJob) can run
+    // between calls. Chosen so that handlers with up to 4 sequential no-retry
+    // decompiles (e.g. /analyze_for_documentation -> nested
+    // /analyze_function_completeness -> validateParameterTypeQuality fallback)
+    // still finish under the 60s client-side HTTP timeout:
+    //   4 * 12s = 48s < 60s client timeout. 12s also stays under the 20s
+    //   Swing deadlock threshold per decompile. Pathological functions that
+    //   need >12s are treated as "too complex to score" — an acceptable
+    //   trade since they also pin the HTTP thread pool under any longer cap.
+    private static final int NO_RETRY_DECOMPILE_TIMEOUT_SECONDS = 12;
+
     private final ProgramProvider programProvider;
     private final ThreadingStrategy threadingStrategy;
 
@@ -166,6 +179,32 @@ public class FunctionService {
      */
     public DecompileResults decompileFunction(Function func, Program program) {
         return decompileFunctionWithRetry(func, program, 3);  // 3 retries for stability
+    }
+
+    /**
+     * Single-attempt decompile with no retry escalation. For scoring/analysis
+     * code paths where a clean miss is fine and we cannot afford the 60→120→180s
+     * escalation of the retry wrapper (which leaked DecompInterface contexts
+     * when abandoned by upstream timeouts). Worst case:
+     * {@link #NO_RETRY_DECOMPILE_TIMEOUT_SECONDS} per call, sized so that
+     * handlers with up to 4 sequential calls still finish under the 60s client
+     * timeout. No retry.
+     */
+    public DecompileResults decompileFunctionNoRetry(Function func, Program program) {
+        DecompInterface decomp = null;
+        try {
+            decomp = new DecompInterface();
+            decomp.openProgram(program);
+            decomp.setSimplificationStyle("decompile");
+            return decomp.decompileFunction(func, NO_RETRY_DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
+        } catch (Exception e) {
+            Msg.warn(this, "Single-attempt decompile failed for " + func.getName() + ": " + e.getMessage());
+            return null;
+        } finally {
+            if (decomp != null) {
+                try { decomp.dispose(); } catch (Exception ignored) {}
+            }
+        }
     }
 
     /**
