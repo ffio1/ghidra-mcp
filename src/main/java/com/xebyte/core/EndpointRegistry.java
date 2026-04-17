@@ -465,6 +465,14 @@ public class EndpointRegistry {
             params(qStr("address", "Function address in hex"), pProg()),
             (q, b) -> functionService.disassembleFunction(str(q, "address"), str(q, "program")));
 
+        get("/summarize_function", "Compact single-call function digest (addr, name, size, in-xrefs, convention, prototype, callees, strings)",
+            params(qStr("address", "Function address in hex"),
+                qInt("max_callees", 12, "Max unique callees listed"),
+                qInt("max_strings", 8, "Max string refs listed"),
+                pProg()),
+            (q, b) -> functionService.summarizeFunction(str(q, "address"), str(q, "program"),
+                num(q, "max_callees", 12), num(q, "max_strings", 8)));
+
         get("/force_decompile", "Force decompiler cache refresh for function",
             params(qStr("address", "Function address in hex"), pProg()),
             (q, b) -> functionService.forceDecompile(str(q, "address"), str(q, "program")));
@@ -989,12 +997,15 @@ public class EndpointRegistry {
             params(qStr("name_pattern", "Name pattern"), qNullInt("min_xrefs"), qNullInt("max_xrefs"),
                 qStr("calling_convention", "Calling convention filter"), qNullBool("has_custom_name"),
                 qBool("regex", false, "Use regex matching"), qStr("sort_by", "Sort field"),
-                qInt("offset", 0), qInt("limit", 100), pProg()),
+                qInt("offset", 0), qInt("limit", 100),
+                qStr("format", "Output format: 'json' (default) or 'line' (token-efficient)"),
+                pProg()),
             (q, b) -> analysisService.searchFunctionsEnhanced(str(q, "name_pattern"),
                 nullableInt(q, "min_xrefs"), nullableInt(q, "max_xrefs"),
                 str(q, "calling_convention"), nullableBool(q, "has_custom_name"),
                 bool(q, "regex"), str(q, "sort_by", "address"),
-                num(q, "offset", 0), num(q, "limit", 100), str(q, "program")));
+                num(q, "offset", 0), num(q, "limit", 100),
+                str(q, "format", "json"), str(q, "program")));
     }
 
     // ======================================================================

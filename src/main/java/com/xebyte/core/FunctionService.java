@@ -16,6 +16,8 @@ import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.RefType;
+import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.symbol.SymbolTable;
@@ -130,7 +132,9 @@ public class FunctionService {
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String addressStr,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName,
-            @Param(value = "timeout", defaultValue = "60", description = "Decompile timeout in seconds") int timeoutSeconds) {
+            @Param(value = "timeout", defaultValue = "60", description = "Decompile timeout in seconds") int timeoutSeconds,
+            @Param(value = "max_lines", defaultValue = "0",
+                   description = "Opt-in token cap. 0 (default) = return full decompile unchanged. >0 = truncate after N lines with '... +K more lines (use max_lines=0 for full)' trailer. Use when you only need a quick look (e.g. scanning for a specific call or string).") int maxLines) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
@@ -158,7 +162,18 @@ public class FunctionService {
                 return Response.err("Decompiler completed but returned null decompiled function.");
             }
 
-            return Response.text(decompResult.getDecompiledFunction().getC());
+            String c = decompResult.getDecompiledFunction().getC();
+            if (maxLines > 0 && c != null) {
+                String[] lines = c.split("\n", -1);
+                if (lines.length > maxLines) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < maxLines; i++) sb.append(lines[i]).append('\n');
+                    sb.append("... +").append(lines.length - maxLines)
+                      .append(" more lines (use max_lines=0 for full)\n");
+                    return Response.text(sb.toString());
+                }
+            }
+            return Response.text(c);
         } catch (Throwable e) {
             String msg = e.getMessage() != null ? e.getMessage() : e.toString();
             return Response.err("Error decompiling function: " + msg);
@@ -166,12 +181,16 @@ public class FunctionService {
     }
 
     // Backward compatible overloads for internal callers
+    public Response decompileFunctionByAddress(String addressStr, String programName, int timeoutSeconds) {
+        return decompileFunctionByAddress(addressStr, programName, timeoutSeconds, 0);
+    }
+
     public Response decompileFunctionByAddress(String addressStr, String programName) {
-        return decompileFunctionByAddress(addressStr, programName, DECOMPILE_TIMEOUT_SECONDS);
+        return decompileFunctionByAddress(addressStr, programName, DECOMPILE_TIMEOUT_SECONDS, 0);
     }
 
     public Response decompileFunctionByAddress(String addressStr) {
-        return decompileFunctionByAddress(addressStr, null, DECOMPILE_TIMEOUT_SECONDS);
+        return decompileFunctionByAddress(addressStr, null, DECOMPILE_TIMEOUT_SECONDS, 0);
     }
 
     /**
@@ -508,6 +527,115 @@ public class FunctionService {
     // Backward compatible overload for internal callers
     public Response disassembleFunction(String addressStr) {
         return disassembleFunction(addressStr, null);
+    }
+
+    // ========================================================================
+    // Summary — single-call digest (token-efficient replacement for the
+    // xrefs+callees+disassemble+prototype cascade agents run per function).
+    // ========================================================================
+
+    /**
+     * Compact single-call digest of a function: header line (addr, qualified name,
+     * size, in-xref count, calling convention), prototype, direct callees, string refs.
+     */
+    @McpTool(path = "/summarize_function",
+             description = "Compact single-call function digest: addr, qualified name, size, in-xref count, calling convention, prototype, direct callees (addr:name), string refs. Token-efficient replacement for the xref+callees+disassemble cascade — use first when inquiring 'what is this function?'. Returns plain text, not JSON.",
+             category = "function")
+    public Response summarizeFunction(
+            @Param(value = "address", paramType = "address",
+                   description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex>.") String addressStr,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName,
+            @Param(value = "max_callees", defaultValue = "12", description = "Maximum unique callees listed") int maxCallees,
+            @Param(value = "max_strings", defaultValue = "8", description = "Maximum string refs listed") int maxStrings) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("Address is required");
+
+        try {
+            Function func = ServiceUtils.resolveFunction(program, addressStr);
+            if (func == null) return Response.err("No function found for " + addressStr);
+
+            int xrefIn = func.getSymbol().getReferenceCount();
+            long size = func.getBody().getNumAddresses();
+            String conv = func.getCallingConventionName();
+            if (conv == null || conv.isEmpty()) conv = "unknown";
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(func.getEntryPoint());
+            sb.append(' ').append(func.getName(true));
+            sb.append(" size=").append(size);
+            sb.append(" in=").append(xrefIn);
+            sb.append(" conv=").append(conv);
+            sb.append('\n');
+
+            sb.append("proto: ").append(func.getSignature().getPrototypeString(true)).append('\n');
+
+            Listing listing = program.getListing();
+            FunctionManager funcMgr = program.getFunctionManager();
+
+            LinkedHashMap<String, String> callees = new LinkedHashMap<>();
+            List<String> strings = new ArrayList<>();
+            int calleesTruncated = 0;
+            int stringsTruncated = 0;
+
+            InstructionIterator instrIter = listing.getInstructions(func.getBody(), true);
+            while (instrIter.hasNext()) {
+                Instruction instr = instrIter.next();
+                for (Reference ref : instr.getReferencesFrom()) {
+                    Address to = ref.getToAddress();
+                    if (to == null) continue;
+                    RefType rt = ref.getReferenceType();
+
+                    if (rt.isCall()) {
+                        Function calledFunc = funcMgr.getFunctionAt(to);
+                        String nm = (calledFunc != null) ? calledFunc.getName(true) : ("FUN_" + to);
+                        String key = to.toString();
+                        if (!callees.containsKey(key)) {
+                            if (callees.size() < maxCallees) {
+                                callees.put(key, nm);
+                            } else {
+                                calleesTruncated++;
+                            }
+                        }
+                    } else if (rt.isData()) {
+                        Data data = listing.getDefinedDataAt(to);
+                        if (data != null && data.hasStringValue()) {
+                            String s = data.getDefaultValueRepresentation();
+                            if (s != null && !s.isEmpty()) {
+                                if (strings.size() < maxStrings) {
+                                    strings.add(s);
+                                } else {
+                                    stringsTruncated++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!callees.isEmpty()) {
+                sb.append("out:");
+                for (Map.Entry<String, String> e : callees.entrySet()) {
+                    sb.append(' ').append(e.getKey()).append(':').append(e.getValue());
+                }
+                if (calleesTruncated > 0) sb.append(" +").append(calleesTruncated).append("more");
+                sb.append('\n');
+            }
+
+            if (!strings.isEmpty()) {
+                sb.append("str:");
+                for (String s : strings) {
+                    sb.append(' ').append(s);
+                }
+                if (stringsTruncated > 0) sb.append(" +").append(stringsTruncated).append("more");
+                sb.append('\n');
+            }
+
+            return Response.text(sb.toString());
+        } catch (Exception e) {
+            return Response.err("Error summarizing function: " + e.getMessage());
+        }
     }
 
     // ========================================================================
@@ -868,6 +996,160 @@ public class FunctionService {
 
     public Response renameFunctionByAddress(String functionAddrStr, String newName, String programName) {
         return renameFunctionByAddress(functionAddrStr, newName, null, programName);
+    }
+
+    // ========================================================================
+    // Bulk rename by string regex — server-side loop, kills per-function round trip
+    // ========================================================================
+
+    /**
+     * Rename many functions in one call: for each defined string whose value matches
+     * a regex with capture groups, rename the functions that reference it using
+     * captured namespace/name groups.
+     */
+    @McpTool(path = "/bulk_classify_by_string", method = "POST",
+             description = "Bulk rename functions by string-ref regex. Scans defined strings; for each match with capture groups, renames referencing functions using (namespace_group, name_group). Example: pattern='([A-Za-z]\\\\w*)::([A-Za-z]\\\\w*)' on string 'GRMusicService::Play' renames the referencing function to GRMusicService::Play. Server-side loop replaces per-function round trip of the re-string-hunt workflow. Use dry_run=true first to preview.",
+             category = "function")
+    public Response bulkClassifyByString(
+            @Param(value = "pattern", source = ParamSource.BODY,
+                   description = "Regex (case-insensitive) with capture groups. Must match inside a defined string's value (Pattern.find).") String patternStr,
+            @Param(value = "namespace_group", source = ParamSource.BODY, defaultValue = "1",
+                   description = "1-based capture group index for the namespace. 0 = no namespace.") int nsGroup,
+            @Param(value = "name_group", source = ParamSource.BODY, defaultValue = "2",
+                   description = "1-based capture group index for the method name. Required.") int nameGroup,
+            @Param(value = "namespace_prefix", source = ParamSource.BODY, defaultValue = "",
+                   description = "Optional prefix prepended to captured namespace (e.g. 'AK::' so '(\\\\w+)::(\\\\w+)' on 'SoundEngine::Init' becomes 'AK::SoundEngine::Init').") String nsPrefix,
+            @Param(value = "overwrite_custom", source = ParamSource.BODY, defaultValue = "false",
+                   description = "Skip (false) or overwrite (true) functions whose name is already user-defined. Default skip.") boolean overwriteCustom,
+            @Param(value = "limit", source = ParamSource.BODY, defaultValue = "0",
+                   description = "Cap on renames applied (0 = no cap). Useful during tuning.") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+        // dry_run handled by AnnotationScanner: when ?dry_run=true, framework wraps
+        // POST handler in a transaction that always rolls back, so renames stage
+        // but never commit. No explicit flag needed here.
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (patternStr == null || patternStr.isEmpty()) return Response.err("pattern is required");
+        if (nameGroup < 1) return Response.err("name_group must be >= 1");
+
+        final java.util.regex.Pattern pat;
+        try {
+            pat = java.util.regex.Pattern.compile(patternStr, java.util.regex.Pattern.CASE_INSENSITIVE);
+        } catch (Exception e) {
+            return Response.err("Invalid regex: " + e.getMessage());
+        }
+
+        final List<Map<String, Object>> renames = new ArrayList<>();
+        final AtomicInteger scanned = new AtomicInteger();
+        final AtomicInteger matched = new AtomicInteger();
+        final AtomicInteger skippedCustom = new AtomicInteger();
+        final AtomicInteger skippedLimit = new AtomicInteger();
+        final AtomicInteger renamedCount = new AtomicInteger();
+        final AtomicReference<String> firstError = new AtomicReference<>(null);
+
+        Runnable work = () -> {
+            SymbolTable symTable = program.getSymbolTable();
+            FunctionManager funcMgr = program.getFunctionManager();
+            ghidra.program.model.symbol.ReferenceManager refMgr = program.getReferenceManager();
+
+            DataIterator dataIt = program.getListing().getDefinedData(true);
+            Set<Address> renamedFuncs = new HashSet<>();
+
+            while (dataIt.hasNext()) {
+                Data data = dataIt.next();
+                if (data == null || !ServiceUtils.isStringData(data)) continue;
+                scanned.incrementAndGet();
+
+                String value = data.getValue() != null ? data.getValue().toString() : "";
+                java.util.regex.Matcher m = pat.matcher(value);
+                if (!m.find()) continue;
+                matched.incrementAndGet();
+
+                String capturedNs = (nsGroup > 0 && nsGroup <= m.groupCount()) ? m.group(nsGroup) : "";
+                String capturedName = (nameGroup <= m.groupCount()) ? m.group(nameGroup) : null;
+                if (capturedName == null || capturedName.isEmpty()) continue;
+
+                String targetNs = capturedNs;
+                if (nsPrefix != null && !nsPrefix.isEmpty()) {
+                    targetNs = targetNs.isEmpty() ? nsPrefix : nsPrefix + (nsPrefix.endsWith("::") ? "" : "::") + targetNs;
+                }
+
+                ghidra.program.model.symbol.ReferenceIterator refs = refMgr.getReferencesTo(data.getAddress());
+                while (refs.hasNext()) {
+                    ghidra.program.model.symbol.Reference ref = refs.next();
+                    Function fn = funcMgr.getFunctionContaining(ref.getFromAddress());
+                    if (fn == null) continue;
+
+                    Address key = fn.getEntryPoint();
+                    if (renamedFuncs.contains(key)) continue;
+
+                    String oldName = fn.getName();
+                    boolean isCustom = !ServiceUtils.isAutoGeneratedName(oldName);
+                    if (isCustom && !overwriteCustom) {
+                        skippedCustom.incrementAndGet();
+                        continue;
+                    }
+
+                    if (limit > 0 && renamedCount.get() >= limit) {
+                        skippedLimit.incrementAndGet();
+                        continue;
+                    }
+
+                    Map<String, Object> rec = new LinkedHashMap<>();
+                    rec.put("address", key.toString(false));
+                    rec.put("old_name", fn.getName(true));
+                    rec.put("new_namespace", targetNs);
+                    rec.put("new_name", capturedName);
+                    rec.put("matched_string", value);
+
+                    try {
+                        Namespace ns = program.getGlobalNamespace();
+                        if (targetNs != null && !targetNs.isEmpty()) {
+                            for (String part : targetNs.split("::")) {
+                                if (part.isEmpty()) continue;
+                                Namespace child = symTable.getNamespace(part, ns);
+                                if (child == null) {
+                                    child = symTable.createNameSpace(ns, part, SourceType.USER_DEFINED);
+                                }
+                                ns = child;
+                            }
+                        }
+                        fn.getSymbol().setNameAndNamespace(capturedName, ns, SourceType.USER_DEFINED);
+                    } catch (Exception e) {
+                        rec.put("error", e.getMessage());
+                        if (firstError.get() == null) firstError.set(e.getMessage());
+                        renames.add(rec);
+                        continue;
+                    }
+
+                    renames.add(rec);
+                    renamedFuncs.add(key);
+                    renamedCount.incrementAndGet();
+                }
+            }
+        };
+
+        try {
+            threadingStrategy.executeWrite(program, "Bulk classify by string", () -> {
+                work.run();
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed: " + e.getMessage());
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("strings_scanned", scanned.get());
+        result.put("strings_matched", matched.get());
+        result.put("renamed", renamedCount.get());
+        result.put("skipped_custom", skippedCustom.get());
+        result.put("skipped_limit", skippedLimit.get());
+        result.put("pattern", patternStr);
+        result.put("samples", renames.subList(0, Math.min(renames.size(), 50)));
+        if (firstError.get() != null) result.put("first_error", firstError.get());
+        return Response.ok(result);
     }
 
     // ========================================================================

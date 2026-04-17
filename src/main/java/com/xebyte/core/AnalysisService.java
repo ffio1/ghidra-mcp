@@ -2249,6 +2249,8 @@ public class AnalysisService {
             @Param(value = "sort_by", defaultValue = "address", description = "Sort field") String sortBy,
             @Param(value = "offset", defaultValue = "0") int offset,
             @Param(value = "limit", defaultValue = "100") int limit,
+            @Param(value = "format", defaultValue = "json",
+                   description = "Output format: 'json' (default, structured) or 'line' (one 'addr name xref_count' line per result — token-efficient for iteration)") String format,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -2329,12 +2331,27 @@ public class AnalysisService {
                     int endIndex = Math.min(offset + limit, total);
                     List<Map<String, Object>> page = matches.subList(Math.min(offset, total), endIndex);
 
-                    responseRef.set(Response.ok(JsonHelper.mapOf(
-                        "total", total,
-                        "offset", offset,
-                        "limit", limit,
-                        "results", page
-                    )));
+                    if ("line".equalsIgnoreCase(format)) {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("total=").append(total)
+                          .append(" offset=").append(offset)
+                          .append(" limit=").append(limit)
+                          .append('\n');
+                        for (Map<String, Object> m : page) {
+                            sb.append(m.get("address"))
+                              .append(' ').append(m.get("name"))
+                              .append(' ').append(m.get("xref_count"))
+                              .append('\n');
+                        }
+                        responseRef.set(Response.text(sb.toString()));
+                    } else {
+                        responseRef.set(Response.ok(JsonHelper.mapOf(
+                            "total", total,
+                            "offset", offset,
+                            "limit", limit,
+                            "results", page
+                        )));
+                    }
 
                 } catch (Exception e) {
                     errorMsg.set(e.getMessage());
@@ -2349,6 +2366,15 @@ public class AnalysisService {
         }
 
         return responseRef.get();
+    }
+
+    // Backward-compatible overload (no format parameter — defaults to "json").
+    public Response searchFunctionsEnhanced(String namePattern, Integer minXrefs, Integer maxXrefs,
+                                            String callingConvention, Boolean hasCustomName,
+                                            boolean regex, String sortBy, int offset, int limit,
+                                            String programName) {
+        return searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, callingConvention,
+                hasCustomName, regex, sortBy, offset, limit, "json", programName);
     }
 
     // ========================================================================

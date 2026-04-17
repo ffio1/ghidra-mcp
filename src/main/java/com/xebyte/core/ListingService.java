@@ -433,6 +433,8 @@ public class ListingService {
             @Param(value = "name_filter", description = "Only return functions whose simple or fully-qualified name starts with this prefix (case-insensitive). Comma-separate multiple prefixes, e.g. \"FUN_,Unknown::,GRScript::Helper_\". Leave empty to return all functions.", defaultValue = "") String nameFilter,
             @Param(value = "min_size", description = "Minimum function body size in bytes (0 = no minimum)", defaultValue = "0") int minSize,
             @Param(value = "max_size", description = "Maximum function body size in bytes (0 = no maximum)", defaultValue = "0") int maxSize,
+            @Param(value = "format", defaultValue = "json",
+                   description = "Output format: 'json' (default, structured) or 'line' (one 'addr name size' line per result — token-efficient for iteration)") String format,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -469,6 +471,23 @@ public class ListingService {
             item.put("size", size);
             functions.add(item);
             added++;
+        }
+
+        if ("line".equalsIgnoreCase(format)) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("count=").append(added)
+              .append(" offset=").append(offset)
+              .append(" limit=").append(limit)
+              .append(" start=").append(start.toString(false))
+              .append(" end=").append(end.toString(false))
+              .append('\n');
+            for (Map<String, Object> item : functions) {
+                sb.append(item.get("address"))
+                  .append(' ').append(item.get("name"))
+                  .append(' ').append(item.get("size"))
+                  .append('\n');
+            }
+            return Response.text(sb.toString());
         }
 
         return Response.ok(JsonHelper.mapOf(
