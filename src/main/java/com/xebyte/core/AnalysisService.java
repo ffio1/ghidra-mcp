@@ -1,5 +1,6 @@
 package com.xebyte.core;
 
+import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.framework.options.Options;
@@ -4863,26 +4864,31 @@ public class AnalysisService {
 
                 if (!hasRet) continue;
 
-                // Check first few instructions for ECX/EDX usage patterns
+                // Check first few instructions for ECX/EDX usage patterns.
+                // Two signals that indicate __thiscall:
+                //   (a) explicit save (MOV [reg],ECX) — the old heuristic
+                //   (b) ECX is READ as input before any write — MSVC thiscall that
+                //       uses [ECX+off] directly without saving. This used to
+                //       false-positive as __stdcall.
                 boolean savesEcx = false;
                 boolean savesEdx = false;
                 boolean usesEcxAsThis = false;
+                boolean ecxWritten = false;
+                boolean ecxReadBeforeWrite = false;
 
                 instrIter = listing.getInstructions(func.getBody(), true);
                 int checked = 0;
-                while (instrIter.hasNext() && checked < 8) {
+                while (instrIter.hasNext() && checked < 16) {
                     Instruction instr = instrIter.next();
                     String mnem = instr.getMnemonicString();
-                    String rep = instr.toString();
                     checked++;
 
-                    // MOV [EBP-x],ECX or MOV reg,ECX in prologue = saves ECX (thiscall/fastcall)
+                    // Pattern (a): explicit MOV reg, ECX (prologue save)
                     if (mnem.equals("MOV")) {
                         String op0 = instr.getDefaultOperandRepresentation(0);
                         String op1 = instr.getDefaultOperandRepresentation(1);
                         if (op1.equals("ECX") && !op0.equals("ECX")) {
                             savesEcx = true;
-                            // If next instructions access fields via the saved reg, it's __thiscall
                             if (op0.equals("ESI") || op0.equals("EDI") || op0.equals("EBX") ||
                                 op0.contains("EBP")) {
                                 usesEcxAsThis = true;
@@ -4892,7 +4898,40 @@ public class AnalysisService {
                             savesEdx = true;
                         }
                     }
+
+                    // Pattern (b): ECX read (as addressing-mode base, source operand, or push)
+                    // BEFORE any instruction writes ECX. Indicates ECX held the `this`
+                    // pointer on entry and is being consumed directly.
+                    if (!ecxReadBeforeWrite) {
+                        Object[] inputs = instr.getInputObjects();
+                        if (inputs != null) {
+                            for (Object inp : inputs) {
+                                if (inp instanceof ghidra.program.model.lang.Register) {
+                                    String rn = ((ghidra.program.model.lang.Register) inp).getName();
+                                    if ("ECX".equalsIgnoreCase(rn) && !ecxWritten) {
+                                        ecxReadBeforeWrite = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Track ECX writes (e.g. MOV ECX, <something>, XOR ECX,ECX, LEA ECX,...)
+                    Object[] outputs = instr.getResultObjects();
+                    if (outputs != null) {
+                        for (Object out : outputs) {
+                            if (out instanceof ghidra.program.model.lang.Register) {
+                                String rn = ((ghidra.program.model.lang.Register) out).getName();
+                                if ("ECX".equalsIgnoreCase(rn)) {
+                                    ecxWritten = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
+                // ECX-read-before-write counts as thiscall signal — no explicit save needed.
+                if (ecxReadBeforeWrite) usesEcxAsThis = true;
 
                 // Determine suggested convention
                 String suggested = null;
@@ -5751,111 +5790,215 @@ public class AnalysisService {
     // ========================================================================
 
     @McpTool(path = "/propagate_types",
-             description = "Propagate parameter types across the call graph. If function A calls function B "
-                         + "and passes its param_1 as B's typed param_2, infer A's param_1 type. "
-                         + "Start from well-typed seed functions and propagate outward.",
+             description = "Propagate parameter types across the call graph via pcode analysis. For each seed "
+                         + "function, decompiles each caller, locates the CALL pcode op, and maps each argument "
+                         + "varnode back to a caller HighParam. If the seed's param slot N is typed (non-"
+                         + "undefined) and the caller passes its own param M into slot N, caller param M "
+                         + "inherits the seed's type. When dry_run=false, applies setDataType under a "
+                         + "transaction; when dry_run=true, only reports candidates.",
              category = "analysis")
     public Response propagateTypes(
             @Param(value = "seed_address", defaultValue = "",
                    description = "Address of a well-typed function to propagate from. If empty, uses common seeds.") String seedAddr,
             @Param(value = "max_depth", defaultValue = "2",
-                   description = "Maximum call graph depth to propagate") int maxDepth,
+                   description = "Maximum call graph depth to propagate (currently one hop, reserved).") int maxDepth,
             @Param(value = "dry_run", defaultValue = "true",
                    description = "Preview changes without applying") boolean dryRun,
             @Param(value = "limit", defaultValue = "100",
-                   description = "Maximum functions to process") int limit,
+                   description = "Maximum caller functions to process") int limit,
             @Param(value = "program", defaultValue = "") String programName) {
 
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
-        Program program = pe.program();
+        final Program program = pe.program();
+
+        final ReferenceManager refMgr = program.getReferenceManager();
+        final List<Map<String, Object>> propagations = new ArrayList<>();
+        final java.util.concurrent.atomic.AtomicInteger appliedCount = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger skippedCount = new java.util.concurrent.atomic.AtomicInteger();
+
+        // Gather seed functions
+        final List<Function> seeds = new ArrayList<>();
+        if (seedAddr != null && !seedAddr.isEmpty()) {
+            Address addr = ServiceUtils.parseAddress(program, seedAddr);
+            if (addr != null) {
+                Function f = program.getFunctionManager().getFunctionAt(addr);
+                if (f != null) seeds.add(f);
+            }
+        } else {
+            FunctionIterator iter = program.getFunctionManager().getFunctions(true);
+            while (iter.hasNext() && seeds.size() < 50) {
+                Function func = iter.next();
+                Parameter[] params = func.getParameters();
+                if (params.length < 1) continue;
+                boolean typed = false;
+                for (Parameter p : params) {
+                    String tn = p.getDataType().getName();
+                    if (!tn.startsWith("undefined") && !tn.equals("int")) { typed = true; break; }
+                }
+                if (!typed) continue;
+                int callers = 0;
+                ReferenceIterator ri = refMgr.getReferencesTo(func.getEntryPoint());
+                while (ri.hasNext()) { ri.next(); callers++; }
+                if (callers >= 10) seeds.add(func);
+            }
+        }
+
+        // Decompiler (shared across callers for speed)
+        final DecompInterface decomp = new DecompInterface();
+        decomp.openProgram(program);
+        final TaskMonitor monitor = new ConsoleTaskMonitor();
 
         try {
-            ReferenceManager refMgr = program.getReferenceManager();
-            List<Map<String, Object>> propagations = new ArrayList<>();
+            // Collect pending propagations (caller, paramOrdinal, seedDataType, seedAddress, seedParamSlot)
+            final List<Object[]> pending = new ArrayList<>();
+            int callersProcessed = 0;
 
-            // Find seed functions: well-typed functions with non-undefined params
-            List<Function> seeds = new ArrayList<>();
-            if (seedAddr != null && !seedAddr.isEmpty()) {
-                Address addr = ServiceUtils.parseAddress(program, seedAddr);
-                if (addr != null) {
-                    Function f = program.getFunctionManager().getFunctionAt(addr);
-                    if (f != null) seeds.add(f);
+            outer:
+            for (Function seed : seeds) {
+                Parameter[] seedParams = seed.getParameters();
+                // Early skip if seed has no useful typed params
+                boolean anyTyped = false;
+                for (Parameter p : seedParams) {
+                    String tn = p.getDataType().getName();
+                    if (!tn.startsWith("undefined") && !tn.equals("int") && !tn.equals("void")) {
+                        anyTyped = true; break;
+                    }
                 }
-            } else {
-                // Auto-find seeds: functions with typed params and many callers
-                FunctionIterator iter = program.getFunctionManager().getFunctions(true);
-                while (iter.hasNext() && seeds.size() < 50) {
-                    Function func = iter.next();
-                    Parameter[] params = func.getParameters();
-                    if (params.length < 1) continue;
+                if (!anyTyped) continue;
 
-                    boolean hasTypedParam = false;
-                    for (Parameter p : params) {
-                        String tn = p.getDataType().getName();
-                        if (!tn.startsWith("undefined") && !tn.equals("int")) {
-                            hasTypedParam = true;
-                            break;
+                ReferenceIterator refIter = refMgr.getReferencesTo(seed.getEntryPoint());
+                Set<Address> seenCallers = new HashSet<>();
+                while (refIter.hasNext()) {
+                    if (callersProcessed >= limit) break outer;
+                    Reference ref = refIter.next();
+                    if (!ref.getReferenceType().isCall()) continue;
+                    Function caller = program.getFunctionManager().getFunctionContaining(ref.getFromAddress());
+                    if (caller == null) continue;
+                    if (!seenCallers.add(caller.getEntryPoint())) continue;
+                    Parameter[] callerParams = caller.getParameters();
+                    if (callerParams.length == 0) continue;
+                    // Decompile caller
+                    DecompileResults dr = decomp.decompileFunction(caller, 60, monitor);
+                    if (dr == null || !dr.decompileCompleted()) continue;
+                    HighFunction hf = dr.getHighFunction();
+                    if (hf == null) continue;
+                    callersProcessed++;
+
+                    // Map caller storage to HighSymbol id → Parameter ordinal lookup
+                    Map<String, Integer> paramSymByName = new HashMap<>();
+                    for (Parameter cp : callerParams) {
+                        paramSymByName.put(cp.getName(), cp.getOrdinal());
+                    }
+
+                    Iterator<PcodeOpAST> ops = hf.getPcodeOps();
+                    while (ops.hasNext()) {
+                        PcodeOpAST op = ops.next();
+                        if (op.getOpcode() != PcodeOp.CALL) continue;
+                        Varnode target = op.getInput(0);
+                        if (target == null || target.getAddress() == null) continue;
+                        if (!target.getAddress().equals(seed.getEntryPoint())) continue;
+
+                        // Inspect each argument slot
+                        int numArgs = op.getNumInputs() - 1;
+                        int maxSlot = Math.min(numArgs, seedParams.length);
+                        for (int i = 0; i < maxSlot; i++) {
+                            Varnode argVn = op.getInput(i + 1);
+                            if (argVn == null) continue;
+                            HighVariable hv = argVn.getHigh();
+                            if (hv == null) continue;
+                            HighSymbol hsym = hv.getSymbol();
+                            if (hsym == null || !hsym.isParameter()) continue;
+
+                            Integer callerOrd = paramSymByName.get(hsym.getName());
+                            if (callerOrd == null || callerOrd >= callerParams.length) continue;
+
+                            Parameter cp = callerParams[callerOrd];
+                            String cpTypeName = cp.getDataType().getName();
+                            boolean untyped = cpTypeName.startsWith("undefined")
+                                    || cpTypeName.equals("int")
+                                    || cpTypeName.equals("uint")
+                                    || cpTypeName.equals("dword");
+                            if (!untyped) continue;
+
+                            Parameter seedParam = seedParams[i];
+                            DataType seedType = seedParam.getDataType();
+                            String seedTypeName = seedType.getName();
+                            if (seedTypeName.startsWith("undefined") || seedTypeName.equals("void")) continue;
+
+                            // Record candidate
+                            Map<String, Object> prop = new LinkedHashMap<>();
+                            prop.put("caller_address", caller.getEntryPoint().toString());
+                            prop.put("caller_name", caller.getName());
+                            prop.put("caller_param", cp.getName());
+                            prop.put("caller_param_ordinal", callerOrd);
+                            prop.put("caller_param_type_old", cpTypeName);
+                            prop.put("seed_address", seed.getEntryPoint().toString());
+                            prop.put("seed_name", seed.getName());
+                            prop.put("seed_param_ordinal", i);
+                            prop.put("propagated_type", seedTypeName);
+                            propagations.add(prop);
+
+                            if (!dryRun) {
+                                pending.add(new Object[] { caller, callerOrd, seedType });
+                            }
                         }
                     }
-                    if (!hasTypedParam) continue;
-
-                    // Count callers
-                    int callers = 0;
-                    ReferenceIterator ri = refMgr.getReferencesTo(func.getEntryPoint());
-                    while (ri.hasNext()) { ri.next(); callers++; }
-                    if (callers >= 10) seeds.add(func);
                 }
             }
 
-            // For each seed, look at callers and check if they pass undefined params
-            int processed = 0;
-            for (Function seed : seeds) {
-                if (processed >= limit) break;
-
-                Parameter[] seedParams = seed.getParameters();
-                // Look at each caller
-                ReferenceIterator refIter = refMgr.getReferencesTo(seed.getEntryPoint());
-                while (refIter.hasNext() && processed < limit) {
-                    Reference ref = refIter.next();
-                    if (!ref.getReferenceType().isCall()) continue;
-
-                    Function caller = program.getFunctionManager()
-                            .getFunctionContaining(ref.getFromAddress());
-                    if (caller == null) continue;
-
-                    // Check caller's params — are any undefined that could be inferred?
-                    Parameter[] callerParams = caller.getParameters();
-                    for (Parameter cp : callerParams) {
-                        if (!cp.getDataType().getName().startsWith("undefined")) continue;
-
-                        // Check if this caller param is passed directly to the seed
-                        // This requires decompilation analysis which is expensive,
-                        // so for now we report candidates for manual review
-                        Map<String, Object> prop = new LinkedHashMap<>();
-                        prop.put("caller_address", caller.getEntryPoint().toString());
-                        prop.put("caller_name", caller.getName());
-                        prop.put("caller_param", cp.getName());
-                        prop.put("caller_param_type", cp.getDataType().getName());
-                        prop.put("seed_address", seed.getEntryPoint().toString());
-                        prop.put("seed_name", seed.getName());
-                        prop.put("seed_signature", seed.getSignature().getPrototypeString(false));
-                        propagations.add(prop);
-                        processed++;
-                        break; // One per caller for now
+            // Apply changes on the Swing EDT under a transaction
+            if (!dryRun && !pending.isEmpty()) {
+                SwingUtilities.invokeAndWait(() -> {
+                    int txId = program.startTransaction("Propagate types");
+                    boolean commit = false;
+                    try {
+                        for (Object[] p : pending) {
+                            Function caller = (Function) p[0];
+                            int ord = (Integer) p[1];
+                            DataType dt = (DataType) p[2];
+                            Parameter[] params = caller.getParameters();
+                            if (ord >= params.length) { skippedCount.incrementAndGet(); continue; }
+                            Parameter cp = params[ord];
+                            // Re-check still untyped (may have been updated by an earlier propagation in this batch)
+                            String tn2 = cp.getDataType().getName();
+                            boolean stillUntyped2 = tn2.startsWith("undefined")
+                                    || tn2.equals("int") || tn2.equals("uint") || tn2.equals("dword");
+                            if (!stillUntyped2) { skippedCount.incrementAndGet(); continue; }
+                            try {
+                                cp.setDataType(dt, SourceType.USER_DEFINED);
+                                appliedCount.incrementAndGet();
+                            } catch (Exception ex) {
+                                skippedCount.incrementAndGet();
+                            }
+                        }
+                        commit = true;
+                    } finally {
+                        program.endTransaction(txId, commit);
                     }
-                }
+                });
+                program.flushEvents();
             }
 
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("seeds_used", seeds.size());
+            result.put("callers_processed", callersProcessed);
             result.put("propagation_candidates", propagations.size());
             result.put("dry_run", dryRun);
+            result.put("applied", appliedCount.get());
+            result.put("skipped", skippedCount.get());
             result.put("candidates", propagations);
             return Response.ok(result);
-
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return Response.err("Interrupted");
+        } catch (InvocationTargetException ite) {
+            Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
+            return Response.err("Type propagation failed: " + cause.getMessage());
         } catch (Exception e) {
             return Response.err("Type propagation failed: " + e.getMessage());
+        } finally {
+            try { decomp.dispose(); } catch (Throwable ignored) {}
         }
     }
 
