@@ -857,9 +857,13 @@ public class EndpointRegistry {
             params(bStr("struct_name"), bStr("field_name"), pProg()),
             (q, b) -> dataTypeService.removeStructField(bodyStr(b, "struct_name"), bodyStr(b, "field_name"), str(q, "program")));
 
-        post("/import_data_types", "Import data types from C source",
-            params(bStr("source"), bStr("format")),
-            (q, b) -> dataTypeService.importDataTypes(bodyStr(b, "source"), bodyStr(b, "format", "c")));
+        post("/import_data_types", "Import data types from C source (structs, typedefs, enums, function-sig typedefs). Preprocessor is NOT run — strip or expand #define/#include first. category places new types; bridge auto-adds dry_run.",
+            params(bStr("source"), bStrOpt("format", "c"), bStrOpt("category", ""), pProg()),
+            (q, b) -> dataTypeService.importDataTypes(
+                bodyStr(b, "source"),
+                bodyStr(b, "format", "c"),
+                bodyStr(b, "category", ""),
+                str(q, "program")));
 
         post("/create_data_type_category", "Create a new data type category",
             params(bStr("category_path"), pProg()),

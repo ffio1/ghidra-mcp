@@ -1856,15 +1856,126 @@ public class DataTypeService {
     }
 
     /**
-     * Import data types (placeholder)
+     * Import data types from C source text using Ghidra's CParser.
+     * Newly added types are moved to the target category (if provided).
+     * Supports dry_run (parse + rollback) so callers can validate syntax
+     * without mutating the program.
      */
-    @McpTool(path = "/import_data_types", method = "POST", description = "Import data types from C source", category = "datatype")
+    @McpTool(path = "/import_data_types", method = "POST", description = "Import data types from C source (structs, typedefs, enums, function-sig typedefs). Uses Ghidra CParser. Preprocessor #define/#include are NOT processed — strip or expand before calling. category places new types. dry_run is auto-injected by the bridge; set it to true to parse + roll back without committing.", category = "datatype")
     public Response importDataTypes(
             @Param(value = "source", source = ParamSource.BODY) String source,
-            @Param(value = "format", source = ParamSource.BODY, defaultValue = "c") String format) {
-        // This is a placeholder for import functionality
-        // In a real implementation, you would parse the source based on format
-        return Response.text("Import functionality not yet implemented. Source: " + source + ", Format: " + format);
+            @Param(value = "format", source = ParamSource.BODY, defaultValue = "c") String format,
+            @Param(value = "category", source = ParamSource.BODY, defaultValue = "") String categoryPath,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        // dry_run is handled by AnnotationScanner wrapper (query param) — if set, outer tx rolls back
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (source == null || source.isEmpty()) return Response.err("source is required");
+        if (format != null && !format.isEmpty() && !"c".equalsIgnoreCase(format)) {
+            return Response.err("Unsupported format: " + format + ". Only 'c' is supported.");
+        }
+
+        final DataTypeManager dtm = program.getDataTypeManager();
+
+        final AtomicReference<String> parseError = new AtomicReference<>();
+        final List<String> moveErrors = new ArrayList<>();
+        final List<String> addedPaths = new ArrayList<>();
+        final List<String> parseMessages = new ArrayList<>();
+        final AtomicBoolean ok = new AtomicBoolean(false);
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int txId = program.startTransaction("Import data types");
+                boolean commit = false;
+                try {
+                    ghidra.app.util.cparser.C.CParser parser =
+                        new ghidra.app.util.cparser.C.CParser(dtm);
+                    try {
+                        parser.parse(source);
+                    } catch (Throwable pe2) {
+                        String msg = pe2.getMessage() != null ? pe2.getMessage() : pe2.toString();
+                        parseError.set(msg);
+                    }
+
+                    String pmsgs = parser.getParseMessages();
+                    if (pmsgs != null && !pmsgs.isEmpty()) {
+                        for (String line : pmsgs.split("\\r?\\n")) {
+                            if (!line.trim().isEmpty()) parseMessages.add(line);
+                        }
+                    }
+
+                    // Resolve target category (if any)
+                    ghidra.program.model.data.CategoryPath target = null;
+                    if (categoryPath != null && !categoryPath.isEmpty()) {
+                        target = new ghidra.program.model.data.CategoryPath(categoryPath);
+                        dtm.createCategory(target);
+                    }
+
+                    // CParser hands back detached DataType instances in its internal maps.
+                    // We must explicitly addDataType() each into the program's DTM for
+                    // them to persist. Set the category path on the detached dt FIRST so
+                    // addDataType places it directly in /target — avoids duplicate at root.
+                    java.util.LinkedHashMap<String, DataType> collected = new java.util.LinkedHashMap<>();
+                    if (parser.getComposites() != null) collected.putAll(parser.getComposites());
+                    if (parser.getEnums() != null) collected.putAll(parser.getEnums());
+                    if (parser.getFunctions() != null) collected.putAll(parser.getFunctions());
+                    if (parser.getTypes() != null) collected.putAll(parser.getTypes());
+                    if (parser.getDeclarations() != null) collected.putAll(parser.getDeclarations());
+
+                    for (java.util.Map.Entry<String, DataType> entry : collected.entrySet()) {
+                        DataType dt = entry.getValue();
+                        if (dt == null) continue;
+                        try {
+                            if (target != null) {
+                                try { dt.setCategoryPath(target); }
+                                catch (Throwable ignored) { /* built-in */ }
+                            }
+                            DataType added = dtm.addDataType(dt,
+                                ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER);
+                            if (added != null && !addedPaths.contains(added.getPathName())) {
+                                addedPaths.add(added.getPathName());
+                            }
+                        } catch (Throwable aex) {
+                            moveErrors.add(entry.getKey() + ": " +
+                                (aex.getMessage() != null ? aex.getMessage() : aex.toString()));
+                        }
+                    }
+
+                    commit = true;
+                    ok.set(true);
+                } catch (Throwable e) {
+                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                    parseError.set(msg);
+                    Msg.error(this, "Error importing data types", e);
+                } finally {
+                    program.endTransaction(txId, commit);
+                }
+            });
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return Response.err("Interrupted");
+        } catch (InvocationTargetException ite) {
+            Throwable cause = ite.getCause() != null ? ite.getCause() : ite;
+            return Response.err("Import failed: " + cause.getMessage());
+        }
+
+        if (!ok.get() && parseError.get() != null && addedPaths.isEmpty()) {
+            return Response.err("Parse error: " + parseError.get());
+        }
+
+        if (ok.get()) program.flushEvents();
+
+        java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("committed", ok.get());
+        payload.put("added_count", addedPaths.size());
+        payload.put("added", addedPaths);
+        if (parseError.get() != null) payload.put("parse_error", parseError.get());
+        if (!parseMessages.isEmpty()) payload.put("parse_messages", parseMessages);
+        if (!moveErrors.isEmpty()) payload.put("add_errors", moveErrors);
+        if (categoryPath != null && !categoryPath.isEmpty()) payload.put("category", categoryPath);
+        return Response.ok(payload);
     }
 
     // -----------------------------------------------------------------------

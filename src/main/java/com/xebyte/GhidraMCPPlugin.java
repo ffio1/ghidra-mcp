@@ -2232,7 +2232,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      * Import data types from various sources
      */
     private String importDataTypes(String source, String format) {
-        return dataTypeService.importDataTypes(source, format).toJson();
+        return dataTypeService.importDataTypes(source, format, "", null).toJson();
     }
 
     /**

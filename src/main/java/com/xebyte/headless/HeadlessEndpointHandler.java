@@ -1959,7 +1959,11 @@ public class HeadlessEndpointHandler {
     }
 
     public String importDataTypes(String source, String format, String programName) {
-        return dataTypeService.importDataTypes(source, format).toJson();
+        return dataTypeService.importDataTypes(source, format, "", programName).toJson();
+    }
+
+    public String importDataTypes(String source, String format, String category, String programName) {
+        return dataTypeService.importDataTypes(source, format, category, programName).toJson();
     }
 
     // ==========================================================================
