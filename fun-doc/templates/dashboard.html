@@ -150,8 +150,16 @@
         .worker-card .btn-stop { position: absolute; top: 0.4rem; right: 0.4rem; }
         .worker-pane { background: var(--bg-dark); border: 1px solid var(--border-dark); border-radius: 6px; display: flex; flex-direction: column; min-height: 100px; max-height: 180px; }
         .worker-pane.running { border-color: var(--color-set); }
+        .worker-pane.focused { border-color: var(--accent-gold); border-width: 2px; box-shadow: 0 0 8px rgba(199, 179, 119, 0.3); }
         .worker-pane.stopping { border-color: var(--color-rare); }
         .worker-pane.finished { border-color: var(--text-muted); opacity: 0.85; }
+        .sortable-header { cursor: pointer; user-select: none; white-space: nowrap; }
+        .sortable-header:hover { color: var(--accent-gold); }
+        .sortable-header span { font-size: 0.6rem; color: var(--accent-gold); }
+        .focus-banner { display: none; background: var(--bg-medium); border: 1px solid var(--accent-gold); border-radius: 4px; padding: 0.3rem 0.8rem; margin-bottom: 0.75rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--accent-gold); align-items: center; gap: 0.5rem; }
+        .focus-banner.active { display: flex; }
+        .focus-banner .focus-func { color: var(--text-primary); font-weight: 600; }
+        .focus-banner .focus-addr { color: var(--text-secondary); }
         .worker-pane-header { padding: 0.25rem 0.5rem; background: linear-gradient(180deg, var(--bg-light), var(--bg-medium)); border-bottom: 1px solid var(--border-dark); border-radius: 6px 6px 0 0; display: flex; align-items: center; gap: 0.4rem; font-size: 0.65rem; }
         .worker-pane-header .wp-title { font-family: var(--font-mono); color: var(--accent-gold); font-weight: 600; }
         .worker-pane-header .wp-status { font-family: var(--font-mono); color: var(--text-muted); font-size: 0.6rem; }
@@ -215,6 +223,21 @@
                 <input type="checkbox" id="debugModeInput" {% if stats.queue_config.debug_mode %}checked{% endif %} onchange="saveQueueConfig()" style="margin: 0;">
                 <span style="line-height: 1;">Debug Logs</span>
             </label>
+            <span class="header-sep"></span>
+            <label style="font-size: 0.65rem; color: var(--text-secondary); display: flex; align-items: center; gap: 3px;" title="After the worker finishes, a second provider reviews and fixes gaps. Off = no audit pass.">
+                <span>Audit→</span>
+                <select class="header-select" id="auditProviderInput" onchange="saveQueueConfig()">
+                    <option value="off" {% if not stats.queue_config.audit_provider %}selected{% endif %}>Off</option>
+                    <option value="claude" {% if stats.queue_config.audit_provider == 'claude' %}selected{% endif %}>Claude</option>
+                    <option value="codex" {% if stats.queue_config.audit_provider == 'codex' %}selected{% endif %}>Codex</option>
+                    <option value="minimax" {% if stats.queue_config.audit_provider == 'minimax' %}selected{% endif %}>MiniMax</option>
+                    <option value="gemini" {% if stats.queue_config.audit_provider == 'gemini' %}selected{% endif %}>Gemini</option>
+                </select>
+            </label>
+            <label style="font-size: 0.65rem; color: var(--text-secondary); display: flex; align-items: center; gap: 3px;" title="Skip audit if worker's score gain >= this value. Lower = more audits.">
+                <span>MinΔ</span>
+                <input type="number" class="worker-input" id="auditMinDeltaInput" value="{{ stats.queue_config.audit_min_delta|default(5) }}" min="0" max="100" onchange="saveQueueConfig()" style="width: 38px;">
+            </label>
         </div>
         <span class="header-info">
             <span class="live-dot" id="liveDot"></span>
@@ -251,6 +274,20 @@
             </div>
         </div>
 
+        <!-- Focus banner — shows which worker/function you're tracking -->
+        <div class="focus-banner" id="focusBanner">
+            <span>Focused:</span>
+            <span class="focus-func" id="focusWorkerName">—</span>
+            <span>→</span>
+            <span class="focus-func" id="focusFuncName">—</span>
+            <span class="focus-addr" id="focusFuncAddr"></span>
+            <button class="btn" onclick="navigateToFocusedFunction()" title="Navigate Ghidra to this function">Go to Ghidra</button>
+            <label style="margin-left: auto; font-size: 0.6rem; color: var(--text-secondary); cursor: pointer;">
+                <input type="checkbox" id="autoFollowCheckbox" onchange="onAutoFollowChanged()"> Auto-follow
+            </label>
+            <button class="btn" onclick="unfocusWorker()" title="Release focus">Unfocus</button>
+        </div>
+
         <!-- Worker status cards (replaced by output panes, kept for status updates) -->
         <div id="workerPanel" style="display: none;"></div>
 
@@ -263,6 +300,8 @@
             <div class="stat-card"><div class="stat-value" id="stat-pct">{{ stats.pct }}%</div><div class="stat-label">Progress</div></div>
             <div class="stat-card"><div class="stat-value text-magic" id="stat-today">{{ stats.run_stats.today_runs }}</div><div class="stat-label">Runs Today</div></div>
             <div class="stat-card"><div class="stat-value" id="stat-delta">{{ stats.run_stats.avg_delta }}%</div><div class="stat-label">Avg Delta</div></div>
+            <div class="stat-card"><div class="stat-value" id="stat-audited" style="color: var(--color-magic);">{{ stats.audited }}</div><div class="stat-label">Audited</div></div>
+            <div class="stat-card"><div class="stat-value" id="stat-escalated" style="color: var(--color-rare);">{{ stats.escalated }}</div><div class="stat-label">Escalated</div></div>
         </div>
 
         <!-- Progress bar -->
@@ -273,7 +312,11 @@
             </div>
         </div>
 
-        <!-- Worker Output Panes (2x2 grid) -->
+        <!-- Worker Output Panes -->
+        <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.35rem;" id="workerGridHeader">
+            <span style="font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono);" id="workerGridCount"></span>
+            <button class="btn btn-danger" onclick="stopAllWorkers()" id="btnStopAll" style="display: none; margin-left: auto;">Stop All Workers</button>
+        </div>
         <div id="workerGrid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; margin-bottom: 0.5rem;">
             <!-- Worker panes are dynamically created by JavaScript -->
         </div>
@@ -318,17 +361,69 @@
                 <div class="panel">
                     <div class="panel-header"><h2>Model Performance</h2></div>
                     <div class="panel-content" id="runStatsPanel">
-                        <div style="display: flex; gap: 0.75rem; margin-bottom: 0.4rem;">
+                        <!-- Top-level summary row -->
+                        <div style="display: flex; gap: 0.75rem; margin-bottom: 0.4rem; flex-wrap: wrap;">
                             <div><span class="mono" style="color: var(--accent-gold);">{{ stats.run_stats.total_runs }}</span> <span style="color: var(--text-muted); font-size: 0.65rem;">runs</span></div>
                             <div><span class="mono" style="color: var(--color-set);">{{ stats.run_stats.success_rate }}%</span> <span style="color: var(--text-muted); font-size: 0.65rem;">success</span></div>
+                            <div><span class="mono" style="color: var(--accent-red-light);">{{ stats.run_stats.regressions }}</span> <span style="color: var(--text-muted); font-size: 0.65rem;">regressed</span></div>
+                            <div><span class="mono" style="color: var(--text-secondary);">{{ stats.run_stats.zero_delta }}</span> <span style="color: var(--text-muted); font-size: 0.65rem;">zero-Δ</span></div>
                         </div>
+
+                        <!-- Today vs All-time toggle -->
+                        {% if stats.run_stats.today.runs > 0 %}
+                        <div style="margin-bottom: 0.4rem; padding: 0.3rem 0.5rem; background: var(--bg-light); border-radius: 4px; font-size: 0.65rem;">
+                            <span style="color: var(--accent-gold);">Today:</span>
+                            <span class="mono" style="color: var(--text-primary);">{{ stats.run_stats.today.runs }}</span> runs
+                            <span style="color: var(--text-muted);">·</span>
+                            <span class="mono" style="color: var(--color-set);">{{ stats.run_stats.today.success_rate }}%</span> success
+                            <span style="color: var(--text-muted);">·</span>
+                            avg <span class="mono" style="color: {% if stats.run_stats.today.avg_delta > 0 %}var(--color-set){% elif stats.run_stats.today.avg_delta < 0 %}var(--accent-red-light){% else %}var(--text-muted){% endif %};">{{ stats.run_stats.today.avg_delta }}%</span> Δ
+                        </div>
+                        {% endif %}
+
+                        <!-- Per-provider cards (enriched) -->
                         {% for provider, pstats in stats.run_stats.by_provider.items() %}
-                        <div class="provider-card">
+                        <div class="provider-card" style="flex-wrap: wrap;">
                             <span class="provider-name">{{ provider }}</span>
                             <span class="provider-stat">{{ pstats.runs }} runs</span>
-                            <span class="provider-stat">avg {{ pstats.avg_delta }}%</span>
+                            <span class="provider-stat" style="color: {% if pstats.avg_delta > 0 %}var(--color-set){% elif pstats.avg_delta < 0 %}var(--accent-red-light){% else %}var(--text-muted){% endif %};">avg {{ pstats.avg_delta }}%</span>
+                            <span class="provider-stat" style="color: {% if pstats.success_rate >= 80 %}var(--color-set){% elif pstats.success_rate >= 50 %}var(--accent-gold){% else %}var(--accent-red-light){% endif %};">{{ pstats.success_rate }}% ok</span>
+                            {% if pstats.avg_tools > 0 %}
+                            <span class="provider-stat" style="color: var(--text-muted);">{{ pstats.avg_tools }} tools</span>
+                            {% endif %}
+                            {% if pstats.today_runs > 0 %}
+                            <span class="provider-stat" style="color: var(--color-magic); font-size: 0.6rem;">today: {{ pstats.today_runs }} · {{ pstats.today_avg_delta }}%Δ</span>
+                            {% endif %}
                         </div>
                         {% endfor %}
+
+                        <!-- Failure modes breakdown -->
+                        {% if stats.run_stats.failure_modes %}
+                        <div style="margin-top: 0.4rem; font-size: 0.65rem;">
+                            <strong style="color: var(--accent-red-light);">Failures:</strong>
+                            {% for mode, count in stats.run_stats.failure_modes.items() %}
+                            <span style="color: var(--text-muted); margin-left: 0.3rem;">{{ mode }} <span class="mono">{{ count }}</span></span>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+
+                        <!-- Audit effectiveness -->
+                        {% if stats.run_stats.audit.ran > 0 or stats.run_stats.audit.skipped_good > 0 %}
+                        <div style="margin-top: 0.4rem; padding: 0.3rem 0.5rem; background: var(--bg-light); border-radius: 4px; font-size: 0.65rem;">
+                            <strong style="color: var(--color-magic);">Audit:</strong>
+                            <span class="mono" style="color: var(--text-primary);">{{ stats.run_stats.audit.ran }}</span> ran
+                            <span style="color: var(--text-muted);">·</span>
+                            <span class="mono" style="color: var(--color-set);">{{ stats.run_stats.audit.improved }}</span> improved
+                            <span style="color: var(--text-muted);">·</span>
+                            <span class="mono" style="color: var(--accent-red-light);">{{ stats.run_stats.audit.regressed }}</span> regressed
+                            <span style="color: var(--text-muted);">·</span>
+                            <span class="mono" style="color: var(--text-muted);">{{ stats.run_stats.audit.no_change }}</span> no change
+                            <span style="color: var(--text-muted);">·</span>
+                            <span class="mono" style="color: var(--text-muted);">{{ stats.run_stats.audit.skipped_good + stats.run_stats.audit.skipped_delta }}</span> skipped
+                        </div>
+                        {% endif %}
+
+                        <!-- Stuck functions -->
                         {% if stats.run_stats.stuck_functions %}
                         <div style="margin-top: 0.4rem; font-size: 0.65rem; color: var(--accent-red-light);">
                             <strong>Stuck:</strong>
@@ -375,8 +470,11 @@
                 <span id="refreshLastAt" style="font-family: var(--font-mono); color: var(--text-secondary);">never</span>
                 <span id="refreshStaleSkips" style="font-family: var(--font-mono); color: var(--text-muted);"></span>
                 <span style="color: var(--border-light);">|</span>
-                <span style="color: var(--text-muted);">Handoffs:</span>
+                <span style="color: var(--text-muted);">Escalations:</span>
                 <span id="handoffCount" style="font-family: var(--font-mono); color: var(--text-secondary);">0</span>
+                <span style="color: var(--border-light);">|</span>
+                <span style="color: var(--text-muted);">Audits:</span>
+                <span id="auditCount" style="font-family: var(--font-mono); color: var(--text-secondary);" title="ran / skipped (good enough + low delta)">—</span>
                 <button class="btn" onclick="drainDone()" id="btnDrainDone" title="Batch-score every pinned function and auto-dequeue any that are already above good_enough" style="margin-left: auto;">Drain Done</button>
                 <button class="btn" onclick="manualRefresh()" id="btnRefresh" title="Batch-rescore the top 50 ROI candidates for the active binary">Refresh Top 50</button>
             </div>
@@ -393,7 +491,7 @@
             <div class="panel-content">
                 <div class="func-list-scroll" style="max-height: 240px;" id="queuePanel">
                     <table class="data-table">
-                        <thead><tr><th>Actions</th><th>Function</th><th>Addr</th><th>Score</th><th>Ready</th><th>Fixable</th><th>ROI</th><th>Type</th><th>Last</th></tr></thead>
+                        <thead><tr><th>Actions</th><th>Function</th><th>Addr</th><th>Score</th><th>Deps</th><th>Fixable</th><th>ROI</th><th>Type</th><th>Last</th></tr></thead>
                         <tbody id="queueBody">
                         {% if queued %}
                         {% for t in queued %}
@@ -402,10 +500,10 @@
                             <td><span class="badge badge-pinned">QUEUED</span> {{ t.name }}</td>
                             <td class="mono">0x{{ t.address }}</td>
                             <td class="score-cell {% if t.score >= 90 %}score-90{% elif t.score >= 70 %}score-70{% elif t.score >= 50 %}score-50{% else %}score-low{% endif %}">{{ t.score }}%</td>
-                            <td class="mono" style="color: {% if t.readiness >= 1.0 %}var(--color-set){% elif t.readiness >= 0.5 %}var(--color-rare){% else %}var(--text-muted){% endif %};">{{ (t.readiness * 100)|round|int }}%</td>
+                            <td class="mono">{% if t.deps_remaining is defined and t.deps_remaining == 0 and not t.is_leaf %}<span style="color: var(--color-set);">Ready</span>{% elif t.is_leaf %}<span class="badge badge-leaf">Leaf</span>{% elif t.deps_remaining is defined and t.deps_remaining > 0 %}<span style="color: var(--color-rare);">{{ t.deps_remaining }} dep{{ 's' if t.deps_remaining > 1 }}</span>{% else %}—{% endif %}</td>
                             <td class="mono">{{ t.fixable }}</td>
                             <td class="mono" style="color: var(--accent-gold);">{{ t.roi }}</td>
-                            <td>{% if t.is_leaf %}<span class="badge badge-leaf">LEAF</span>{% endif %}</td>
+                            <td>{% if t.is_leaf %}<span class="badge badge-leaf">Leaf</span>{% elif t.call_graph_layer is not none %}<span style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.65rem;">L{{ t.call_graph_layer }}</span>{% elif t.call_graph_layer is none and not t.is_leaf %}<span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 0.65rem;">Cyc</span>{% endif %}</td>
                             <td style="color: var(--text-muted); font-size: 0.6rem;">{{ t.last_result or '' }}</td>
                         </tr>
                         {% endfor %}
@@ -429,7 +527,7 @@
             <div class="panel-content">
                 <div class="func-list-scroll" style="max-height: 300px;" id="autoPickPanel">
                     <table class="data-table">
-                        <thead><tr><th>Actions</th><th>Function</th><th>Addr</th><th>Score</th><th>Ready</th><th>Fixable</th><th>ROI</th><th>Type</th><th>Last</th></tr></thead>
+                        <thead><tr><th>Actions</th><th>Function</th><th>Addr</th><th>Score</th><th>Deps</th><th>Fixable</th><th>ROI</th><th>Type</th><th>Last</th></tr></thead>
                         <tbody id="autoPickBody">
                         {% for t in autopicks[:30] %}
                         <tr>
@@ -437,10 +535,10 @@
                             <td>{% if t.needs_scoring %}<span class="badge badge-new">COLD</span> {% endif %}{{ t.name }}</td>
                             <td class="mono">0x{{ t.address }}</td>
                             <td class="score-cell {% if t.score >= 90 %}score-90{% elif t.score >= 70 %}score-70{% elif t.score >= 50 %}score-50{% else %}score-low{% endif %}">{{ t.score }}%</td>
-                            <td class="mono" style="color: {% if t.readiness >= 1.0 %}var(--color-set){% elif t.readiness >= 0.5 %}var(--color-rare){% else %}var(--text-muted){% endif %};">{{ (t.readiness * 100)|round|int }}%</td>
+                            <td class="mono">{% if t.deps_remaining is defined and t.deps_remaining == 0 and not t.is_leaf %}<span style="color: var(--color-set);">Ready</span>{% elif t.is_leaf %}<span class="badge badge-leaf">Leaf</span>{% elif t.deps_remaining is defined and t.deps_remaining > 0 %}<span style="color: var(--color-rare);">{{ t.deps_remaining }} dep{{ 's' if t.deps_remaining > 1 }}</span>{% else %}—{% endif %}</td>
                             <td class="mono">{{ t.fixable }}</td>
                             <td class="mono" style="color: var(--accent-gold);">{{ t.roi }}</td>
-                            <td>{% if t.is_leaf %}<span class="badge badge-leaf">LEAF</span>{% endif %}</td>
+                            <td>{% if t.is_leaf %}<span class="badge badge-leaf">Leaf</span>{% elif t.call_graph_layer is not none %}<span style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.65rem;">L{{ t.call_graph_layer }}</span>{% elif t.call_graph_layer is none and not t.is_leaf %}<span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 0.65rem;">Cyc</span>{% endif %}</td>
                             <td style="color: var(--text-muted); font-size: 0.6rem;">{{ t.last_result or '' }}</td>
                         </tr>
                         {% endfor %}
@@ -474,7 +572,7 @@
             <div class="panel-header">
                 <h2>All Functions</h2>
                 <span style="color: var(--text-muted); font-size: 0.65rem;" id="allFuncsCount">
-                    showing {{ stats.all_functions|length }} of {{ stats.all_functions_total|default(stats.all_functions|length) }} (search loads more)
+                    {{ stats.all_functions|length }} functions
                 </span>
             </div>
             <div class="panel-content">
@@ -483,16 +581,22 @@
                     <button class="btn" id="filter-needs_work" onclick="filterFuncs('needs_work', this)">Needs Work</button>
                     <button class="btn" id="filter-fixable" onclick="filterFuncs('fixable', this)">Fixable</button>
                     <button class="btn" id="filter-done" onclick="filterFuncs('done', this)">Done</button>
-                    <input class="filter-input" type="text" id="searchInput" placeholder="Search name or address (server-side)..." oninput="onSearchInput()">
-                    <select class="header-select" id="searchSort" onchange="runServerSearch()" title="Sort search results">
-                        <option value="score">Lowest score</option>
-                        <option value="callers">Most callers</option>
-                        <option value="fixable">Most fixable</option>
-                        <option value="name">Name</option>
+                    <select class="header-select" id="layerFilterSelect" onchange="onLayerDropdownChanged()" title="Filter by call-graph layer">
+                        <option value="">All Layers</option>
                     </select>
+                    <input class="filter-input" type="text" id="searchInput" placeholder="Search name or address..." oninput="onSearchInput()">
                 </div>
                 <div class="func-list-scroll">
-                    <table class="data-table"><thead><tr><th>Actions</th><th>Function</th><th>Addr</th><th>Binary</th><th>Score</th><th>Fixable</th><th>Callers</th><th>Status</th></tr></thead>
+                    <table class="data-table"><thead><tr>
+                        <th>Actions</th>
+                        <th class="sortable-header" onclick="toggleSort('name')">Function <span id="sort-ind-name"></span></th>
+                        <th class="sortable-header" onclick="toggleSort('address')">Addr <span id="sort-ind-address"></span></th>
+                        <th class="sortable-header" onclick="toggleSort('score')">Score <span id="sort-ind-score"></span></th>
+                        <th class="sortable-header" onclick="toggleSort('deps')">Deps <span id="sort-ind-deps"></span></th>
+                        <th class="sortable-header" onclick="toggleSort('fixable')">Fixable <span id="sort-ind-fixable"></span></th>
+                        <th class="sortable-header" onclick="toggleSort('layer')">Layer <span id="sort-ind-layer"></span></th>
+                        <th class="sortable-header" onclick="toggleSort('status')">Status <span id="sort-ind-status"></span></th>
+                    </tr></thead>
                     <tbody id="allFuncsBody">
                     {% for f in stats.all_functions %}
                     <tr class="func-row" data-score="{{ f.score }}" data-name="{{ f.name|lower }}" data-key="{{ f.key }}">
@@ -501,19 +605,20 @@
                             {% else %}<button class="btn" onclick="queueFunc('{{ f.key }}')">Queue</button>{% endif %}
                         </td>
                         <td>{% if f.pinned %}<span class="badge badge-pinned">QUEUED</span> {% endif %}{{ f.name }}</td>
-                        <td class="mono">0x{{ f.address }}</td><td>{{ f.program }}</td>
+                        <td class="mono">0x{{ f.address }}</td>
                         {% if f.unscored %}
                         <td class="score-cell" style="color: var(--text-muted);">&mdash;</td>
                         {% else %}
                         <td class="score-cell {% if f.score >= 100 %}score-100{% elif f.score >= 90 %}score-90{% elif f.score >= 70 %}score-70{% elif f.score >= 50 %}score-50{% else %}score-low{% endif %}">{{ f.score }}%</td>
                         {% endif %}
-                        <td class="mono">{{ f.fixable }}</td><td class="mono">{{ f.callers }}</td>
+                        <td class="mono">{% if f.is_leaf %}<span class="badge badge-leaf">Leaf</span>{% elif f.callers == 0 %}<span style="color: var(--color-set);">Ready</span>{% else %}<span style="color: var(--color-rare);">{{ f.callers }} dep{{ 's' if f.callers > 1 }}</span>{% endif %}</td>
+                        <td class="mono">{{ f.fixable }}</td>
+                        <td class="mono" style="font-size: 0.6rem; color: var(--text-secondary);">{% if f.is_leaf %}Leaf{% else %}—{% endif %}</td>
                         <td>
                         {% if f.unscored %}<span class="badge badge-new" title="Never scored — click Queue to score on demand">UNSCORED</span>
                         {% elif f.score >= (stats.queue_config.good_enough_score|default(80)) %}<span class="badge badge-done">DONE</span>
                         {% elif f.score >= 70 %}<span class="badge badge-fix">FIX</span>
                         {% else %}<span class="badge badge-new">NEW</span>{% endif %}
-                        {% if f.is_leaf %} <span class="badge badge-leaf">LEAF</span>{% endif %}
                         </td>
                     </tr>
                     {% endfor %}
@@ -570,23 +675,38 @@
                 : `<button class="btn" onclick="queueFunc('${escapeHtml(t.key)}')">Queue</button>`;
             const queuedBadge = queued ? '<span class="badge badge-pinned">QUEUED</span> ' : '';
             const coldBadge = t.needs_scoring ? '<span class="badge badge-new">COLD</span> ' : '';
-            const leaf = t.is_leaf ? '<span class="badge badge-leaf">LEAF</span>' : '';
-            const readyPct = Math.round((t.readiness != null ? t.readiness : 1) * 100);
-            const readyColor = readyPct >= 100 ? 'var(--color-set)' : readyPct >= 50 ? 'var(--color-rare)' : 'var(--text-muted)';
+            let layerLabel = '';
+            if (t.is_leaf) {
+                layerLabel = '<span class="badge badge-leaf">Leaf</span>';
+            } else if (t.call_graph_layer != null) {
+                layerLabel = `<span style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.65rem;">L${t.call_graph_layer}</span>`;
+            } else if (!t.is_leaf) {
+                layerLabel = '<span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 0.65rem;">Cyc</span>';
+            }
+            let depsCell;
+            if (t.is_leaf) {
+                depsCell = '<span class="badge badge-leaf">Leaf</span>';
+            } else if (t.deps_remaining === 0) {
+                depsCell = '<span style="color: var(--color-set);">Ready</span>';
+            } else if (t.deps_remaining != null && t.deps_remaining > 0) {
+                depsCell = `<span style="color: var(--color-rare);">${t.deps_remaining} dep${t.deps_remaining > 1 ? 's' : ''}</span>`;
+            } else {
+                depsCell = '—';
+            }
             return `<tr>
                 <td>${actionBtn}</td>
                 <td>${queuedBadge}${coldBadge}${escapeHtml(t.name)}</td>
                 <td class="mono">0x${escapeHtml(t.address)}</td>
                 <td class="score-cell ${scoreCellClass(t.score)}">${t.score}%</td>
-                <td class="mono" style="color: ${readyColor};">${readyPct}%</td>
+                <td class="mono">${depsCell}</td>
                 <td class="mono">${t.fixable}</td>
                 <td class="mono" style="color: var(--accent-gold);">${t.roi}</td>
-                <td>${leaf}</td>
+                <td>${layerLabel}</td>
                 <td style="color: var(--text-muted); font-size: 0.6rem;">${escapeHtml(t.last_result || '')}</td>
             </tr>`;
         }
 
-        function repaintRefreshStatus(meta) {
+        function repaintRefreshStatus(meta, runStats) {
             if (!meta) return;
             const lastEl = document.getElementById('refreshLastAt');
             const staleEl = document.getElementById('refreshStaleSkips');
@@ -617,6 +737,20 @@
                 const n = meta.handoffs_this_session || 0;
                 handoffEl.textContent = String(n);
                 handoffEl.style.color = n > 0 ? 'var(--color-rare)' : 'var(--text-secondary)';
+            }
+            const auditEl = document.getElementById('auditCount');
+            if (auditEl && runStats && runStats.audit) {
+                const a = runStats.audit;
+                const ran = a.today_ran || 0;
+                const skipped = (a.today_skipped_good || 0) + (a.today_skipped_delta || 0);
+                if (ran > 0 || skipped > 0) {
+                    const improved = a.today_improved || 0;
+                    auditEl.textContent = `${ran} ran${improved ? ` (${improved} ↑)` : ''} / ${skipped} skipped`;
+                    auditEl.style.color = ran > 0 ? 'var(--color-rare)' : 'var(--text-secondary)';
+                } else {
+                    auditEl.textContent = '—';
+                    auditEl.style.color = 'var(--text-secondary)';
+                }
             }
         }
 
@@ -700,6 +834,8 @@
                 document.getElementById("stat-pct").textContent = stats.pct + "%";
                 document.getElementById("stat-today").textContent = stats.run_stats.today_runs;
                 document.getElementById("stat-delta").textContent = stats.run_stats.avg_delta + "%";
+                document.getElementById("stat-audited").textContent = stats.audited;
+                document.getElementById("stat-escalated").textContent = stats.escalated;
                 document.getElementById("progressInner").style.width = stats.pct + "%";
                 document.getElementById("progressText").textContent = `${stats.done} / ${stats.total} (${stats.pct}%)`;
 
@@ -719,7 +855,7 @@
                     }
                     if (dm) dm.checked = !!stats.queue_config.debug_mode;
                 }
-                if (stats.queue_meta) repaintRefreshStatus(stats.queue_meta);
+                if (stats.queue_meta) repaintRefreshStatus(stats.queue_meta, stats.run_stats);
                 if (stats.roi_queue) repaintQueue(stats.roi_queue);
 
                 // Score distribution
@@ -744,6 +880,8 @@
                         return `<div class="deduction-row"><span class="deduction-cat">${d.category.replace(/_/g, ' ')}</span><span class="deduction-stat">${d.functions} fns</span><div class="deduction-bar"><div class="deduction-bar-fill" style="width:${pct}%"></div></div><span class="deduction-stat">${Math.round(d.total_pts)} pts</span></div>`;
                     }).join('');
                 }
+                // Refresh layer dropdown counts
+                populateLayerDropdown();
             }).catch(() => {});
         }
 
@@ -761,6 +899,7 @@
                     <span class="wp-title">${provider || '?'} #${workerId}</span>
                     <span class="wp-status" id="wp-status-${workerId}">${binary || ''}</span>
                     <div class="wp-actions">
+                        <button class="btn" onclick="focusWorker('${workerId}')" id="wp-focus-${workerId}">Focus</button>
                         <button class="btn btn-danger" onclick="stopWorker('${workerId}')" id="wp-stop-${workerId}">Stop</button>
                         <button class="btn" onclick="dismissPane('${workerId}')" style="display:none" id="wp-dismiss-${workerId}">X</button>
                     </div>
@@ -844,11 +983,15 @@
         // Worker lifecycle events
         socket.on("worker_started", d => {
             getOrCreatePane(d.worker_id, d.provider, d.binary || '');
-            appendToPane(d.worker_id, `Worker started: ${d.provider} x${d.count}`, 'scan');
+            appendToPane(d.worker_id, `Worker started: ${d.provider} ${d.continuous ? 'Auto' : 'x' + d.count}`, 'scan');
+            // Show Stop All button when any worker is running
+            const stopAllBtn = document.getElementById('btnStopAll');
+            if (stopAllBtn) stopAllBtn.style.display = '';
         });
         socket.on("worker_stopped", d => {
             appendToPane(d.worker_id, `Worker ${d.reason}: ${d.progress?.completed || 0} completed`, d.reason === 'finished' ? 'success' : 'neutral');
             markPaneFinished(d.worker_id, d.reason);
+            if (_focusedWorkerId === d.worker_id) unfocusWorker();
             refreshStats();
         });
 
@@ -856,6 +999,14 @@
         socket.on("function_started", d => {
             if (d.worker_id) getOrCreatePane(d.worker_id, null, null);
             appendToPane(d.worker_id, `\n${d.name} @ 0x${d.address}`, 'started');
+            // Track current function on the pane so Focus can read it
+            const pane = workerPanes[d.worker_id];
+            if (pane) {
+                pane.currentFuncName = d.name;
+                pane.currentFuncAddr = d.address;
+            }
+            // Update focus tracking if this worker is focused
+            updateFocusedFunction(d.worker_id, d.name, d.address);
         });
         socket.on("function_mode", d => appendToPane(d.worker_id, `  ${d.mode} | ${d.model} | score: ${d.score}%`, 'neutral'));
         socket.on("tool_call", d => appendToPane(d.worker_id, `  [mcp] ${d.tool}: ${d.status}`, 'tool'));
@@ -971,6 +1122,10 @@
             const handoffMax = handoffMaxEl ? (parseInt(handoffMaxEl.value) || 0) : 0;
             const debugEl = document.getElementById('debugModeInput');
             const debug = debugEl ? debugEl.checked : false;
+            const auditSel = document.getElementById('auditProviderInput');
+            const audit = auditSel ? auditSel.value : 'off';
+            const auditDeltaEl = document.getElementById('auditMinDeltaInput');
+            const auditDelta = auditDeltaEl ? (parseInt(auditDeltaEl.value) || 5) : 5;
             await fetch('/api/queue/config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -980,6 +1135,8 @@
                     complexity_handoff_provider: handoff === 'off' ? null : handoff,
                     complexity_handoff_max: handoffMax,
                     debug_mode: debug,
+                    audit_provider: audit === 'off' ? null : audit,
+                    audit_min_delta: auditDelta,
                 }),
             });
             // queue_changed event will trigger a refreshStats which repaints the queue
@@ -989,6 +1146,7 @@
         let _searchTimer = null;
         let _currentFilter = 'all';
         function onSearchInput() {
+            _currentLayerFilter = null;  // clear layer filter on manual search
             if (_searchTimer) clearTimeout(_searchTimer);
             _searchTimer = setTimeout(runServerSearch, 250);
         }
@@ -998,16 +1156,22 @@
         }
         function runServerSearch() {
             const q = document.getElementById('searchInput').value.trim();
-            const sort = document.getElementById('searchSort').value;
+            const sort = _getSortValue();
             const program = document.getElementById('binarySelect').value || '';
             const params = new URLSearchParams();
             if (q) params.set('q', q);
             if (program) params.set('program', program);
             params.set('sort', sort);
-            params.set('limit', '500');
+            params.set('limit', '5000');
+            // Layer filter from Call Graph Layers click
+            if (_currentLayerFilter !== null) {
+                params.set('layer', _currentLayerFilter);
+            }
             fetch('/api/functions/search?' + params.toString())
                 .then(r => r.json())
                 .then(data => repaintAllFunctions(data.results || [], data.total || 0));
+            // Clear the layer filter after use so normal searches work
+            // (it persists until the user types a new search or clicks a filter button)
         }
         function repaintAllFunctions(rows, totalMatch) {
             const tbody = document.getElementById('allFuncsBody');
@@ -1037,15 +1201,34 @@
                     else if (f.score >= 70) statusBadge = '<span class="badge badge-fix">FIX</span>';
                     else statusBadge = '<span class="badge badge-new">NEW</span>';
                 }
-                if (f.is_leaf) statusBadge += ' <span class="badge badge-leaf">LEAF</span>';
+                // Deps remaining column
+                let depsLabel;
+                if (f.is_leaf) {
+                    depsLabel = '<span class="badge badge-leaf">Leaf</span>';
+                } else if (f.deps_remaining === 0) {
+                    depsLabel = '<span style="color: var(--color-set); font-family: var(--font-mono); font-size: 0.65rem;">Ready</span>';
+                } else if (f.deps_remaining != null) {
+                    depsLabel = `<span style="color: var(--color-rare); font-family: var(--font-mono); font-size: 0.65rem;">${f.deps_remaining} dep${f.deps_remaining > 1 ? 's' : ''}</span>`;
+                } else {
+                    depsLabel = '';
+                }
+                // Layer column
+                let layerLabel;
+                if (f.is_leaf) {
+                    layerLabel = 'Leaf';
+                } else if (f.call_graph_layer != null) {
+                    layerLabel = `L${f.call_graph_layer}`;
+                } else {
+                    layerLabel = 'Cyc';
+                }
                 return `<tr class="func-row" data-score="${f.score}" data-name="${escapeHtml((f.name||'').toLowerCase())}" data-key="${escapeHtml(f.key)}">
                     <td>${queueBtn}</td>
                     <td>${queuedBadge}${escapeHtml(f.name)}</td>
                     <td class="mono">0x${escapeHtml(f.address)}</td>
-                    <td>${escapeHtml(f.program)}</td>
                     ${scoreCell}
+                    <td>${depsLabel}</td>
                     <td class="mono">${f.fixable}</td>
-                    <td class="mono">${f.callers}</td>
+                    <td class="mono" style="font-size: 0.6rem; color: var(--text-secondary);">${layerLabel}</td>
                     <td>${statusBadge}</td>
                 </tr>`;
             }).join('');
@@ -1065,11 +1248,20 @@
             setTimeout(() => { btn.disabled = false; }, 2000);
         }
         function stopWorker(wid) { socket.emit('request_stop_worker', {worker_id: wid}); }
+        function stopAllWorkers() {
+            // Stop every worker that has a visible pane
+            Object.keys(workerPanes).forEach(wid => {
+                const pane = workerPanes[wid];
+                if (pane && !pane.element.classList.contains('finished')) {
+                    socket.emit('request_stop_worker', {worker_id: wid});
+                }
+            });
+        }
 
         socket.on('worker_started_ack', d => { /* pane created by worker_started event */ });
         socket.on('worker_error', d => { showBanner(`Worker error: ${d.error}`); setTimeout(hideBanner, 5000); });
         socket.on('worker_stop_ack', d => { /* stop handled by worker_status update */ });
-        socket.on('worker_started', d => addActivity(`Worker ${d.worker_id}: ${d.provider} x${d.count}`, 'scan'));
+        socket.on('worker_started', d => addActivity(`Worker ${d.worker_id}: ${d.provider} ${d.continuous ? 'Auto' : 'x' + d.count}`, 'scan'));
         socket.on('worker_progress', d => {
             if (d.current) addActivity(`Worker ${d.worker_id}: ${d.current.name} (${d.completed+1}/${d.total})`, 'scan');
         });
@@ -1112,16 +1304,213 @@
                 if (status) {
                     const countStr = w.continuous ? 'auto' : `${done}/${w.count}`;
                     const cur = w.progress.current ? w.progress.current.name : '';
-                    status.textContent = `${countStr} | ${w.progress.completed}ok ${w.progress.failed}fail${cur ? ' | ' + cur : ''}`;
+                    const skipStr = w.progress.skipped > 0 ? ` ${w.progress.skipped}skip` : '';
+                    status.textContent = `${countStr} | ${w.progress.completed}ok ${w.progress.failed}fail${skipStr}${cur ? ' | ' + cur : ''}`;
                 }
             });
+            // Show/hide Stop All button based on active workers
+            const activeCount = workers.filter(w => w.status === 'running' || w.status === 'stopping').length;
+            const stopAllBtn = document.getElementById('btnStopAll');
+            const gridCount = document.getElementById('workerGridCount');
+            if (stopAllBtn) stopAllBtn.style.display = activeCount > 0 ? '' : 'none';
+            if (gridCount) gridCount.textContent = activeCount > 0 ? `${activeCount} active worker${activeCount > 1 ? 's' : ''}` : '';
         });
+
+        // --- Column header sort ---
+        // Maps column names to their API sort values for asc/desc
+        const _sortColumns = {
+            name:    { asc: 'name',      desc: 'name_desc'  },
+            address: { asc: 'address',   desc: 'address_desc' },
+            score:   { asc: 'score',     desc: 'score_desc' },
+            deps:    { asc: 'deps_asc',  desc: 'deps_desc'  },
+            fixable: { asc: 'fixable',   desc: 'fixable_desc' },
+            layer:   { asc: 'layer',     desc: 'layer_desc' },
+            status:  { asc: 'status',    desc: 'status_desc' },
+        };
+        let _currentSortCol = null;   // which column is active
+        let _currentSortDir = null;   // 'asc' or 'desc'
+
+        function toggleSort(col) {
+            if (_currentSortCol === col) {
+                // Same column: asc → desc → off
+                if (_currentSortDir === 'asc') {
+                    _currentSortDir = 'desc';
+                } else {
+                    // Was desc (or anything else) → clear
+                    _currentSortCol = null;
+                    _currentSortDir = null;
+                }
+            } else {
+                // New column: start with asc
+                _currentSortCol = col;
+                _currentSortDir = 'asc';
+            }
+            // Update indicators
+            for (const c of Object.keys(_sortColumns)) {
+                const ind = document.getElementById(`sort-ind-${c}`);
+                if (!ind) continue;
+                if (c === _currentSortCol && _currentSortDir === 'asc') {
+                    ind.textContent = '▲';
+                } else if (c === _currentSortCol && _currentSortDir === 'desc') {
+                    ind.textContent = '▼';
+                } else {
+                    ind.textContent = '';
+                }
+            }
+            runServerSearch();
+        }
+
+        function _getSortValue() {
+            if (!_currentSortCol || !_currentSortDir) return 'score'; // default
+            const col = _sortColumns[_currentSortCol];
+            return col ? (col[_currentSortDir] || 'score') : 'score';
+        }
+
+        // --- Layer filter ---
+        let _currentLayerFilter = null;
+
+        function filterByLayer(layerId, layerLabel) {
+            // Switch to list view
+            switchView('list');
+            // Set the dropdown to match
+            const sel = document.getElementById('layerFilterSelect');
+            if (sel) sel.value = layerId;
+            // Store the layer filter and re-run search
+            _currentLayerFilter = layerId || null;
+            runServerSearch();
+        }
+
+        function onLayerDropdownChanged() {
+            const sel = document.getElementById('layerFilterSelect');
+            const val = sel ? sel.value : '';
+            _currentLayerFilter = val || null;
+            // Switch to list view if on graph tab
+            const graphPanel = document.getElementById('callGraphPanel');
+            if (graphPanel && graphPanel.style.display !== 'none') {
+                switchView('list');
+            }
+            runServerSearch();
+        }
+
+        async function populateLayerDropdown() {
+            const sel = document.getElementById('layerFilterSelect');
+            if (!sel) return;
+            try {
+                const resp = await fetch('/api/call_graph_layers');
+                const data = await resp.json();
+                if (!data.layers) return;
+                // Preserve current selection
+                const current = sel.value;
+                // Clear all options except the first ("All Layers")
+                while (sel.options.length > 1) sel.remove(1);
+                // Add layer options
+                for (const layer of data.layers) {
+                    const opt = document.createElement('option');
+                    opt.value = layer.label === 'Leaves' ? '0' : layer.label === 'Cyclic' ? 'cyclic' : String(layer.depth);
+                    const remaining = layer.total - layer.done;
+                    opt.textContent = `${layer.label} (${remaining} remaining)`;
+                    sel.appendChild(opt);
+                }
+                // Restore selection
+                if (current) sel.value = current;
+            } catch (e) {
+                // silently fail — dropdown just won't have options
+            }
+        }
+
+        // Populate on page load
+        populateLayerDropdown();
+
+        // --- Worker Focus ---
+        let _focusedWorkerId = null;
+        let _focusedFuncAddr = null;
+        let _focusedFuncName = null;
+        let _focusedWorkerName = null;
+
+        function focusWorker(workerId) {
+            // Toggle off if already focused
+            if (_focusedWorkerId === workerId) {
+                unfocusWorker();
+                return;
+            }
+            // Clear previous focus
+            if (_focusedWorkerId) {
+                const prevPane = workerPanes[_focusedWorkerId];
+                if (prevPane) prevPane.element.classList.remove('focused');
+                const prevBtn = document.getElementById(`wp-focus-${_focusedWorkerId}`);
+                if (prevBtn) { prevBtn.textContent = 'Focus'; prevBtn.classList.remove('btn-primary'); }
+            }
+            _focusedWorkerId = workerId;
+            // Highlight the pane
+            const pane = workerPanes[workerId];
+            if (pane) pane.element.classList.add('focused');
+            const btn = document.getElementById(`wp-focus-${workerId}`);
+            if (btn) { btn.textContent = 'Focused'; btn.classList.add('btn-primary'); }
+            // Update banner with worker name + current function
+            const titleEl = pane?.element.querySelector('.wp-title');
+            _focusedWorkerName = titleEl ? titleEl.textContent : workerId;
+            document.getElementById('focusWorkerName').textContent = _focusedWorkerName;
+            // Read the current function from the pane (set by function_started events)
+            if (pane && pane.currentFuncAddr) {
+                _focusedFuncAddr = pane.currentFuncAddr;
+                _focusedFuncName = pane.currentFuncName || '—';
+                document.getElementById('focusFuncName').textContent = _focusedFuncName;
+                document.getElementById('focusFuncAddr').textContent = `@ 0x${_focusedFuncAddr}`;
+            }
+            // Show the banner
+            document.getElementById('focusBanner').classList.add('active');
+            // Navigate to whatever function this worker is currently on
+            navigateToFocusedFunction();
+        }
+
+        function unfocusWorker() {
+            if (_focusedWorkerId) {
+                const pane = workerPanes[_focusedWorkerId];
+                if (pane) pane.element.classList.remove('focused');
+                const btn = document.getElementById(`wp-focus-${_focusedWorkerId}`);
+                if (btn) { btn.textContent = 'Focus'; btn.classList.remove('btn-primary'); }
+            }
+            _focusedWorkerId = null;
+            _focusedFuncAddr = null;
+            _focusedFuncName = null;
+            document.getElementById('focusBanner').classList.remove('active');
+            document.getElementById('autoFollowCheckbox').checked = false;
+        }
+
+        function updateFocusedFunction(workerId, name, address) {
+            if (workerId !== _focusedWorkerId) return;
+            _focusedFuncName = name;
+            _focusedFuncAddr = address;
+            document.getElementById('focusFuncName').textContent = name || '—';
+            document.getElementById('focusFuncAddr').textContent = address ? `@ 0x${address}` : '';
+            // Auto-follow: navigate Ghidra if checkbox is on
+            if (document.getElementById('autoFollowCheckbox').checked) {
+                navigateToFocusedFunction();
+            }
+        }
+
+        function navigateToFocusedFunction() {
+            if (!_focusedFuncAddr) return;
+            fetch('/api/navigate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address: _focusedFuncAddr })
+            }).catch(() => {});
+        }
+
+        function onAutoFollowChanged() {
+            // If just turned on, navigate immediately
+            if (document.getElementById('autoFollowCheckbox').checked && _focusedFuncAddr) {
+                navigateToFocusedFunction();
+            }
+        }
 
         // --- Filter ---
         function filterFuncs(mode, btn) {
             document.querySelectorAll('.filter-bar .btn').forEach(b => b.classList.remove('active'));
             if (btn) btn.classList.add('active');
             _currentFilter = mode;
+            _currentLayerFilter = null;  // clear layer filter on manual filter click
             runServerSearch();
         }
 
@@ -1152,9 +1541,10 @@
                 const bars = data.layers.map(layer => {
                     const pct = layer.total > 0 ? Math.round(layer.done / layer.total * 100) : 0;
                     const barClass = pct >= 100 ? 's100' : pct >= 80 ? 's80' : pct >= 50 ? 's50' : pct >= 20 ? 's20' : 's0';
-                    const remaining = layer.total - layer.done;
                     const readyStyle = layer.ready > 0 ? 'color: var(--color-set); font-weight: 600;' : 'color: var(--text-muted);';
-                    return `<div class="score-bar-row" style="margin-bottom: 4px;">
+                    // Layer ID for filtering: "0" for leaves, "1"-"14" for layers, "cyclic" for cyclic
+                    const layerId = layer.label === 'Leaves' ? '0' : layer.label === 'Cyclic' ? 'cyclic' : String(layer.depth);
+                    return `<div class="score-bar-row" style="margin-bottom: 4px; cursor: pointer;" onclick="filterByLayer('${layerId}', '${layer.label}')" title="Click to view ${layer.label} functions in List View">
                         <span class="score-bar-label" style="min-width: 70px; font-size: 0.7rem;">${layer.label}</span>
                         <div class="score-bar-track" style="flex: 1;">
                             <div class="score-bar-fill ${barClass}" style="width: ${pct}%;"></div>

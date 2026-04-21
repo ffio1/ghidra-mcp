@@ -4,15 +4,20 @@ import com.xebyte.core.AnalysisService;
 import com.xebyte.core.BinaryComparisonService;
 import com.xebyte.core.CommentService;
 import com.xebyte.core.DataTypeService;
+import com.xebyte.core.DebuggerService;
 import com.xebyte.core.DocumentationHashService;
 import com.xebyte.core.FunctionService;
 import com.xebyte.core.ListingService;
 import com.xebyte.core.MalwareSecurityService;
 import com.xebyte.core.ProgramProvider;
+import com.xebyte.core.EmulationService;
 import com.xebyte.core.ProgramScriptService;
 import com.xebyte.core.SymbolLabelService;
 import com.xebyte.core.ThreadingStrategy;
 import com.xebyte.core.XrefCallGraphService;
+import com.xebyte.headless.GhidraServerManager;
+import com.xebyte.headless.HeadlessManagementService;
+import com.xebyte.headless.HeadlessProgramProvider;
 
 /**
  * Builds the full set of service instances that {@link com.xebyte.core.ServerManager}
@@ -44,6 +49,14 @@ public final class ServiceFactory {
         AnalysisService analysisService = new AnalysisService(provider, ts, functionService);
         MalwareSecurityService malwareSecurityService = new MalwareSecurityService(provider, ts);
         ProgramScriptService programScriptService = new ProgramScriptService(provider, ts);
+        EmulationService emulationService = new EmulationService(provider, ts);
+
+        HeadlessManagementService headlessManagementService =
+            new HeadlessManagementService(new HeadlessProgramProvider(), new GhidraServerManager());
+
+        // DebuggerService uses PluginTool only at runtime; scanner only reflects on
+        // method signatures, so a null tool is safe for offline scanning.
+        DebuggerService debuggerService = new DebuggerService(provider, ts, null);
 
         return new Object[] {
             listingService,
@@ -56,6 +69,9 @@ public final class ServiceFactory {
             documentationHashService,
             malwareSecurityService,
             programScriptService,
+            emulationService,
+            headlessManagementService,
+            debuggerService,
         };
     }
 

@@ -4,6 +4,250 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
+## v5.4.1 - 2026-04-18 (security)
+
+Security + operational-readiness release on top of v5.4.0. Addresses the
+findings from a full production-readiness audit: unauthenticated HTTP
+surface, ungated RCE-class endpoints, silent `--bind 0.0.0.0`, broken CI
+after the debugger merge, stale metadata, and an empty v5.4.0 release
+page.
+
+### Breaking change
+
+- **`/run_script_inline` and `/run_ghidra_script` are now off by default.**
+  These endpoints execute arbitrary Java against the running Ghidra
+  process. Set `GHIDRA_MCP_ALLOW_SCRIPTS=1` (or `true`/`yes`) to restore
+  v5.4.0 behavior. Error message surfaced to callers names the env var
+  and explains why.
+
+### Security — opt-in hardening (default = pre-v5.4.1 localhost behavior)
+
+New [`com.xebyte.core.SecurityConfig`](src/main/java/com/xebyte/core/SecurityConfig.java)
+— read-once, thread-safe snapshot of three env vars:
+
+- **`GHIDRA_MCP_AUTH_TOKEN`** — when set, every HTTP request must carry
+  `Authorization: Bearer <token>`. Constant-time byte comparison resists
+  timing attacks. `/mcp/health`, `/health`, `/check_connection` are
+  always-exempt read-only pings. Enforced in the GUI plugin's
+  `safeHandler()` wrapper and the new headless
+  `safeContext(path, handler)` registration helper (replaces bare
+  `server.createContext` at all 32 sites).
+- **`GHIDRA_MCP_ALLOW_SCRIPTS`** — see Breaking change above.
+- **`GHIDRA_MCP_FILE_ROOT`** — when set, filesystem-path endpoints
+  canonicalize input and require it to fall under the configured root.
+  Mechanism + helper (`SecurityConfig.resolveWithinFileRoot()`) shipped
+  in this release; per-endpoint wiring for `/import_file`,
+  `/delete_file`, `/open_project`, etc. follows in v5.4.2.
+
+### Security — bind hardening
+
+- Headless `startServer()` now calls
+  `SecurityConfig.requireAuthForNonLoopbackBind(bindAddress)` before
+  binding. Non-loopback binds (`0.0.0.0`, explicit external IP) now
+  refuse to start unless `GHIDRA_MCP_AUTH_TOKEN` is configured. Error
+  message names the env var.
+
+### CI
+
+- **All four workflows now install the three Ghidra Debugger JARs**
+  (`Debugger-api`, `Framework-TraceModeling`, `Debugger-rmi-trace`) —
+  every build on main since the v5.4.0 debugger merge had been failing
+  because these weren't in the `mvn install:install-file` blocks.
+  Release workflow re-ran successfully after the fix; v5.4.0 release
+  page now has attached artifacts (was empty at tag time).
+- **Offline Java tests run in CI.** The 11 annotation-scanner + catalog
+  parity tests (~3 s) were previously only run on developer machines;
+  they now gate every push/PR on `main` and `develop`. Integration
+  tests (which require live Ghidra on port 8089) remain excluded.
+
+### Docs
+
+- **`CHANGELOG.md`** — v5.4.0 entry backfilled (was missing at tag
+  time). This v5.4.1 entry.
+- **`README.md`** — version badge `5.3.2 → 5.4.0 → 5.4.1`, tool-count
+  references refreshed to 219 (5+ occurrences), new `## 🔒 Security`
+  section documenting the three env vars with a worked LAN-exposure
+  example and a migration note for the script-gate breaking change,
+  Dynamic Analysis features subsection covering emulation + debugger,
+  GUI/headless endpoint counts corrected.
+- **`CLAUDE.md`** — version + tool count, Architecture section updated
+  for `EmulationService`, `DebuggerService`, `debugger/` Python
+  package on port 8099 via `GHIDRA_DEBUGGER_URL`, and
+  `HeadlessManagementService`.
+- **`tests/endpoints.json`** — `version` field `5.2.0 → 5.4.1` (had
+  been stale since v5.3).
+- **`src/main/resources/META-INF/MANIFEST.MF`** — `Plugin-Version`
+  `4.4.0 → 5.4.1` (very stale).
+- **`src/main/resources/extension.properties`** — tool count
+  `199 → 219`; dynamic-analysis capabilities noted.
+- **`GhidraMCPHeadlessServer.java`** — `VERSION` string
+  `5.3.2-headless → 5.4.1-headless`.
+
+### Hygiene
+
+- **Deprecated-API warning suppressed** in
+  `HeadlessEndpointHandler.batchSetComments` — Ghidra 12's deprecated
+  `Listing.setComment(Address, int, String)` + `CodeUnit` int
+  constants. Silences the "Some input files use or override a
+  deprecated API" warning that appeared on every clean build.
+- **`requirements.txt:8`** — bumped `requests` floor to `>=2.32.0`
+  per CVE-2024-35195 (certificate-verification bypass).
+- **`.playwright-mcp/`** added to `.gitignore` — Playwright MCP
+  scratch directory was appearing in `git status` after every browser
+  test.
+- **Per-function escalation + audit tracking (fun-doc)** — when a
+  worker auto-escalates mid-function to a stronger provider, or when
+  the post-function audit pass runs, the function record is now
+  stamped with `escalation_count` / `last_escalated` /
+  `last_escalation_from` / `last_escalation_to` /  `audit_count` /
+  `last_audited` / `last_audit_provider` / `last_audit_delta`.
+  `/api/stats` surfaces two new counters (`audited`, `escalated`).
+
+### Known gaps (follow-ups to v5.4.2)
+
+- **Per-endpoint file-path root check.** The `SecurityConfig`
+  mechanism is ready, but individual endpoints (`/import_file`,
+  `/delete_file`, `/open_project`, `/load_program`, etc.) still
+  accept raw paths. Wire-up in next patch.
+- **Debugger endpoints are still live-untested.** 17 Java + 22 Python
+  bridge tools compile, pass offline tests, and fail gracefully when
+  no debug session is attached, but haven't been exercised against a
+  running target. v5.4.2 or v5.5.0 will ship with live-validation
+  logs.
+- **Three placeholder endpoints** (`/detect_crypto_constants`,
+  `/find_dead_code`, `auto_decrypt_strings`) still in the schema with
+  "Not yet implemented" responses.
+
+---
+
+## v5.4.0 - 2026-04-18
+
+Feature release. Three new service domains land together: P-code emulation,
+live debugger integration, and PCode-graph data flow analysis. Plus headless
+catalog fixes, fun-doc UI improvements, and a `--use-venv` setup flag. Tool
+count rises from 199 → 219 on main.
+
+### Added
+
+- **P-code emulation** (#127) — [`EmulationService.java`](src/main/java/com/xebyte/core/EmulationService.java)
+  exposes two new endpoints backed by Ghidra's `EmulatorHelper`:
+  - `POST /emulate_function` — run a function with user-supplied register
+    and memory state; returns the final register values. Memory regions
+    accept base64 (`data`), hex, or `string` forms, wrapped under
+    `{"regions": [...]}` in the JSON body.
+  - `POST /emulate_hash_batch` — brute-force API hash resolution. Iterates
+    a candidate list, writes each string into scratch memory, runs the
+    hash function, and compares the result register against a target hash.
+    Returns all matches (collision-safe) plus a `best_match` convenience
+    field.
+
+  Live-verified against D2Common.dll: a two-instruction leaf
+  (`MOV EAX, [ECX+4]; RET`) round-trips `0xDEADC0DE` through the emulator,
+  and `/emulate_hash_batch` correctly isolates a single matching
+  candidate from a three-item list using a contrived hash target.
+
+- **Live debugger integration** (#128) — two-part addition:
+  - Java side: [`DebuggerService.java`](src/main/java/com/xebyte/core/DebuggerService.java)
+    exposes 17 `/debugger/*` endpoints (`status`, `traces`, `resume`,
+    `interrupt`, `step_{into,over,out}`, `{set,remove,list}_breakpoint`,
+    `registers`, `read_memory`, `stack_trace`, `modules`,
+    `{static,dynamic}_to_{dynamic,static}`, `launch_offers`) wrapping
+    Ghidra's `DebuggerTraceManagerService`,
+    `DebuggerLogicalBreakpointService`, and `TraceRmiLauncherService`.
+    Supports whatever backend Ghidra's TraceRmi framework provides
+    (`dbgeng` for Windows PE targets, `gdb`/`lldb` otherwise). GUI-only —
+    not wired into the headless server because `DebuggerService` requires
+    a `PluginTool`.
+  - Python side: new [`debugger/`](debugger/) package with a standalone
+    HTTP server on port 8099 (engine, protocol, tracing, address_map,
+    D2-specific convention parser). `bridge_mcp_ghidra.py` registers 22
+    static MCP tools (`debugger_attach`, `debugger_continue`,
+    `debugger_step_*`, `debugger_registers`, `debugger_read_memory`,
+    `debugger_stack_trace`, `debugger_trace_*`, `debugger_watch_*`) that
+    proxy to the server via the `GHIDRA_DEBUGGER_URL` env var.
+
+  Compile + offline tests pass for both layers. Live-session testing is
+  pending an attached debug target.
+
+- **Data flow analysis** (#125, closes #111) — `GET /analyze_dataflow`
+  traces value propagation through a function using the decompiler's
+  PCode graph. Backward mode walks producers via `Varnode.getDef()`;
+  forward mode walks consumers via `Varnode.getDescendants()`.
+  Terminates at constants, function inputs, call boundaries, or
+  `max_steps`. Phi (`MULTIEQUAL`) nodes are summarized as single steps
+  rather than recursed. Anchor resolution accepts register names
+  (`EAX`), HighVariable names (`param_1`, `local_14`), or empty for the
+  first PcodeOp output at the address. Live-verified against
+  `ANIM_GetFrameData` in D2Common.dll: the backward chain reproduces the
+  decompiler output `*(byte *)(pUnit->dwField50 + 0x10 + nAnimIndex)`
+  step-for-step.
+
+- **Headless program/project management** (#121, #122, #123) — the eight
+  headless-specific endpoints (`/load_program`, `/close_program`,
+  `/create_project`, `/open_project`, `/close_project`,
+  `/load_program_from_project`, `/get_project_info`, `/server/status`)
+  were previously registered manually and invisible to `/mcp/schema`,
+  so `list_tool_groups` omitted them. New
+  [`HeadlessManagementService.java`](src/main/java/com/xebyte/headless/HeadlessManagementService.java)
+  moves them into the annotation scanner. Parity test extended to
+  scan the headless-only service so catalog drift in these endpoints
+  now fails at `mvn test` time.
+
+- **`--use-venv` flag for Linux setup** (#120) — `ghidra-mcp-setup.sh`
+  can now install Python deps into a local `.venv` instead of the
+  system Python, required on Ubuntu 24.04+ where system Python is
+  externally-managed.
+
+### Changed
+
+- **`tests/endpoints.json`** regenerated via `RegenerateEndpointsJson`
+  — 199 → 219 entries. The `version` field, stale at `5.2.0`, is bumped
+  to `5.4.0`. Categories list adds `emulation` and `headless`.
+- **fun-doc UI** (#126) — layer filter dropdown (matches dashboard BFS
+  computation), 7 sortable column headers replacing the previous
+  dropdown sort, `Layer` column replacing `Callers`, 500-row table cap
+  removed, `Focus` button on worker panes + banner wired to
+  `/api/navigate`, `Stop All Workers` button with visibility logic,
+  runs-today counter reads the full log file, auto-escalate to stronger
+  provider when score < `good_enough`. Live smoke-tested via Playwright
+  against the running dashboard.
+- **`tests/endpoints.json` catalog corrections** (#123) — three headless
+  endpoint params had been miscatalogued (`/load_program`: `path` →
+  `file`; `/close_program`: `program` → `name`;
+  `/load_program_from_project`: two params → one). Catalog is now
+  authoritative and validated by the offline parity test.
+
+### Fixed
+
+- **Intermediate varnode rendering in `/analyze_dataflow`** (second
+  commit on #125) — Ghidra's `HighVariable` returns the literal string
+  `"UNNAMED"` for anonymous intermediates. The initial implementation
+  rendered these as `"UNNAMED"` instead of falling through to the
+  `unique:<id>` labeling. Fixed by skipping the placeholder and
+  surfacing the unique varnode id, giving traceable dependency chains.
+
+### Security
+
+- No security-relevant changes in v5.4.0. The unchanged default state
+  — unauthenticated HTTP endpoints with the option to bind `0.0.0.0`
+  in headless mode — applies here as before. **A v5.4.1 security
+  release is planned** to address auth, bind hardening, script-endpoint
+  gating, and path canonicalization on file-handling endpoints.
+
+### Known gaps
+
+- **Debugger endpoints are live-untested.** All 17 Java endpoints and
+  22 Python bridge tools compile, pass offline annotation-parity tests,
+  and fail gracefully when no debug session is attached, but they have
+  not been exercised against a running target. v5.4.1 or v5.5.0 will
+  ship with live-validation logs.
+- **Three placeholder endpoints** remain in the schema with "Not yet
+  implemented" responses: `/detect_crypto_constants`, `/find_dead_code`,
+  `auto_decrypt_strings`. These will either be implemented or switched
+  to returning an error in a subsequent release.
+
+---
+
 ## v5.3.2 - 2026-04-15 (hotfix)
 
 Second hotfix on the v5.3.x line, shipped after a multi-hour overnight

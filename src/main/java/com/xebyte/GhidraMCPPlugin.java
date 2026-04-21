@@ -99,7 +99,7 @@ import java.util.regex.Pattern;
 
 // Load version from properties file (populated by Maven during build)
 class VersionInfo {
-    private static String VERSION = "5.3.2"; // Default fallback
+    private static String VERSION = "5.4.1"; // Default fallback
     private static String APP_NAME = "GhidraMCP";
     private static String GHIDRA_VERSION = "unknown"; // Loaded from version.properties (Maven-filtered)
     private static String BUILD_TIMESTAMP = "dev"; // Will be replaced by Maven
@@ -107,19 +107,24 @@ class VersionInfo {
     private static final int ENDPOINT_COUNT = 175;
 
     static {
+        // v5.4.2: loading "/version.properties" from the classpath root was
+        // hitting a sibling version.properties exported by another Ghidra
+        // module, which resolved first and returned stale values. Move the
+        // resource under the com/xebyte/ package path so the lookup is scoped
+        // to this plugin's classes.
         try (InputStream input = GhidraMCPPlugin.class
-                .getResourceAsStream("/version.properties")) {
+                .getResourceAsStream("/com/xebyte/version.properties")) {
             if (input != null) {
                 Properties props = new Properties();
                 props.load(input);
-                VERSION = props.getProperty("app.version", "5.3.2");
-                APP_NAME = props.getProperty("app.name", "GhidraMCP");
-                GHIDRA_VERSION = props.getProperty("ghidra.version", "unknown");
-                BUILD_TIMESTAMP = props.getProperty("build.timestamp", "dev");
-                BUILD_NUMBER = props.getProperty("build.number", "0");
+                VERSION = props.getProperty("app.version", VERSION);
+                APP_NAME = props.getProperty("app.name", APP_NAME);
+                GHIDRA_VERSION = props.getProperty("ghidra.version", GHIDRA_VERSION);
+                BUILD_TIMESTAMP = props.getProperty("build.timestamp", BUILD_TIMESTAMP);
+                BUILD_NUMBER = props.getProperty("build.number", BUILD_NUMBER);
             }
         } catch (IOException e) {
-            // Use defaults if file not found
+            // Use defaults (hard-coded above) if file not found.
         }
     }
 
@@ -228,6 +233,8 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     private final com.xebyte.core.AnalysisService analysisService;
     private final com.xebyte.core.MalwareSecurityService malwareSecurityService;
     private final com.xebyte.core.ProgramScriptService programScriptService;
+    private final com.xebyte.core.EmulationService emulationService;
+    private final com.xebyte.core.DebuggerService debuggerService;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -247,6 +254,8 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         this.analysisService = new com.xebyte.core.AnalysisService(programProvider, threadingStrategy, this.functionService);
         this.malwareSecurityService = new com.xebyte.core.MalwareSecurityService(programProvider, threadingStrategy);
         this.programScriptService = new com.xebyte.core.ProgramScriptService(programProvider, threadingStrategy);
+        this.emulationService = new com.xebyte.core.EmulationService(programProvider, threadingStrategy);
+        this.debuggerService = new com.xebyte.core.DebuggerService(programProvider, threadingStrategy, tool);
         Msg.info(this, "============================================");
         Msg.info(this, "GhidraMCP " + VersionInfo.getFullVersion());
         Msg.info(this, "Endpoints: " + VersionInfo.getEndpointCount());
@@ -469,7 +478,8 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         AnnotationScanner scanner = new AnnotationScanner(programProvider,
             listingService, functionService, commentService, symbolLabelService,
             xrefCallGraphService, dataTypeService, analysisService,
-            documentationHashService, malwareSecurityService, programScriptService);
+            documentationHashService, malwareSecurityService, programScriptService,
+            emulationService, debuggerService);
 
         for (EndpointDef ep : scanner.getEndpoints()) {
             server.createContext(ep.path(), safeHandler(exchange -> {
@@ -1809,12 +1819,36 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      */
     private static final long SLOW_HANDLER_WARN_MS = 2000;
 
+    /**
+     * Read-only health endpoints that bypass the auth check even when
+     * GHIDRA_MCP_AUTH_TOKEN is configured. Keep this set minimal — anything
+     * that reveals program state or accepts writes must require auth.
+     */
+    private static boolean isAuthExempt(String path) {
+        return "/mcp/health".equals(path) || "/check_connection".equals(path);
+    }
+
     private com.sun.net.httpserver.HttpHandler safeHandler(com.sun.net.httpserver.HttpHandler handler) {
         return exchange -> {
             long startNanos = System.nanoTime();
             String path = exchange.getRequestURI().getPath();
             activeRequests.incrementAndGet();
             try {
+                if (!isAuthExempt(path)) {
+                    com.xebyte.core.SecurityConfig sec = com.xebyte.core.SecurityConfig.getInstance();
+                    if (sec.isAuthEnabled()) {
+                        String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+                        if (!sec.matchesBearerAuth(authHeader)) {
+                            byte[] body = "{\"error\": \"Unauthorized\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                            exchange.getResponseHeaders().set("Content-Type", "application/json");
+                            exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer");
+                            exchange.sendResponseHeaders(401, body.length);
+                            exchange.getResponseBody().write(body);
+                            exchange.getResponseBody().close();
+                            return;
+                        }
+                    }
+                }
                 handler.handle(exchange);
             } catch (Throwable e) {
                 try {

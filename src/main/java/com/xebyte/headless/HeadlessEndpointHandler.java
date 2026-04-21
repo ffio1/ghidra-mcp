@@ -58,6 +58,7 @@ public class HeadlessEndpointHandler {
     private final com.xebyte.core.DocumentationHashService documentationHashService;
     private final com.xebyte.core.MalwareSecurityService malwareSecurityService;
     private final com.xebyte.core.ProgramScriptService programScriptService;
+    private final com.xebyte.core.EmulationService emulationService;
 
     public HeadlessEndpointHandler(ProgramProvider programProvider, ThreadingStrategy threadingStrategy) {
         this.programProvider = programProvider;
@@ -76,6 +77,7 @@ public class HeadlessEndpointHandler {
         this.documentationHashService.setFunctionService(this.functionService);
         this.malwareSecurityService = new com.xebyte.core.MalwareSecurityService(programProvider, threadingStrategy);
         this.programScriptService = new com.xebyte.core.ProgramScriptService(programProvider, threadingStrategy);
+        this.emulationService = new com.xebyte.core.EmulationService(programProvider, threadingStrategy);
     }
 
     // ==========================================================================
@@ -92,6 +94,7 @@ public class HeadlessEndpointHandler {
     public com.xebyte.core.DocumentationHashService getDocumentationHashService() { return documentationHashService; }
     public com.xebyte.core.MalwareSecurityService getMalwareSecurityService() { return malwareSecurityService; }
     public com.xebyte.core.ProgramScriptService getProgramScriptService() { return programScriptService; }
+    public com.xebyte.core.EmulationService getEmulationService() { return emulationService; }
     public ProgramProvider getProgramProvider() { return programProvider; }
 
     // ==========================================================================
@@ -823,7 +826,13 @@ public class HeadlessEndpointHandler {
 
     /**
      * Set multiple comments in a single batch operation.
+     *
+     * Suppresses the deprecated-API warning for Ghidra 12's Listing.setComment(Address, int, String)
+     * and CodeUnit.PLATE_COMMENT / PRE_COMMENT / EOL_COMMENT int constants. The replacement
+     * ghidra.program.model.listing.CommentType enum API will be adopted when this handler is
+     * refactored to delegate to CommentService (the GUI-side path already uses the enum).
      */
+    @SuppressWarnings("deprecation")
     public String batchSetComments(String functionAddress, String decompilerCommentsJson,
                                    String disassemblyCommentsJson, String plateComment, String programName) {
         Program program = getProgram(programName);

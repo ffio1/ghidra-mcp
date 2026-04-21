@@ -1128,8 +1128,9 @@ def fetch_function_data(program, address, mode="FIX"):
         "decompile_timeout": False,
     }
 
-    # Navigate
-    ghidra_post("/tool/goto_address", data={"address": f"0x{address}"})
+    # Navigation removed — was calling /tool/goto_address on every function,
+    # stealing Ghidra focus from the user. Navigation is now controlled by the
+    # dashboard's Focus button (auto-follow checkbox) via /api/navigate.
 
     # Decompile
     data["decompiled"] = ghidra_get(
@@ -1246,18 +1247,71 @@ def populate_call_graph(state, prog_path):
 
     # Stamp each function's state entry with its callee list
     funcs = state.get("functions", {})
+    # Collect addresses — separate scoreable (non-thunk) from all for BFS.
+    # BFS layers are computed on non-thunk functions only so they match the
+    # dashboard's Call Graph Layers visualization. Thunks participate in
+    # callee lists (so readiness can track them) but don't get layer numbers.
+    prog_addrs = set()  # all addresses (including thunks)
+    scoreable_addrs = set()  # non-thunk only (for BFS)
+    addr_to_key = {}
     stamped = 0
     for key, func in funcs.items():
         if func.get("program") != prog_path:
             continue
         addr = func.get("address", "")
         func["callees"] = sorted(adjacency.get(addr, set()))
+        prog_addrs.add(addr)
+        addr_to_key[addr] = key
+        if not func.get("is_thunk") and not func.get("is_external"):
+            scoreable_addrs.add(addr)
         stamped += 1
 
+    # BFS layer assignment: leaf = layer 0, callers of leaves = layer 1, etc.
+    # Uses scoreable (non-thunk) addresses only so layers match the dashboard.
+    internal_callees = {}
+    callers_of = defaultdict(set)
+    for addr in scoreable_addrs:
+        ic = adjacency.get(addr, set()) & scoreable_addrs
+        internal_callees[addr] = ic
+        for c in ic:
+            callers_of[c].add(addr)
+
+    depth = {}
+    current = set()
+    for addr in scoreable_addrs:
+        if not internal_callees.get(addr):
+            depth[addr] = 0
+            current.add(addr)
+    layer_num = 0
+    while current:
+        nxt = set()
+        for addr in current:
+            for caller in callers_of.get(addr, set()):
+                if caller in depth:
+                    continue
+                if all(c in depth for c in internal_callees.get(caller, set())):
+                    depth[caller] = layer_num + 1
+                    nxt.add(caller)
+        current = nxt
+        layer_num += 1
+        if layer_num > 200:
+            break
+
+    # Stamp layer on each scoreable function
+    for addr, d in depth.items():
+        if addr in addr_to_key:
+            funcs[addr_to_key[addr]]["call_graph_layer"] = d
+    # Cyclic functions get no layer (None); thunks keep whatever they had
+    for addr in scoreable_addrs - set(depth.keys()):
+        if addr in addr_to_key:
+            funcs[addr_to_key[addr]]["call_graph_layer"] = None
+
     edge_count = resp.get("edge_count", len(edges))
+    assigned = len(depth)
+    cyclic = len(prog_addrs) - assigned
     print(
         f"  Call graph: {edge_count} edges, {len(adjacency)} callers, "
-        f"{stamped} functions stamped",
+        f"{stamped} stamped, {assigned} layered, {cyclic} cyclic",
         flush=True,
     )
     return stamped
@@ -1355,6 +1409,13 @@ DEFAULT_QUEUE_CONFIG = {
     # logs/debug/{date}/ and prints verbose console lines. Use analyze_debug.py
     # to spot inefficiencies (consecutive same-tool runs, retries, etc).
     "debug_mode": False,
+    # Audit stage: after the worker finishes, a second provider reviews the
+    # result and fixes gaps (missing plate sections, unrenamed variables, etc.).
+    # Set to None / "off" to disable. Only fires when score gain < audit_min_delta.
+    "audit_provider": None,
+    # Minimum score delta to skip audit. If the worker gained >= this many
+    # points, audit is skipped (the worker did well enough). Lower = more audits.
+    "audit_min_delta": 5,
     # Pre-refresh top candidates' scores when a worker starts. Skipped when:
     # - This flag is False
     # - No active_binary is set (would touch every binary Ghidra has)
@@ -1450,6 +1511,18 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
         consecutive_fails = func.get("consecutive_fails", 0)
         if consecutive_fails >= 3 and not is_pinned:
             continue
+        # Safety valve: even pinned functions get removed after 6 consecutive
+        # failures (2 full escalation cycles). Prevents infinite retry loops.
+        if consecutive_fails >= 6 and is_pinned:
+            pinned_list_copy = list(queue.get("pinned", []))
+            if key in pinned_list_copy:
+                pinned_list_copy.remove(key)
+                queue["pinned"] = pinned_list_copy
+                save_priority_queue(queue)
+                print(
+                    f"  Auto-unpinned {func.get('name', key)} after {consecutive_fails} consecutive failures"
+                )
+            continue
 
         # Recovery-pass one-shot: massive functions get exactly one
         # complexity-forced recovery pass; after that they stay out of the
@@ -1509,6 +1582,7 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
                 "roi": roi,
                 "readiness": readiness,
                 "is_leaf": not func.get("callees"),
+                "call_graph_layer": func.get("call_graph_layer"),
                 "pinned": is_pinned,
                 "pin_order": pin_order.get(key, 10**9),
                 "needs_scoring": needs_scoring,
@@ -1522,9 +1596,9 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
             not c["pinned"],
             c["pin_order"],
             not c["needs_scoring"],
-            -c["readiness"],       # higher readiness first (1.0 before 0.5)
-            not c["is_leaf"],      # within same readiness, leaves before callers
-            -c["roi"],             # within same tier, highest ROI first
+            -c["readiness"],  # higher readiness first (1.0 before 0.5)
+            not c["is_leaf"],  # within same readiness, leaves before callers
+            -c["roi"],  # within same tier, highest ROI first
         )
     )
     return candidates
@@ -2902,7 +2976,7 @@ def invoke_claude(
     if effective_provider == "codex":
         return _wrap_result(_invoke_codex(prompt, model, max_turns))
     if effective_provider == "gemini":
-        return _wrap_result(_invoke_gemini(prompt, model, max_turns))
+        return _invoke_gemini(prompt, model, max_turns)
 
     return _wrap_result(_invoke_claude(prompt, model, max_turns))
 
@@ -2995,11 +3069,26 @@ def _invoke_codex(prompt, model="gpt-5.3-codex", max_turns=25):
 
         return "\n".join(output_parts) if output_parts else None
 
-    try:
-        return asyncio.run(run())
-    except Exception as e:
-        print(f"ERROR: Codex SDK failed: {e}", file=sys.stderr)
-        return None
+    # Retry transient Codex CLI crashes (exit code 1 with "Reading prompt from stdin")
+    last_err = None
+    for _attempt in range(3):
+        try:
+            return asyncio.run(run())
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "exited with code" in err_str and _attempt < 2:
+                wait = (2**_attempt) * 5  # 5s, 10s
+                print(
+                    f"  [codex] transient failure (attempt {_attempt + 1}/3), "
+                    f"retrying in {wait}s: {err_str[:120]}",
+                    flush=True,
+                )
+                time.sleep(wait)
+            else:
+                break
+    print(f"ERROR: Codex SDK failed: {last_err}", file=sys.stderr)
+    return None
 
 
 def _invoke_gemini(prompt, model="gemini-2.5-pro", max_turns=25):
@@ -3038,8 +3127,10 @@ def _invoke_gemini(prompt, model="gemini-2.5-pro", max_turns=25):
 
         output_parts = []
         tool_call_count = 0
+        event_count = 0
 
         async for event in cli.run(prompt):
+            event_count += 1
             if isinstance(event, InitEvent):
                 print(
                     f"  [gemini] session={event.session_id} model={event.model}",
@@ -3079,13 +3170,47 @@ def _invoke_gemini(prompt, model="gemini-2.5-pro", max_turns=25):
                     )
 
         text = "\n".join(output_parts) if output_parts else None
-        return text
+        if not text and event_count == 0:
+            print(
+                "  [gemini] WARNING: CLI produced 0 events — session may have "
+                "failed to start or timed out",
+                flush=True,
+            )
+        elif not text:
+            print(
+                f"  [gemini] WARNING: {event_count} events but no output text "
+                f"(tool_calls={tool_call_count})",
+                flush=True,
+            )
+        return (text, {"tool_calls": tool_call_count})
 
-    try:
-        return asyncio.run(run())
-    except Exception as e:
-        print(f"ERROR: Gemini CLI failed: {e}", file=sys.stderr)
-        return None
+    # Retry on transient Gemini capacity/rate-limit errors.
+    # The Gemini CLI has its own internal retries but uses short backoffs that
+    # aren't enough when the model is fully saturated (429 / RESOURCE_EXHAUSTED).
+    # We add longer waits between whole-session retries.
+    last_err = None
+    for _attempt in range(3):
+        try:
+            return asyncio.run(run())
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            is_transient = any(
+                k in err_str
+                for k in ("429", "RESOURCE_EXHAUSTED", "capacity", "rateLimitExceeded")
+            )
+            if is_transient and _attempt < 2:
+                wait = (2**_attempt) * 30  # 30s, 60s — longer than CLI's own backoff
+                print(
+                    f"  [gemini] capacity exhausted (attempt {_attempt + 1}/3), "
+                    f"retrying in {wait}s...",
+                    flush=True,
+                )
+                time.sleep(wait)
+            else:
+                break
+    print(f"ERROR: Gemini CLI failed: {last_err}", file=sys.stderr)
+    return (None, {"tool_calls": 0})
 
 
 def _invoke_minimax(prompt, model="MiniMax-M2.7", max_turns=25, complexity_tier=None):
@@ -3261,7 +3386,29 @@ def _invoke_minimax(prompt, model="MiniMax-M2.7", max_turns=25, complexity_tier=
             if tools_openai:
                 kwargs["tools"] = tools_openai
 
-            response = client.chat.completions.create(**kwargs)
+            # Retry transient errors (429 rate limit, 529 overloaded, 5xx server)
+            response = None
+            for _attempt in range(4):
+                try:
+                    response = client.chat.completions.create(**kwargs)
+                    break
+                except Exception as api_err:
+                    err_str = str(api_err)
+                    retryable = any(
+                        code in err_str for code in ("429", "529", "500", "502", "503")
+                    )
+                    if retryable and _attempt < 3:
+                        wait = (2**_attempt) * 5  # 5s, 10s, 20s
+                        print(
+                            f"  [minimax] transient error (attempt {_attempt + 1}/4), "
+                            f"retrying in {wait}s: {err_str[:120]}",
+                            flush=True,
+                        )
+                        time.sleep(wait)
+                    else:
+                        raise
+            if response is None:
+                break
         except Exception as e:
             print(f"  [minimax] API error: {e}", file=sys.stderr)
             break
@@ -3471,7 +3618,10 @@ def _invoke_claude(prompt, model="sonnet", max_turns=25):
                             "input": tool_input,
                             "start_time": time.perf_counter(),
                         }
-                        print(f"  [mcp] {tool_name}: calling", flush=True)
+                        print(
+                            f"  [mcp] {tool_name.removeprefix('mcp__ghidra-mcp__')}: calling",
+                            flush=True,
+                        )
                         bus_emit(
                             "tool_call",
                             {
@@ -3505,7 +3655,10 @@ def _invoke_claude(prompt, model="sonnet", max_turns=25):
                             if call_info
                             else None
                         )
-                        print(f"  [mcp] {tool_name}: {status}", flush=True)
+                        print(
+                            f"  [mcp] {tool_name.removeprefix('mcp__ghidra-mcp__')}: {status}",
+                            flush=True,
+                        )
                         bus_emit(
                             "tool_result",
                             {
@@ -3963,11 +4116,13 @@ def _inject_tool_block(prompt):
     RELEVANT_TOOLS = {
         "analyze_for_documentation",
         "get_function_variables",
+        "get_plate_comment",
         "set_variables",
         "rename_function_by_address",
         "set_function_prototype",
         "set_local_variable_type",
         "set_parameter_type",
+        "batch_set_variable_types",
         "rename_variable",
         "rename_variables",
         "batch_set_comments",
@@ -4211,11 +4366,15 @@ def process_function(
             ):
                 use_two_pass = True
 
-        # Massive functions: force recovery-only (skip pass 2)
+        # Massive functions: still use two-pass but NO LONGER force recovery-only.
+        # The original reason for skipping Pass 2 on massive functions was EDT
+        # saturation from long-running decompiles — that's been fixed by the 12s
+        # decompile timeout (v5.3.1). With Pass 2 running, massive functions can
+        # now reach good_enough_score in one attempt (Pass 1 types/names + Pass 2
+        # comments). Without this change, recovery_pass_done blocked them forever.
         if complexity_tier == "massive":
             use_two_pass = True
-            complexity_forced_recovery = True
-            print(f"  COMPLEXITY: {complexity_tier} — forcing recovery-only mode")
+            print(f"  COMPLEXITY: {complexity_tier} — two-pass mode")
     if use_two_pass:
         recovery_prompt = build_recovery_prompt(
             func_name, address, data, program=program
@@ -4273,6 +4432,12 @@ def process_function(
                         handoff_reason,
                         new_count,
                     )
+                    # Stamp per-function escalation tracking
+                    func["escalation_count"] = func.get("escalation_count", 0) + 1
+                    func["last_escalated"] = datetime.now().isoformat()
+                    func["last_escalation_from"] = effective_provider
+                    func["last_escalation_to"] = handoff_provider
+                    update_function_state(func_key, func)
                     # Swap provider for the rest of this function's processing
                     provider = handoff_provider
                     effective_provider = handoff_provider
@@ -4392,15 +4557,25 @@ def process_function(
             provider=provider,
             complexity_tier=complexity_tier,
         )
-        # Merge results: use pass 2 output for final parsing, sum tool calls
+        # Merge results: use pass 2 output for final parsing, sum tool calls.
+        # Sentinel -1 means "unknown" — don't let -1 + -1 = -2 break
+        # downstream guards that check for -1 specifically.
         if output2:
             output = output2
-        tool_calls_made += meta2.get("tool_calls", 0)
+        tc2 = meta2.get("tool_calls", 0)
+        if tool_calls_made == -1 and tc2 == -1:
+            tool_calls_made = -1  # still unknown
+        elif tool_calls_made == -1:
+            tool_calls_made = tc2  # use the known value
+        elif tc2 != -1:
+            tool_calls_made += tc2  # both known, sum normally
 
     # Parse result
     result = "completed"
     if output:
-        # Detect rate limit errors (provider returns limit message as text)
+        # Check success markers FIRST — models sometimes mention rate limits,
+        # blocked states, etc. in their reasoning text while ultimately
+        # succeeding. DONE/VERIFIED OK take absolute priority.
         rate_limit_phrases = [
             "hit your limit",
             "rate limit",
@@ -4408,15 +4583,20 @@ def process_function(
             "usage limit",
             "try again at",
         ]
-        if any(phrase in output.lower() for phrase in rate_limit_phrases):
-            print(f"  RATE LIMITED — stopping worker on this function", flush=True)
-            result = "rate_limited"
-        elif "BLOCKED:" in output:
-            result = "blocked"
-        elif "DONE:" in output:
+        if "DONE:" in output:
             result = "completed"
         elif "VERIFIED OK:" in output or "QUICK FIX:" in output:
             result = "completed"
+        elif any(phrase in output.lower() for phrase in rate_limit_phrases):
+            # Only fire when no DONE marker — this is a real API rate limit,
+            # not the model discussing "rate limiting" in game code analysis.
+            print(f"  RATE LIMITED on this function", flush=True)
+            result = "rate_limited"
+        elif "BLOCKED:" in output:
+            # Check BLOCKED after DONE — models sometimes mention a previous
+            # BLOCKED attempt in their reasoning text before ultimately
+            # succeeding with a DONE marker. DONE takes priority.
+            result = "blocked"
         elif "NEEDS REDO:" in output:
             result = "needs_redo"
     elif tool_calls_made >= 1 or tool_calls_made == -1:
@@ -4644,6 +4824,128 @@ def process_function(
     else:
         print(f"\n  Result: {result} | Score: unavailable")
 
+    # ── Audit stage ─────────────────────────────────────────────────────
+    # If configured, run a second provider to review and fix gaps.
+    # Only fires when: audit_provider is set, worker result was usable,
+    # score gain was below the min-delta threshold, and the function isn't
+    # already at the good-enough score.
+    audit_score_before = None
+    audit_score_after = None
+    audit_outcome = None  # "skipped_good_enough", "skipped_delta", "ran", or None
+    audit_cfg = (
+        cfg
+        if "audit_provider" in cfg
+        else ((load_priority_queue().get("config") or DEFAULT_QUEUE_CONFIG))
+    )
+    audit_provider = audit_cfg.get("audit_provider")
+    audit_min_delta = audit_cfg.get("audit_min_delta", 5)
+
+    if (
+        audit_provider
+        and result in ("completed", "partial")
+        and new_score is not None
+        and live_score is not None
+        and mode not in ("VERIFY", "FULL:recovery")
+    ):
+        worker_diff = new_score - live_score
+        good_enough = audit_cfg.get("good_enough_score", 80)
+
+        if new_score >= good_enough:
+            audit_outcome = "skipped_good_enough"
+            print(
+                f"  [audit] skipped — score {new_score}% already >= good_enough {good_enough}%"
+            )
+        elif worker_diff >= audit_min_delta:
+            audit_outcome = "skipped_delta"
+            print(
+                f"  [audit] skipped — worker gained {worker_diff:.0f}% (>= minΔ {audit_min_delta})"
+            )
+        else:
+            print(
+                f"\n  [audit] {audit_provider}: reviewing (worker Δ{worker_diff:.0f}% < minΔ {audit_min_delta})"
+            )
+            bus_emit(
+                "audit_start",
+                {
+                    "key": func_key,
+                    "provider": audit_provider,
+                    "worker_delta": worker_diff,
+                },
+            )
+
+            # Fetch fresh data for the FIX-mode audit pass
+            audit_data = fetch_function_data(program, address, mode="FIX")
+            audit_func_name = (
+                audit_data["completeness"].get("function_name", func_name)
+                if audit_data.get("completeness")
+                else func_name
+            )
+            audit_prompt = build_fix_prompt(
+                audit_func_name, address, audit_data, program=program
+            )
+            # Inject tool block for non-Gemini providers
+            if audit_provider != "gemini":
+                audit_prompt = _inject_tool_block(audit_prompt)
+
+            audit_outcome = "ran"
+            audit_score_before = new_score
+            print(
+                f"  [audit] FIX | {audit_provider} | {len(audit_prompt):,} chars | score: {new_score}%"
+            )
+            print()
+            audit_output, audit_meta = invoke_claude(
+                audit_prompt,
+                model="sonnet",
+                provider=audit_provider,
+                max_turns=15,
+            )
+            audit_tool_calls = audit_meta.get("tool_calls", -1)
+
+            # Rescore after audit
+            audit_new_score, audit_completeness = _rescore_and_sync(
+                func, address, program
+            )
+            if audit_new_score is not None:
+                audit_score_after = audit_new_score
+                audit_diff = audit_new_score - audit_score_before
+                print(
+                    f"\n  [audit] {audit_provider}: done — "
+                    f"{audit_score_before}% -> {audit_new_score}% "
+                    f"({'+' if audit_diff >= 0 else ''}{audit_diff:.0f}%), "
+                    f"{audit_tool_calls} tool calls"
+                )
+                # Update tracked values for downstream logging
+                new_score = audit_new_score
+                post_completeness = audit_completeness
+                tool_calls_made += audit_tool_calls if audit_tool_calls > 0 else 0
+                # Upgrade partial to completed if audit pushed past issues
+                if result == "partial" and audit_diff > 0:
+                    result = "completed"
+                    func["last_result"] = result
+            else:
+                print(f"\n  [audit] {audit_provider}: done — score unavailable")
+
+            bus_emit(
+                "audit_complete",
+                {
+                    "key": func_key,
+                    "provider": audit_provider,
+                    "score_before": audit_score_before,
+                    "score_after": audit_new_score,
+                },
+            )
+
+            # Save program after audit writes
+            if audit_tool_calls != 0:
+                ghidra_post("/save_program", params={"program": program})
+
+            # Stamp per-function audit tracking
+            func["audit_count"] = func.get("audit_count", 0) + 1
+            func["last_audited"] = datetime.now().isoformat()
+            func["last_audit_provider"] = audit_provider
+            func["last_audit_delta"] = audit_diff if audit_new_score is not None else 0
+            update_function_state(func_key, func)
+
     # Track partial_runs for requeue deprioritization
     if result == "partial":
         func["partial_runs"] = func.get("partial_runs", 0) + 1
@@ -4669,6 +4971,14 @@ def process_function(
             "tool_calls": tool_calls_made,
             "complexity_tier": complexity_tier,
             "missing_artifacts": missing_artifacts if missing_artifacts else None,
+            "audit_provider": (
+                audit_provider
+                if (audit_provider and result in ("completed", "partial"))
+                else None
+            ),
+            "audit_outcome": audit_outcome,
+            "audit_score_before": audit_score_before,
+            "audit_score_after": audit_score_after,
             "output": output[:5000] if output else None,
         }
     )
@@ -4701,10 +5011,17 @@ def process_function(
     # — re-queuing burns opus/minimax tokens for marginal improvement. The
     # flag clears on `--scan --refresh` or `refresh_candidate_scores`, or can
     # be bypassed by pinning the function explicitly.
+    # Don't flag leaf functions — they're self-contained and should always
+    # get another chance via the normal stagnation guard. The "massive"
+    # classifier triggers on fixable_pts > 50 regardless of function size,
+    # so a 10-line leaf with many undefined variables gets incorrectly
+    # forced into recovery-only mode and stuck forever.
+    is_leaf_func = not func.get("callees")
     if (
         complexity_forced_recovery
         and mode == "FULL:recovery"
         and result in ("completed", "partial")
+        and not is_leaf_func
     ):
         func["recovery_pass_done"] = True
         func["recovery_pass_score"] = new_score
@@ -4720,8 +5037,10 @@ def process_function(
     # the function and the worker would re-pick it forever.
     #
     # Semantics:
-    #   - Increment on any completed/partial run with delta <= 1 (no progress
+    #   - Increment on any completed/partial/blocked run with delta <= 1 (no progress
     #     OR regression). -1% dropped via Guard #2b to "partial" still counts.
+    #     Blocked runs always count (delta is always 0 when the model narrates
+    #     instead of calling tools).
     #   - Reset to 0 on meaningful positive progress (delta >= 5).
     #   - Not touched by failed/needs_redo/rate_limited (consecutive_fails
     #     already covers those).
@@ -4729,7 +5048,7 @@ def process_function(
     #   - Cleared by refresh_candidate_scores and full --scan --refresh, same
     #     as the other one-shot flags.
     if (
-        result in ("completed", "partial")
+        result in ("completed", "partial", "blocked")
         and new_score is not None
         and live_score is not None
     ):

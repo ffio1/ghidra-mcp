@@ -6,9 +6,9 @@
     <groupId>com.xebyte</groupId>
     <artifactId>GhidraMCP</artifactId>
     <packaging>jar</packaging>
-    <version>5.3.2</version>
+    <version>5.4.1</version>
     <name>Ghidra MCP Server</name>
-    <description>Production-ready Model Context Protocol server for Ghidra reverse engineering platform. v5.3.2 (hotfix): Pass 2 gate accepts tool_calls_made==-1 so codex/claude runs actually execute the comments pass (fixes score plateau at ~60% for massive-complexity functions), stagnation_runs one-shot blacklist for any no-progress loop, claude system prompt tells it to call MCP tools directly instead of using ToolSearch (eliminates false BLOCKED reports).</description>
+    <description>Production-ready Model Context Protocol server for Ghidra reverse engineering platform. v5.4.1 security release: opt-in HTTP bearer-token authentication (GHIDRA_MCP_AUTH_TOKEN), non-loopback bind refusal without auth, script-endpoint gate (GHIDRA_MCP_ALLOW_SCRIPTS, default off), filesystem path-root allow-list mechanism (GHIDRA_MCP_FILE_ROOT), CI fixes, docs refresh, and the v5.4.0 emulation / debugger / data-flow feature set.</description>
     <url>https://github.com/bethington/ghidra-mcp</url>
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
@@ -91,6 +91,28 @@
             <artifactId>Help</artifactId>
             <version>${ghidra.version}</version>
         </dependency>
+        <!-- Ghidra Emulation (for EmulationService P-code emulator) -->
+        <dependency>
+            <groupId>ghidra</groupId>
+            <artifactId>Emulation</artifactId>
+            <version>${ghidra.version}</version>
+        </dependency>
+        <!-- Ghidra Debug module dependencies (for DebuggerService) -->
+        <dependency>
+            <groupId>ghidra</groupId>
+            <artifactId>Debugger-api</artifactId>
+            <version>${ghidra.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ghidra</groupId>
+            <artifactId>Framework-TraceModeling</artifactId>
+            <version>${ghidra.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ghidra</groupId>
+            <artifactId>Debugger-rmi-trace</artifactId>
+            <version>${ghidra.version}</version>
+        </dependency>
         <!-- Gson (provided — bundled with Ghidra in Framework/Generic/lib/) -->
         <dependency>
             <groupId>com.google.code.gson</groupId>
@@ -128,7 +150,7 @@
                 <directory>src/main/resources</directory>
                 <filtering>true</filtering>
                 <includes>
-                    <include>version.properties</include>
+                    <include>com/xebyte/version.properties</include>
                     <include>extension.properties</include>
                 </includes>
             </resource>
@@ -136,7 +158,7 @@
                 <directory>src/main/resources</directory>
                 <filtering>false</filtering>
                 <excludes>
-                    <exclude>version.properties</exclude>
+                    <exclude>com/xebyte/version.properties</exclude>
                     <exclude>extension.properties</exclude>
                 </excludes>
             </resource>

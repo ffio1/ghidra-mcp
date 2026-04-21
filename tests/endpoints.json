@@ -1,7 +1,7 @@
 {
-  "version": "5.2.0",
+  "version": "5.4.1",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 199,
+  "total_endpoints": 222,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -16,7 +16,8 @@
     "project": "Project lifecycle management",
     "server": "Server connection and version control",
     "script": "Script execution",
-    "utility": "Utility endpoints"
+    "utility": "Utility endpoints",
+    "emulation": "P-code emulation (run functions with controlled inputs)"
   },
   "endpoints": [
     {
@@ -87,6 +88,19 @@
       "description": "Analyze data region"
     },
     {
+      "path": "/analyze_dataflow",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "address",
+        "variable",
+        "direction",
+        "max_steps",
+        "program"
+      ],
+      "description": "Trace value propagation through a function (PCode graph, forward/backward)"
+    },
+    {
       "path": "/analyze_for_documentation",
       "method": "GET",
       "category": "analysis",
@@ -110,7 +124,7 @@
         "include_completeness",
         "program"
       ],
-      "description": "Complete function analysis"
+      "description": "Comprehensive single-call function analysis. Requires function name — if you only have an address, call get_function_by_address first."
     },
     {
       "path": "/analyze_function_completeness",
@@ -122,6 +136,22 @@
         "program"
       ],
       "description": "Analyze documentation completeness"
+    },
+    {
+      "path": "/analyze_function_full",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "name",
+        "include_xrefs",
+        "include_callees",
+        "include_callers",
+        "include_disasm",
+        "include_variables",
+        "include_completeness",
+        "program"
+      ],
+      "description": "Complete function analysis"
     },
     {
       "path": "/analyze_struct_field_usage",
@@ -272,15 +302,29 @@
     {
       "path": "/batch_string_anchor_report",
       "method": "GET",
-      "category": "utility",
+      "category": "documentation",
       "params": [
         "pattern",
         "program"
       ],
-      "description": "Report strings and their undocumented functions"
+      "description": "Report of source file strings and their FUN_* functions"
     },
     {
       "path": "/bulk_fuzzy_match",
+      "method": "GET",
+      "category": "documentation",
+      "params": [
+        "source_program",
+        "target_program",
+        "threshold",
+        "offset",
+        "limit",
+        "filter"
+      ],
+      "description": "Bulk cross-binary function matching"
+    },
+    {
+      "path": "/bulk_fuzzy_match_functions",
       "method": "GET",
       "category": "utility",
       "params": [
@@ -326,7 +370,7 @@
     {
       "path": "/clear_instruction_flow_override",
       "method": "POST",
-      "category": "datatype",
+      "category": "analysis",
       "params": [
         "address",
         "program"
@@ -347,16 +391,16 @@
     {
       "path": "/close_program",
       "method": "POST",
-      "category": "program",
+      "category": "headless",
       "params": [
-        "program"
+        "name"
       ],
-      "description": "Close a loaded program (headless)"
+      "description": "Close a loaded program and free its resources"
     },
     {
       "path": "/close_project",
       "method": "POST",
-      "category": "project",
+      "category": "headless",
       "params": [],
       "description": "Close the currently open project"
     },
@@ -500,7 +544,7 @@
     {
       "path": "/create_project",
       "method": "POST",
-      "category": "project",
+      "category": "headless",
       "params": [
         "parentDir",
         "name"
@@ -539,6 +583,141 @@
         "program"
       ],
       "description": "Create union"
+    },
+    {
+      "path": "/debugger/dynamic_to_static",
+      "method": "GET",
+      "category": "debugger",
+      "params": [
+        "address"
+      ],
+      "description": "Translate a runtime dynamic address from the current trace back to a static Ghidra program address"
+    },
+    {
+      "path": "/debugger/interrupt",
+      "method": "POST",
+      "category": "debugger",
+      "params": [],
+      "description": "Interrupt (break into) the running target"
+    },
+    {
+      "path": "/debugger/launch_offers",
+      "method": "GET",
+      "category": "debugger",
+      "params": [
+        "program"
+      ],
+      "description": "List available debugger launch/attach options for the current program"
+    },
+    {
+      "path": "/debugger/list_breakpoints",
+      "method": "GET",
+      "category": "debugger",
+      "params": [],
+      "description": "List all breakpoints in the current trace"
+    },
+    {
+      "path": "/debugger/modules",
+      "method": "GET",
+      "category": "debugger",
+      "params": [],
+      "description": "List modules (DLLs/EXEs) loaded in the debugged process"
+    },
+    {
+      "path": "/debugger/read_memory",
+      "method": "GET",
+      "category": "debugger",
+      "params": [
+        "address",
+        "size"
+      ],
+      "description": "Read memory from the debugged process. Returns hex dump and DWORD interpretation."
+    },
+    {
+      "path": "/debugger/registers",
+      "method": "GET",
+      "category": "debugger",
+      "params": [],
+      "description": "Read CPU registers from the current debug trace snapshot. Shows general-purpose registers (EAX-EDI, EIP, ESP, EFLAGS for x86)"
+    },
+    {
+      "path": "/debugger/remove_breakpoint",
+      "method": "POST",
+      "category": "debugger",
+      "params": [
+        "address"
+      ],
+      "description": "Remove a breakpoint at an address"
+    },
+    {
+      "path": "/debugger/resume",
+      "method": "POST",
+      "category": "debugger",
+      "params": [],
+      "description": "Resume execution of the debugged process"
+    },
+    {
+      "path": "/debugger/set_breakpoint",
+      "method": "POST",
+      "category": "debugger",
+      "params": [
+        "address"
+      ],
+      "description": "Set a software execution breakpoint at an address in the trace"
+    },
+    {
+      "path": "/debugger/stack_trace",
+      "method": "GET",
+      "category": "debugger",
+      "params": [
+        "depth"
+      ],
+      "description": "Get the call stack backtrace for the current thread"
+    },
+    {
+      "path": "/debugger/static_to_dynamic",
+      "method": "GET",
+      "category": "debugger",
+      "params": [
+        "address",
+        "program"
+      ],
+      "description": "Translate a static Ghidra program address to a runtime dynamic address in the current trace"
+    },
+    {
+      "path": "/debugger/status",
+      "method": "GET",
+      "category": "debugger",
+      "params": [],
+      "description": "Get debugger status: active trace, thread, execution state, module count"
+    },
+    {
+      "path": "/debugger/step_into",
+      "method": "POST",
+      "category": "debugger",
+      "params": [],
+      "description": "Single-step into the next instruction (follows calls)"
+    },
+    {
+      "path": "/debugger/step_out",
+      "method": "POST",
+      "category": "debugger",
+      "params": [],
+      "description": "Step out of the current function (run to return)"
+    },
+    {
+      "path": "/debugger/step_over",
+      "method": "POST",
+      "category": "debugger",
+      "params": [],
+      "description": "Step over the next instruction (does not follow calls)"
+    },
+    {
+      "path": "/debugger/traces",
+      "method": "GET",
+      "category": "debugger",
+      "params": [],
+      "description": "List all open debug traces"
     },
     {
       "path": "/decompile_function",
@@ -678,6 +857,36 @@
       "description": "Disassemble function"
     },
     {
+      "path": "/emulate_function",
+      "method": "POST",
+      "category": "emulation",
+      "params": [
+        "address",
+        "registers",
+        "memory",
+        "max_steps",
+        "return_registers",
+        "program"
+      ],
+      "description": "Emulate a single function with controlled register/memory inputs. Returns final register state after execution. Ideal for understanding hash functions, crypto routines, or any pure-computation code path."
+    },
+    {
+      "path": "/emulate_hash_batch",
+      "method": "POST",
+      "category": "emulation",
+      "params": [
+        "hash_function_address",
+        "string_register",
+        "result_register",
+        "target_hash",
+        "candidates",
+        "initial_registers",
+        "wide_string",
+        "program"
+      ],
+      "description": "Brute-force API hash resolution. Emulates a hash function with each candidate API name and returns the one that produces the target hash. Ideal for resolving ROR13, CRC32, djb2, FNV, and custom hash algorithms."
+    },
+    {
       "path": "/exit_ghidra",
       "method": "POST",
       "category": "program",
@@ -749,9 +958,9 @@
       "description": "Find similar functions"
     },
     {
-      "path": "/find_similar_functions_fuzzy",
+      "path": "/find_similar_functions_across_programs",
       "method": "GET",
-      "category": "utility",
+      "category": "documentation",
       "params": [
         "address",
         "source_program",
@@ -762,6 +971,19 @@
       "description": "Find similar functions via fuzzy matching"
     },
     {
+      "path": "/find_similar_functions_fuzzy",
+      "method": "GET",
+      "category": "documentation",
+      "params": [
+        "address",
+        "source_program",
+        "target_program",
+        "threshold",
+        "limit"
+      ],
+      "description": "Cross-binary fuzzy function matching. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution."
+    },
+    {
       "path": "/find_undocumented_by_string",
       "method": "GET",
       "category": "utility",
@@ -770,6 +992,16 @@
         "program"
       ],
       "description": "Find undocumented functions referencing string"
+    },
+    {
+      "path": "/find_undocumented_functions_by_strings",
+      "method": "GET",
+      "category": "documentation",
+      "params": [
+        "pattern",
+        "program"
+      ],
+      "description": "Report strings and their undocumented functions"
     },
     {
       "path": "/force_decompile",
@@ -1070,9 +1302,9 @@
     {
       "path": "/get_project_info",
       "method": "GET",
-      "category": "program",
+      "category": "headless",
       "params": [],
-      "description": "Get project information (headless)"
+      "description": "Get info about the currently open project"
     },
     {
       "path": "/get_struct_layout",
@@ -1087,12 +1319,12 @@
     {
       "path": "/get_type_size",
       "method": "GET",
-      "category": "getter",
+      "category": "datatype",
       "params": [
         "type_name",
         "program"
       ],
-      "description": "Get data type size"
+      "description": "Get data type size and info"
     },
     {
       "path": "/get_valid_data_types",
@@ -1337,7 +1569,7 @@
         "limit",
         "program"
       ],
-      "description": "List all function names"
+      "description": "List all function names with pagination"
     },
     {
       "path": "/list_namespaces",
@@ -1410,19 +1642,18 @@
     {
       "path": "/load_program",
       "method": "POST",
-      "category": "program",
+      "category": "headless",
       "params": [
-        "path"
+        "file"
       ],
-      "description": "Load program into headless server"
+      "description": "Load a binary file into the headless server for analysis"
     },
     {
       "path": "/load_program_from_project",
       "method": "POST",
-      "category": "program",
+      "category": "headless",
       "params": [
-        "project_path",
-        "program_path"
+        "path"
       ],
       "description": "Load program from Ghidra project (headless)"
     },
@@ -1497,11 +1728,11 @@
     {
       "path": "/open_project",
       "method": "POST",
-      "category": "project",
+      "category": "headless",
       "params": [
         "path"
       ],
-      "description": "Open an existing Ghidra project"
+      "description": "Open an existing Ghidra project (.gpr file or directory)"
     },
     {
       "path": "/project/info",
@@ -1664,17 +1895,6 @@
         "program"
       ],
       "description": "Run script with output capture"
-    },
-    {
-      "path": "/run_script",
-      "method": "POST",
-      "category": "script",
-      "params": [
-        "script_path",
-        "args",
-        "program"
-      ],
-      "description": "Run Ghidra script"
     },
     {
       "path": "/run_script_inline",
@@ -1873,9 +2093,9 @@
     {
       "path": "/server/status",
       "method": "GET",
-      "category": "server",
+      "category": "headless",
       "params": [],
-      "description": "Get server connection status"
+      "description": "Check headless server connection status"
     },
     {
       "path": "/server/version_control/add",
@@ -1968,7 +2188,7 @@
     {
       "path": "/set_function_no_return",
       "method": "POST",
-      "category": "datatype",
+      "category": "function",
       "params": [
         "function_address",
         "no_return",

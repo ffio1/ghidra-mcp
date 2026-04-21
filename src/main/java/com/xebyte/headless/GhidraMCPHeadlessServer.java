@@ -52,7 +52,7 @@ import java.util.*;
  */
 public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
-    private static final String VERSION = "5.3.2-headless";
+    private static final String VERSION = "5.4.1-headless";
     private static final int DEFAULT_PORT = 8089;
     private static final String DEFAULT_BIND_ADDRESS = "127.0.0.1";
 
@@ -65,6 +65,7 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
     // Endpoint handler registry
     private HeadlessEndpointHandler endpointHandler;
+    private HeadlessManagementService managementService;
     private int registeredEndpointCount;
 
     // Ghidra server connection manager
@@ -98,6 +99,8 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
         // Create server manager for shared Ghidra server support
         serverManager = new GhidraServerManager();
+
+        managementService = new HeadlessManagementService(programProvider, serverManager);
 
         // Load initial programs if specified
         loadInitialPrograms(args);
@@ -265,12 +268,21 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
     }
 
     private void startServer() throws IOException {
+        // v5.4.1: refuse non-loopback bind without a token configured.
+        String bindError = com.xebyte.core.SecurityConfig.getInstance()
+                .requireAuthForNonLoopbackBind(bindAddress);
+        if (bindError != null) {
+            throw new IOException(bindError);
+        }
         server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
         registerEndpoints();
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(10));
         server.start();
         running = true;
         System.out.println("HTTP server started on " + bindAddress + ":" + port);
+        if (com.xebyte.core.SecurityConfig.getInstance().isAuthEnabled()) {
+            System.out.println("Auth: enabled (GHIDRA_MCP_AUTH_TOKEN)");
+        }
     }
 
     private void registerEndpoints() {
@@ -278,15 +290,15 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         // INFRASTRUCTURE ENDPOINTS (not in service layer)
         // ==========================================================================
 
-        server.createContext("/check_connection", exchange -> {
+        safeContext("/check_connection", exchange -> {
             sendResponse(exchange, "Connection OK - GhidraMCP Headless Server v" + VERSION);
         });
 
-        server.createContext("/health", exchange -> {
+        safeContext("/health", exchange -> {
             sendResponse(exchange, endpointHandler.getHealth());
         });
 
-        server.createContext("/get_version", exchange -> {
+        safeContext("/get_version", exchange -> {
             sendResponse(exchange, endpointHandler.getVersion());
         });
 
@@ -299,10 +311,11 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
             endpointHandler.getCommentService(), endpointHandler.getSymbolLabelService(),
             endpointHandler.getXrefCallGraphService(), endpointHandler.getDataTypeService(),
             endpointHandler.getAnalysisService(), endpointHandler.getDocumentationHashService(),
-            endpointHandler.getMalwareSecurityService(), endpointHandler.getProgramScriptService());
+            endpointHandler.getMalwareSecurityService(), endpointHandler.getProgramScriptService(),
+            endpointHandler.getEmulationService(), managementService);
 
         for (EndpointDef ep : scanner.getEndpoints()) {
-            server.createContext(ep.path(), exchange -> {
+            safeContext(ep.path(), exchange -> {
                 try {
                     Map<String, String> query = parseQueryParams(exchange);
                     Map<String, Object> body = "POST".equalsIgnoreCase(exchange.getRequestMethod())
@@ -323,7 +336,7 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         // ==========================================================================
 
         String schemaJson = scanner.generateSchema();
-        server.createContext("/mcp/schema", exchange -> {
+        safeContext("/mcp/schema", exchange -> {
             sendResponse(exchange, schemaJson);
         });
 
@@ -331,118 +344,75 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         // HEADLESS-ONLY ENDPOINTS (no GUI equivalent)
         // ==========================================================================
 
-        server.createContext("/get_current_address", exchange -> {
+        safeContext("/get_current_address", exchange -> {
             sendResponse(exchange, "{\"error\": \"Headless mode - use address parameter with specific endpoints\"}");
         });
 
-        server.createContext("/get_current_function", exchange -> {
+        safeContext("/get_current_function", exchange -> {
             sendResponse(exchange, "{\"error\": \"Headless mode - use get_function_by_address\"}");
         });
 
-        // --- Program Management ---
-
-        server.createContext("/load_program", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String filePath = params.get("file");
-            sendResponse(exchange, endpointHandler.loadProgram(filePath));
-        });
-
-        server.createContext("/close_program", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String name = params.get("name");
-            sendResponse(exchange, endpointHandler.closeProgram(name));
-        });
-
-        // --- Project Management (headless-specific) ---
-
-        server.createContext("/open_project", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String projectPath = params.get("path");
-            sendResponse(exchange, endpointHandler.openProject(projectPath));
-        });
-
-        server.createContext("/close_project", exchange -> {
-            sendResponse(exchange, endpointHandler.closeProject());
-        });
-
-        server.createContext("/load_program_from_project", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String programPath = params.get("path");
-            sendResponse(exchange, endpointHandler.loadProgramFromProject(programPath));
-        });
-
-        server.createContext("/get_project_info", exchange -> {
-            sendResponse(exchange, endpointHandler.getProjectInfo());
-        });
+        // --- Program Management --- (registered via HeadlessManagementService)
 
         // GET_DATA_TYPE_SIZE - Not yet in service layer
-        server.createContext("/get_data_type_size", exchange -> {
+        safeContext("/get_data_type_size", exchange -> {
             Map<String, String> params = parseQueryParams(exchange);
             String typeName = params.get("type_name");
             String programName = params.get("program");
             sendResponse(exchange, endpointHandler.getDataTypeSize(typeName, programName));
         });
 
-        // --- Project Lifecycle ---
+        // --- Project Lifecycle --- (/create_project registered via HeadlessManagementService)
 
-        server.createContext("/create_project", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String parentDir = params.get("parentDir");
-            String name = params.get("name");
-            sendResponse(exchange, endpointHandler.createProject(parentDir, name));
-        });
-
-        server.createContext("/delete_project", exchange -> {
+        safeContext("/delete_project", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, endpointHandler.deleteProject(params.get("projectPath")));
         });
 
-        server.createContext("/list_projects", exchange -> {
+        safeContext("/list_projects", exchange -> {
             Map<String, String> params = parseQueryParams(exchange);
             sendResponse(exchange, endpointHandler.listProjects(params.get("searchDir")));
         });
 
         // --- Project Organization ---
 
-        server.createContext("/create_folder", exchange -> {
+        safeContext("/create_folder", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, endpointHandler.createFolder(params.get("path"), params.get("program")));
         });
 
-        server.createContext("/move_file", exchange -> {
+        safeContext("/move_file", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, endpointHandler.moveFile(params.get("filePath"), params.get("destFolder")));
         });
 
-        server.createContext("/move_folder", exchange -> {
+        safeContext("/move_folder", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, endpointHandler.moveFolder(params.get("sourcePath"), params.get("destPath")));
         });
 
-        server.createContext("/delete_file", exchange -> {
+        safeContext("/delete_file", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, endpointHandler.deleteFile(params.get("filePath")));
         });
 
         // --- Server Endpoints ---
 
-        server.createContext("/server/connect", exchange -> {
+        safeContext("/server/connect", exchange -> {
             sendResponse(exchange, serverManager.connect());
         });
 
-        server.createContext("/server/status", exchange -> {
-            sendResponse(exchange, serverManager.getStatus());
-        });
+        // /server/status registered via HeadlessManagementService
 
-        server.createContext("/server/repositories", exchange -> {
+        safeContext("/server/repositories", exchange -> {
             sendResponse(exchange, serverManager.listRepositories());
         });
 
-        server.createContext("/server/disconnect", exchange -> {
+        safeContext("/server/disconnect", exchange -> {
             sendResponse(exchange, serverManager.disconnect());
         });
 
-        server.createContext("/server/repository/files", exchange -> {
+        safeContext("/server/repository/files", exchange -> {
             Map<String, String> params = parseQueryParams(exchange);
             String repo = params.get("repo");
             String path = params.get("path");
@@ -450,67 +420,67 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
             sendResponse(exchange, serverManager.listRepositoryFiles(repo, path));
         });
 
-        server.createContext("/server/repository/file", exchange -> {
+        safeContext("/server/repository/file", exchange -> {
             Map<String, String> params = parseQueryParams(exchange);
             String repo = params.get("repo");
             String path = params.get("path");
             sendResponse(exchange, serverManager.getFileInfo(repo, path));
         });
 
-        server.createContext("/server/repository/create", exchange -> {
+        safeContext("/server/repository/create", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, serverManager.createRepository(params.get("name")));
         });
 
         // --- Version Control ---
 
-        server.createContext("/server/version_control/checkout", exchange -> {
+        safeContext("/server/version_control/checkout", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, serverManager.checkoutFile(params.get("repo"), params.get("path")));
         });
 
-        server.createContext("/server/version_control/checkin", exchange -> {
+        safeContext("/server/version_control/checkin", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             boolean keepCheckedOut = parseBooleanOrDefault(params.get("keepCheckedOut"), false);
             sendResponse(exchange, serverManager.checkinFile(
                 params.get("repo"), params.get("path"), params.get("comment"), keepCheckedOut));
         });
 
-        server.createContext("/server/version_control/undo_checkout", exchange -> {
+        safeContext("/server/version_control/undo_checkout", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, serverManager.undoCheckout(params.get("repo"), params.get("path")));
         });
 
-        server.createContext("/server/version_control/add", exchange -> {
+        safeContext("/server/version_control/add", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, serverManager.addToVersionControl(
                 params.get("repo"), params.get("path"), params.get("comment")));
         });
 
-        server.createContext("/server/version_history", exchange -> {
+        safeContext("/server/version_history", exchange -> {
             Map<String, String> params = parseQueryParams(exchange);
             sendResponse(exchange, serverManager.getVersionHistory(params.get("repo"), params.get("path")));
         });
 
-        server.createContext("/server/checkouts", exchange -> {
+        safeContext("/server/checkouts", exchange -> {
             Map<String, String> params = parseQueryParams(exchange);
             sendResponse(exchange, serverManager.getCheckouts(params.get("repo"), params.get("path")));
         });
 
         // --- Admin ---
 
-        server.createContext("/server/admin/terminate_checkout", exchange -> {
+        safeContext("/server/admin/terminate_checkout", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             long checkoutId = Long.parseLong(params.getOrDefault("checkoutId", "0"));
             sendResponse(exchange, serverManager.terminateCheckout(
                 params.get("repo"), params.get("path"), checkoutId));
         });
 
-        server.createContext("/server/admin/users", exchange -> {
+        safeContext("/server/admin/users", exchange -> {
             sendResponse(exchange, serverManager.listServerUsers());
         });
 
-        server.createContext("/server/admin/set_permissions", exchange -> {
+        safeContext("/server/admin/set_permissions", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             int accessLevel = parseIntOrDefault(params.get("accessLevel"), 1);
             sendResponse(exchange, serverManager.setUserPermissions(
@@ -519,7 +489,7 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
         // --- Analysis Control ---
 
-        server.createContext("/configure_analyzer", exchange -> {
+        safeContext("/configure_analyzer", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             Boolean enabled = params.containsKey("enabled") ?
                 parseBooleanOrDefault(params.get("enabled"), true) : null;
@@ -529,7 +499,7 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
         // --- Batch Variable Types (headless-specific parsing) ---
 
-        server.createContext("/batch_set_variable_types", exchange -> {
+        safeContext("/batch_set_variable_types", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             boolean forceIndividual = parseBooleanOrDefault(params.get("forceIndividual"), false);
             sendResponse(exchange, endpointHandler.batchSetVariableTypes(
@@ -538,7 +508,7 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
         // --- Exit ---
 
-        server.createContext("/exit_ghidra", exchange -> {
+        safeContext("/exit_ghidra", exchange -> {
             sendResponse(exchange, endpointHandler.exitServer());
         });
 
@@ -546,9 +516,9 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
     }
 
     private int countEndpoints() {
-        // registeredEndpointCount = shared endpoints from EndpointRegistry
-        // 39 = infrastructure + schema + headless-only endpoints registered via createContext
-        return registeredEndpointCount + 39;
+        // registeredEndpointCount = annotation-scanned (shared services + HeadlessManagementService)
+        // 31 = infrastructure + schema + remaining manual createContext registrations
+        return registeredEndpointCount + 31;
     }
 
     public void stop() {
@@ -579,6 +549,45 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
     // ==========================================================================
     // HTTP UTILITY METHODS
     // ==========================================================================
+
+    /**
+     * v5.4.1: register a context with auth enforcement. Replaces the bare
+     * {@code safeContext(path, handler)} pattern at every call site
+     * so every endpoint honors {@code GHIDRA_MCP_AUTH_TOKEN}. Health-style
+     * endpoints are exempted centrally in {@link #isAuthExempt(String)}.
+     */
+    private com.sun.net.httpserver.HttpContext safeContext(
+            String path, com.sun.net.httpserver.HttpHandler handler) {
+        return server.createContext(path, exchange -> {
+            if (!isAuthExempt(path)) {
+                com.xebyte.core.SecurityConfig sec = com.xebyte.core.SecurityConfig.getInstance();
+                if (sec.isAuthEnabled()) {
+                    String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+                    if (!sec.matchesBearerAuth(authHeader)) {
+                        byte[] body = "{\"error\": \"Unauthorized\"}".getBytes(StandardCharsets.UTF_8);
+                        exchange.getResponseHeaders().set("Content-Type", "application/json");
+                        exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer");
+                        exchange.sendResponseHeaders(401, body.length);
+                        try (OutputStream os = exchange.getResponseBody()) {
+                            os.write(body);
+                        }
+                        return;
+                    }
+                }
+            }
+            handler.handle(exchange);
+        });
+    }
+
+    /**
+     * Read-only endpoints that bypass auth. Kept minimal — anything that
+     * reveals program state or accepts writes must require auth.
+     */
+    private static boolean isAuthExempt(String path) {
+        return "/mcp/health".equals(path)
+                || "/health".equals(path)
+                || "/check_connection".equals(path);
+    }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {
         byte[] bytes = response.getBytes(StandardCharsets.UTF_8);

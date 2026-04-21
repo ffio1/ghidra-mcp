@@ -1,19 +1,29 @@
 # Ghidra MCP Server
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Java Version](https://img.shields.io/badge/Java-21%20LTS-orange.svg)](https://openjdk.java.net/projects/jdk/21/)
-[![Ghidra Version](https://img.shields.io/badge/Ghidra-12.0.3-green.svg)](https://ghidra-sre.org/)
-[![Version](https://img.shields.io/badge/Version-5.3.2-brightgreen.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/github/actions/workflow/status/bethington/ghidra-mcp/tests.yml?branch=main&style=for-the-badge&label=Tests&logo=github-actions&logoColor=white)](https://github.com/bethington/ghidra-mcp/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/release/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white&color=blue)](https://github.com/bethington/ghidra-mcp/releases/latest)
+[![License](https://img.shields.io/github/license/bethington/ghidra-mcp?style=for-the-badge&color=green)](LICENSE)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/bethington?style=for-the-badge&logo=githubsponsors&logoColor=white&label=Sponsors&labelColor=ea4aaa&color=ea4aaa)](https://github.com/sponsors/bethington)
+
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Java](https://img.shields.io/badge/Java-21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
+[![Ghidra](https://img.shields.io/badge/Ghidra-12.0.3-brightgreen?style=for-the-badge&logoColor=white)](https://ghidra-sre.org/)
+[![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-6C5CE7?style=for-the-badge&logoColor=white)](https://modelcontextprotocol.io/)
+
+[![Stars](https://img.shields.io/github/stars/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white&color=yellow)](https://github.com/bethington/ghidra-mcp/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/bethington/ghidra-mcp?style=for-the-badge&logo=git&logoColor=white)](https://github.com/bethington/ghidra-mcp/commits/main)
+[![Discussions](https://img.shields.io/github/discussions/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white)](https://github.com/bethington/ghidra-mcp/discussions)
+[![Issues](https://img.shields.io/github/issues/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white&color=orange)](https://github.com/bethington/ghidra-mcp/issues)
 
 > If you find this useful, please ⭐ star the repo — it helps others discover it!
 
-A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **199 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available.
+A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **222 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
 
 ## Why Ghidra MCP?
 
 Most Ghidra MCP implementations give you a handful of read-only tools and call it a day. This project is different — it was built by a reverse engineer who uses it daily on real binaries, not as a demo.
 
-- **199 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, and script execution.
+- **222 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
 - **Battle-tested AI workflows** — Proven documentation workflows (V5) refined across hundreds of functions. Includes step-by-step prompts, Hungarian notation reference, batch processing guides, and orphaned code discovery.
 - **Production-grade reliability** — Atomic transactions, batch operations (93% API call reduction), configurable timeouts, and graceful error handling. No silent failures.
 - **Cross-binary documentation transfer** — SHA-256 function hash matching propagates documentation across binary versions automatically. Document once, apply everywhere.
@@ -43,17 +53,22 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 ### Core MCP Integration
 - **Full MCP Compatibility** — Complete implementation of Model Context Protocol
-- **199 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
+- **222 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
 - **Production-Ready Reliability** — Atomic transactions, batch operations, configurable timeouts
 - **Real-time Analysis** — Live integration with Ghidra's analysis engine
 
 ### Binary Analysis Capabilities
 - **Function Analysis** — Decompilation, call graphs, cross-references, completeness scoring
+- **Data Flow Analysis** — PCode-graph value propagation (forward / backward) from any variable or register
 - **Data Structure Discovery** — Struct/union/enum creation with field analysis and naming suggestions
 - **String Extraction** — Regex search, quality filtering, and string-anchored function discovery
 - **Import/Export Analysis** — Symbol tables, external locations, ordinal import resolution
 - **Memory & Data Inspection** — Raw memory reads, byte pattern search, array boundary detection
 - **Cross-Binary Documentation** — Function hash matching and documentation propagation across versions
+
+### Dynamic Analysis (v5.4.0)
+- **P-code Emulation** — Run any function in isolation via Ghidra's `EmulatorHelper`; brute-force API hash resolution in milliseconds
+- **Live Debugger Integration** — 17 Java endpoints + 22 Python bridge tools over Ghidra's TraceRmi framework (dbgeng on Windows PE, gdb/lldb otherwise): attach, step, breakpoints, registers, memory reads, non-breaking function tracing, ASLR-aware static↔dynamic address translation
 
 ### AI-Powered Reverse Engineering Workflows
 - **Function Documentation Workflow V5** — 7-step process for complete function documentation with Hungarian notation, type auditing, and automated verification scoring
@@ -216,6 +231,33 @@ curl http://127.0.0.1:8089/check_connection
 curl http://127.0.0.1:8089/get_version
 ```
 
+## 🔒 Security
+
+GhidraMCP is designed for **localhost-only development**. The default configuration — HTTP server bound to `127.0.0.1`, no authentication — is safe on a trusted single-user workstation and matches pre-v5.4.1 behavior.
+
+**If you expose the server beyond loopback, configure these three environment variables first.** The server refuses to start on a non-loopback bind without a token.
+
+| Env var | Effect |
+|---|---|
+| `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health`, `/health`, `/check_connection` are exempt. |
+| `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. |
+| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Prevents path-traversal. |
+
+### Example: exposing to a private LAN with auth
+
+```bash
+export GHIDRA_MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+export GHIDRA_MCP_ALLOW_SCRIPTS=1     # only if your workflow needs it
+export GHIDRA_MCP_FILE_ROOT=/srv/ghidra/inputs
+
+java -jar GhidraMCPHeadless.jar --bind 0.0.0.0 --port 8089
+```
+
+### Migration from v5.4.0 → v5.4.1
+
+- **Script endpoints now default-off.** If you relied on `/run_script_inline` or `/run_ghidra_script`, export `GHIDRA_MCP_ALLOW_SCRIPTS=1`. This is a deliberate breaking change; the prior default was unsafe.
+- **Localhost-only deployments need no changes.** Auth, bind refusal, and path-root checks are all opt-in.
+
 ## ❓ Troubleshooting
 
 ### "GhidraMCP" menu not appearing in Tools
@@ -285,7 +327,7 @@ curl http://127.0.0.1:8089/get_version
 
 ## 📊 Production Performance
 
-- **MCP Tools**: 199 tools fully implemented
+- **MCP Tools**: 222 tools fully implemented
 - **Speed**: Sub-second response for most operations
 - **Efficiency**: 93% reduction in API calls via batch operations
 - **Reliability**: Atomic transactions with all-or-nothing semantics
@@ -325,11 +367,11 @@ curl http://127.0.0.1:8089/get_version
 - `get_function_jump_targets` - Get jump target addresses from disassembly
 - `get_function_metrics` - Get complexity metrics for a function
 - `get_function_xrefs` - Get function cross-references
-- `analyze_function_complete` - Comprehensive function analysis
+- `analyze_function_full` - Comprehensive function analysis
 - `analyze_function_completeness` - Documentation completeness score
 - `batch_analyze_completeness` - Batch completeness analysis for multiple functions
-- `find_similar_functions_fuzzy` - Fuzzy similarity matching
-- `bulk_fuzzy_match` - Bulk fuzzy match across all functions
+- `find_similar_functions_across_programs` - Cross-program similarity matching
+- `bulk_fuzzy_match_functions` - Bulk fuzzy match across all functions
 - `diff_functions` - Diff two functions side by side
 - `validate_function_prototype` - Validate a function prototype string
 - `can_rename_at_address` - Check if address can be renamed
@@ -435,7 +477,6 @@ curl http://127.0.0.1:8089/get_version
 
 ### Ghidra Script Management
 - `list_scripts` - List available scripts
-- `run_script` - Run a script
 - `list_ghidra_scripts` - List custom Ghidra scripts
 - `save_ghidra_script` - Save new script
 - `get_ghidra_script` - Get script contents
@@ -467,7 +508,7 @@ curl http://127.0.0.1:8089/get_version
 ### Analysis Tools
 - `find_next_undefined_function` - Find undefined functions
 - `find_undocumented_by_string` - Find functions by string reference
-- `batch_string_anchor_report` - String anchor analysis
+- `find_undocumented_functions_by_strings` - Find undocumented functions by string references
 - `get_assembly_context` - Get assembly context
 - `analyze_struct_field_usage` - Analyze structure field access
 - `get_field_access_context` - Get field access patterns
@@ -534,7 +575,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ### Components
 
-- **bridge_mcp_ghidra.py** — Python MCP server that translates MCP protocol to HTTP calls (199 tools)
+- **bridge_mcp_ghidra.py** — Python MCP server that translates MCP protocol to HTTP calls (222 tools)
 - **GhidraMCP.jar** — Ghidra plugin that exposes analysis capabilities via HTTP (175 GUI endpoints)
 - **GhidraMCPHeadlessServer** — Standalone headless server — 183 endpoints, no GUI required
 - **ghidra_scripts/** — Collection of automation scripts for common tasks
@@ -599,7 +640,7 @@ Quick examples:
 ### Project Structure
 ```
 ghidra-mcp/
-├── bridge_mcp_ghidra.py     # MCP server (Python, 199 tools)
+├── bridge_mcp_ghidra.py     # MCP server (Python, 222 tools)
 ├── src/main/java/           # Ghidra plugin + headless server (Java)
 │   └── com/xebyte/
 │       ├── GhidraMCPPlugin.java         # GUI plugin (175 endpoints)
@@ -715,7 +756,7 @@ docker-compose up -d ghidra-mcp
 
 # Test connection
 curl http://localhost:8089/check_connection
-# Connection OK - GhidraMCP Headless Server v5.3.2
+# Connection OK - GhidraMCP Headless Server v5.4.1
 ```
 
 ### Headless API Workflow
@@ -781,10 +822,10 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 | Metric | Value |
 |--------|-------|
-| **Version** | 5.3.2 |
-| **MCP Tools** | 199 fully implemented |
-| **GUI Endpoints** | 175 (GhidraMCPPlugin) |
-| **Headless Endpoints** | 183 (GhidraMCPHeadlessServer) |
+| **Version** | 5.4.1 |
+| **MCP Tools** | 222 fully implemented |
+| **GUI Endpoints** | 198 (GhidraMCPPlugin) |
+| **Headless Endpoints** | 195 (GhidraMCPHeadlessServer) |
 | **Compilation** | ✅ 100% success |
 | **Batch Efficiency** | 93% API call reduction |
 | **AI Workflows** | 7 proven documentation workflows |
