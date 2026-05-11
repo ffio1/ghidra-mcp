@@ -530,6 +530,301 @@ public class FunctionService {
     }
 
     // ========================================================================
+    // verify_function_abi — extract structured ABI info for hook authoring.
+    //
+    // Motivation: hand-written naked detours are bug-prone when the original
+    // function's ABI (RET imm, register inputs, callee-saved usage) is
+    // mis-described. Reading the disasm by eye and trusting an LLM to
+    // summarize correctly has produced repeated wrong-RET-imm and missed-ECX
+    // bugs (see ExtendedTones mod's debugging history). This tool returns a
+    // structured digest derived directly from the instruction stream — no
+    // paraphrasing, no agent guessing.
+    //
+    // Heuristics:
+    //   - RET imm: every RET instruction's immediate; flag inconsistency.
+    //   - Prologue register reads: scan first ~20 insns. A "MOV reg2, ECX"
+    //     (or any read of ECX/EAX/EDX as a SOURCE) means the register is an
+    //     input. Reads that occur AFTER a write to the same register are
+    //     not counted.
+    //   - Callee-saved pushes: PUSH EBX/ESI/EDI in the prologue.
+    //   - Stack args: largest [EBP+N] read in the function body, where N>0.
+    //     Counts inferred = (largest_offset - 4) / 4 (after PUSH EBP).
+    // ========================================================================
+
+    @McpTool(path = "/verify_function_abi",
+             description = "Extract structured ABI info (RET imm consistency, prologue register reads, callee-saved pushes, max stack-arg offset) from a function's instruction stream. Use BEFORE writing a naked detour / shim to verify exact calling convention — replaces the error-prone 'agent paraphrases the disasm' workflow. Returns plain text.",
+             category = "function")
+    public Response verifyFunctionAbi(
+            @Param(value = "address", paramType = "address",
+                   description = "Address of the function. Accepts 0x<hex> or <space>:<hex>.") String addressStr,
+            @Param(value = "program", description = "Target program name (omit for active)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("Address is required");
+
+        try {
+            Function func = ServiceUtils.resolveFunction(program, addressStr);
+            if (func == null) return Response.err("No function found for " + addressStr);
+
+            Listing listing = program.getListing();
+            Address start = func.getEntryPoint();
+            Address end = func.getBody().getMaxAddress();
+
+            // Walk instructions once. Collect: RETs (with imm), prologue
+            // register reads (limited to first N), callee-saved pushes, max
+            // [EBP+N] stack-arg offset.
+            List<int[]> retImms = new ArrayList<>();   // [address_int, imm]
+            Set<String> regsRead = new LinkedHashSet<>();
+            Set<String> regsWrittenBeforeRead = new LinkedHashSet<>();
+            List<String> calleeSavedPushed = new ArrayList<>();
+            int maxStackArg = 0;
+            int prologueScanned = 0;
+            boolean prologueDone = false;
+            int totalInsns = 0;
+            String firstRetMnemonic = null;
+
+            InstructionIterator it = listing.getInstructions(start, true);
+            while (it.hasNext()) {
+                Instruction insn = it.next();
+                if (insn.getAddress().compareTo(end) > 0) break;
+                totalInsns++;
+                String mnem = insn.getMnemonicString();
+
+                // RET / RETN / RETF — extract immediate (0 if no imm).
+                if (mnem.equalsIgnoreCase("RET") || mnem.equalsIgnoreCase("RETN") || mnem.equalsIgnoreCase("RETF")) {
+                    int imm = 0;
+                    if (insn.getNumOperands() >= 1) {
+                        Object[] ops = insn.getOpObjects(0);
+                        for (Object o : ops) {
+                            if (o instanceof ghidra.program.model.scalar.Scalar) {
+                                imm = (int) ((ghidra.program.model.scalar.Scalar) o).getUnsignedValue();
+                                break;
+                            }
+                        }
+                    }
+                    retImms.add(new int[]{ (int)(insn.getAddress().getOffset() & 0xFFFFFFFFL), imm });
+                    if (firstRetMnemonic == null) firstRetMnemonic = mnem;
+                    continue;
+                }
+
+                // Prologue register reads (first ~25 instructions, until first
+                // CALL/JMP indicating end of prologue). Uses Ghidra's
+                // getInputObjects() / getResultObjects() so we catch patterns
+                // beyond just `MOV reg, src`: also TEST ECX,ECX / MOV X,[ECX] /
+                // PUSH ECX / LEA X,[ECX+N] / etc.
+                if (!prologueDone) {
+                    prologueScanned++;
+                    // Only stop on CALL — many prologues do null-checks on
+                    // input registers (TEST ECX,ECX / JZ / TEST EAX,EAX / JZ)
+                    // which we want to scan past so we catch all input regs.
+                    // Hard cap of 25 instructions guards against runaway.
+                    if (mnem.equalsIgnoreCase("CALL") || prologueScanned > 25) {
+                        prologueDone = true;
+                    }
+
+                    // PUSH EBX/ESI/EDI (callee-saved). Detected before the
+                    // input-objects sweep so PUSH-of-callee-saved doesn't
+                    // count as a "register read" of a parameter register.
+                    if (mnem.equalsIgnoreCase("PUSH") && insn.getNumOperands() == 1) {
+                        Object[] ops = insn.getOpObjects(0);
+                        for (Object o : ops) {
+                            if (o instanceof Register) {
+                                String r = ((Register) o).getName().toUpperCase();
+                                if (r.equals("EBX") || r.equals("ESI") || r.equals("EDI")) {
+                                    if (!calleeSavedPushed.contains(r)) {
+                                        calleeSavedPushed.add(r);
+                                    }
+                                    // Don't fall through to input-sweep —
+                                    // saving a callee-saved reg isn't a read
+                                    // of an input parameter.
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Generic input-register detection. Any reference to
+                    // ECX/EAX/EDX (whether as direct register, base of [reg],
+                    // [reg+N], or operand to TEST/CMP) shows up in
+                    // getInputObjects() as a Register.
+                    Object[] inputs = insn.getInputObjects();
+                    if (inputs != null) {
+                        for (Object o : inputs) {
+                            if (o instanceof Register) {
+                                String src = ((Register) o).getName().toUpperCase();
+                                // Normalize sub-registers (e.g. AL/AX → EAX).
+                                src = normalizeReg(src);
+                                if ((src.equals("ECX") || src.equals("EAX") || src.equals("EDX"))
+                                        && !regsWrittenBeforeRead.contains(src)) {
+                                    regsRead.add(src);
+                                }
+                            }
+                        }
+                    }
+                    // Mark all registers this instruction WRITES as
+                    // "written-before-read" for subsequent instructions.
+                    Object[] outputs = insn.getResultObjects();
+                    if (outputs != null) {
+                        for (Object o : outputs) {
+                            if (o instanceof Register) {
+                                regsWrittenBeforeRead.add(normalizeReg(((Register) o).getName().toUpperCase()));
+                            }
+                        }
+                    }
+                }
+
+                // Stack-arg offsets: any operand referencing [EBP + positive] or
+                // [ESP + positive] where positive > 4 is a stack arg.
+                for (int opIdx = 0; opIdx < insn.getNumOperands(); opIdx++) {
+                    String opStr = insn.getDefaultOperandRepresentation(opIdx);
+                    int offset = parseStackArgOffset(opStr);
+                    if (offset > maxStackArg) maxStackArg = offset;
+                }
+            }
+
+            // Format the report.
+            StringBuilder sb = new StringBuilder();
+            sb.append("function: ").append(func.getName()).append("\n");
+            sb.append("address: ").append(start).append("\n");
+            sb.append("instruction_count: ").append(totalInsns).append("\n");
+            sb.append("calling_convention: ").append(func.getCallingConventionName()).append("\n");
+
+            // RET imm consistency.
+            sb.append("ret_count: ").append(retImms.size()).append("\n");
+            Set<Integer> distinctImms = new TreeSet<>();
+            for (int[] r : retImms) distinctImms.add(r[1]);
+            if (distinctImms.size() == 1) {
+                sb.append("ret_imm: ").append(String.format("0x%X", distinctImms.iterator().next())).append("\n");
+                sb.append("ret_consistency: uniform\n");
+            } else {
+                sb.append("ret_imm: INCONSISTENT (").append(distinctImms).append(")\n");
+                sb.append("ret_consistency: INCONSISTENT — inspect each exit individually\n");
+                sb.append("ret_sites:\n");
+                for (int[] r : retImms) {
+                    sb.append(String.format("  0x%08x: RET 0x%X%n", r[0], r[1]));
+                }
+            }
+
+            // Caller-cleans flag — RET 0 with stack args present = caller cleans.
+            int retImm = distinctImms.size() == 1 ? distinctImms.iterator().next() : -1;
+            if (retImm == 0 && maxStackArg > 0) {
+                sb.append("cleanup: caller-cleans (RET no-imm with stack args)\n");
+            } else if (retImm > 0) {
+                sb.append("cleanup: callee-cleans ").append(retImm).append(" bytes\n");
+            } else if (maxStackArg == 0 && retImm == 0) {
+                sb.append("cleanup: no stack args\n");
+            }
+
+            // Register inputs.
+            sb.append("prologue_regs_read: ").append(regsRead.isEmpty() ? "(none)" : regsRead).append("\n");
+
+            // Callee-saved pushes.
+            sb.append("callee_saved_pushed: ").append(calleeSavedPushed.isEmpty() ? "(none)" : calleeSavedPushed).append("\n");
+
+            // Stack args.
+            if (maxStackArg > 0) {
+                int n = (maxStackArg - 4) / 4;
+                sb.append("max_stack_arg_offset: [EBP+0x").append(Integer.toHexString(maxStackArg)).append("]\n");
+                sb.append("inferred_stack_arg_count: ").append(n).append("\n");
+            } else {
+                sb.append("max_stack_arg_offset: (none observed)\n");
+            }
+
+            // ABI hint.
+            sb.append("\nabi_hint: ");
+            boolean usesEcx = regsRead.contains("ECX");
+            boolean usesEax = regsRead.contains("EAX");
+            boolean usesEdx = regsRead.contains("EDX");
+            int args = maxStackArg > 0 ? (maxStackArg - 4) / 4 : 0;
+            if (usesEcx && !usesEax && !usesEdx) {
+                sb.append("__thiscall (ECX=this");
+                if (args > 0) sb.append(", ").append(args).append(" stack arg(s)");
+                sb.append(", RET 0x").append(Integer.toHexString(Math.max(retImm, 0))).append(")");
+            } else if (usesEcx && usesEdx && !usesEax) {
+                sb.append("__fastcall (ECX=arg1, EDX=arg2");
+                if (args > 0) sb.append(", ").append(args).append(" stack arg(s)");
+                sb.append(", RET 0x").append(Integer.toHexString(Math.max(retImm, 0))).append(")");
+            } else if (usesEax || usesEdx || usesEcx) {
+                sb.append("CUSTOM (");
+                if (usesEcx) sb.append("ECX=in ");
+                if (usesEax) sb.append("EAX=in ");
+                if (usesEdx) sb.append("EDX=in ");
+                if (args > 0) sb.append(args).append(" stack arg(s) ");
+                sb.append("RET 0x").append(Integer.toHexString(Math.max(retImm, 0))).append(")");
+            } else {
+                sb.append(retImm == 0 ? "__cdecl" : "__stdcall");
+                if (args > 0) sb.append(" with ").append(args).append(" stack arg(s)");
+                sb.append(" (RET 0x").append(Integer.toHexString(Math.max(retImm, 0))).append(")");
+            }
+            sb.append("\n");
+
+            return Response.text(sb.toString());
+        } catch (Exception e) {
+            return Response.err("Error verifying function ABI: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Heuristic parser for [EBP+N] / [ESP+N] / [EBP-N] / dword ptr [EBP+N] etc.
+     * Returns positive offset if we detected a positive [EBP+N]; 0 otherwise.
+     * Negative-EBP offsets indicate locals, not args — return 0 for those.
+     */
+    private static int parseStackArgOffset(String operandRepr) {
+        if (operandRepr == null) return 0;
+        String s = operandRepr.toUpperCase();
+        // Quick reject: must contain EBP+ or ESP+ in brackets.
+        int ebpPlus = s.indexOf("EBP +");
+        int espPlus = s.indexOf("ESP +");
+        int idx = ebpPlus >= 0 ? ebpPlus + 5 : (espPlus >= 0 ? espPlus + 5 : -1);
+        if (idx < 0) return 0;
+        // Skip whitespace.
+        while (idx < s.length() && (s.charAt(idx) == ' ' || s.charAt(idx) == '\t')) idx++;
+        // Parse 0xNN or NN.
+        int val = 0;
+        if (idx + 1 < s.length() && s.charAt(idx) == '0' && (s.charAt(idx + 1) == 'X')) {
+            idx += 2;
+            int start = idx;
+            while (idx < s.length() && isHex(s.charAt(idx))) idx++;
+            if (idx > start) {
+                try { val = Integer.parseInt(s.substring(start, idx), 16); } catch (Exception ignored) {}
+            }
+        } else {
+            int start = idx;
+            while (idx < s.length() && Character.isDigit(s.charAt(idx))) idx++;
+            if (idx > start) {
+                try { val = Integer.parseInt(s.substring(start, idx)); } catch (Exception ignored) {}
+            }
+        }
+        // Reject huge values that are likely sign-extended negative offsets
+        // (e.g. 0xFFFFFC50 is really -0x3B0 from EBP — that's a local).
+        if (val > 0x10000) return 0;
+        return val;
+    }
+
+    private static boolean isHex(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+    }
+
+    /**
+     * Normalize x86 sub-registers (AL, AH, AX) to their full-width 32-bit
+     * counterpart (EAX) so a `TEST AL,AL` counts as a read of EAX.
+     */
+    private static String normalizeReg(String reg) {
+        switch (reg) {
+            case "AL": case "AH": case "AX": return "EAX";
+            case "BL": case "BH": case "BX": return "EBX";
+            case "CL": case "CH": case "CX": return "ECX";
+            case "DL": case "DH": case "DX": return "EDX";
+            case "SI": return "ESI";
+            case "DI": return "EDI";
+            case "BP": return "EBP";
+            case "SP": return "ESP";
+            default: return reg;
+        }
+    }
+
+    // ========================================================================
     // Summary — single-call digest (token-efficient replacement for the
     // xrefs+callees+disassemble+prototype cascade agents run per function).
     // ========================================================================
