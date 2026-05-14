@@ -2425,7 +2425,7 @@ public class AnalysisService {
                                             boolean regex, String sortBy, int offset, int limit,
                                             String programName) {
         return searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, callingConvention,
-                hasCustomName, regex, sortBy, offset, limit, "json", programName);
+                hasCustomName, null, null, regex, sortBy, offset, limit, "json", programName);
     }
 
     // ========================================================================

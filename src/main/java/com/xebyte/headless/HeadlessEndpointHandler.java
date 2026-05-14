@@ -1185,7 +1185,7 @@ public class HeadlessEndpointHandler {
                                           Boolean hasCustomName, Boolean isThunk, Boolean isExternal,
                                           boolean regex, String sortBy,
                                           int offset, int limit, String programName) {
-        return analysisService.searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, null, hasCustomName, isThunk, isExternal, regex, sortBy, offset, limit, programName).toJson();
+        return analysisService.searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, null, hasCustomName, isThunk, isExternal, regex, sortBy, offset, limit, "json", programName).toJson();
     }
 
     /**
