@@ -4,6 +4,830 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
+## v5.9.0 - 2026-05-12 (community fixes + P-code endpoints + library-code detector)
+
+Bundles three community-reported bug fixes (#170, #175, #192) plus an
+internal fun-doc improvement (library-code auto-classification). Net
+result: cleaner multi-instance discovery, fewer surprise port collisions,
+new endpoints for downstream P-code tooling, and no more LLM tokens wasted
+on statically-linked CRT.
+
+### Fixed
+
+- **#170**: macOS bridge spawned by Claude Desktop couldn't find Ghidra
+  instances. Root cause: Claude Desktop spawned the bridge without
+  forwarding `$TMPDIR`, so the bridge fell back to `/tmp/ghidra-mcp-<user>`
+  while the plugin (with `$TMPDIR` set to a `/var/folders/<2>/<rand>/T/`
+  path) wrote its socket elsewhere. Fix: `bridge_mcp_ghidra.py` now scans
+  every plausible socket directory (`XDG_RUNTIME_DIR`, `/run/user/<uid>`,
+  `$TMPDIR`, `/var/folders/*/*/T/...`, `/private/var/folders/*/*/T/...`,
+  `/tmp`, `%TEMP%`) via `get_socket_dir_candidates()` and deduplicates by
+  absolute path. Backwards-compatible: `get_socket_dir()` still returns
+  the primary candidate. (PR #195)
+
+- **#175**: On Windows, two Ghidra instances couldn't run simultaneously
+  because both tried to bind TCP `8089` and the second failed with
+  "Address already in use: bind". Two-part fix:
+  1. **UDS enabled by default on all platforms** (Win10 1803+ has
+     `AF_UNIX`; older Windows falls through to the TCP path). Per-PID
+     socket file names mean no port competition for UDS users.
+  2. **TCP port-range fallback** in `GhidraMCPPlugin`: when the
+     configured port is taken, the plugin scans the next 15 ports and
+     binds the first that's free. The actual bound port is surfaced via
+     `/mcp/instance_info → tcp_port` (now served on both UDS and TCP
+     transports), and the bridge's new `_scan_tcp_for_project()` walks
+     `8089..8104` probing for the matching project. Project-mismatch
+     refusal: the bridge no longer silently connects to a wrong-project
+     instance — if UDS finds instances but none match the requested
+     project, it returns a clear error rather than guessing a TCP port.
+     (PR #196)
+
+### Added
+
+- **#192 — decompiler P-code endpoints** for downstream tooling that needs
+  the raw graph rather than the C decompile (P-code emulators, alternative
+  decompilers, ML pipelines):
+  - `/get_function_pcode?function_address=...&granularity={basic|high}`:
+    dumps HighFunction P-code. `basic` returns the basic-block iter only
+    (PcodeOps in program order, lighter payload). `high` (default) adds
+    the full HighFunction PcodeOp graph from `hf.getPcodeOps()`. Each op
+    carries mnemonic, opcode, varnode inputs/output with space/offset/size
+    and SSA flags (`is_register`, `is_constant`, `is_unique`, `is_addrtied`,
+    `is_hash`, `is_persistent`, `merge_group`). Basic blocks carry start/
+    stop addresses via the shared `ServiceUtils.addressToJson` helper.
+  - `/get_language_metadata?include_registers=true&include_default_symbols=true`:
+    SLEIGH-level program facts — language ID, processor, endian, size,
+    variant, default space, default data space, program counter, full
+    address-space list, register list (with parent/child relations,
+    description, aliases, bit length), default symbol set (with
+    end_offset, byte_size, is_entry/is_primary/is_volatile flags).
+
+  Endpoint count: 241 → 243. (PR #197)
+
+- **PDB import helper** (`scripts/ghidra/ImportMSDLPDB.java`): user-
+  installable Ghidra script that reads the program's `PdbInformation`
+  (GUID / age) and kicks the PDB Universal Analyzer to fetch + apply
+  matching symbols from Microsoft's symbol server. Authoritative names
+  for everything MSVCRT / VC-runtime / MFC. Skip-with-reason JSON when
+  the binary has no PDB metadata. Install per
+  `scripts/ghidra/README.md`.
+
+- **Library-code auto-classification (fun-doc)**: heuristic detector at
+  `fun-doc/library_code_detector.py` runs after decompile and before LLM
+  invocation. Trips on canonical CRT names (`??2@YAPAXI@Z`, `_strtoi64@4`,
+  `std::_*`) or CRT-only callees (`__SEH_prolog4`, `_Xinvalid_argument`,
+  `_CxxThrowException`). Detected functions get a generic plate stamped
+  and `library_code=True` set on the workflow row, excluding them from
+  future selector picks until refresh. Motivating case: 729K tokens
+  burned on `ParseSignedShort @ 10052ba0` in BH.dll — code that doesn't
+  exist in BH source. Conservative tuning: `/GS` stack-cookie helpers are
+  SOFT signals (they appear in user code too) so a single `__security_check_cookie`
+  hit doesn't trip the gate. New `skip_library_code` config flag (default
+  `True`) for disable. Storage migration `0002_library_code.sql` adds
+  three columns; 19-case detector unit suite + 3 selector regression
+  tests. (PR #198)
+
+### Test coverage notes
+
+- **Bridge size cap** bumped from 2100 → 2250 lines to absorb the multi-
+  candidate socket-dir scan + TCP port-range scanner. The cap is a soft
+  signal per its docstring; both contributions pull weight (real bug
+  fixes with docstrings + unit coverage).
+- **New unit/integration test files:**
+  - `tests/unit/test_bridge_utils.py` — `TestGetSocketDirCandidates`
+    (3 cases), `TestDiscoverInstancesMultiDir` (2 cases), `TestTcpPortScan`
+    (7 cases), plus three macOS-layout tests using `Path.exists`/`Path.glob`
+    mocks.
+  - `src/test/java/com/xebyte/offline/ServerManagerPortTest.java` —
+    3-case Java unit suite for `boundTcpPort` (default value, persistence,
+    volatile thread-visibility).
+  - `tests/integration/test_readonly_endpoints.py` — new readonly tests
+    for `/mcp/instance_info` (TCP), `/get_function_pcode` (basic + high
+    granularity), and `/get_language_metadata` (with/without heavy
+    sections).
+  - `tests/performance/test_library_code_detector.py` — 19-case detector
+    unit suite.
+
+---
+
+## v5.8.0 - 2026-05-11 (fun-doc SQL storage migration — PR1)
+
+Major release: fun-doc's per-function workflow state moves out of `state.json`
+(~106 MB single file, swapped per-binary by hand) into a SQL-backed
+repository abstraction. The default backend is SQLite at
+`fun-doc/state.db`; users with a Postgres instance can point
+`FUN_DOC_DB_URL=postgresql://...` to use it instead. Schema applies
+to `fun_doc.*` (Postgres) or the equivalent tables (SQLite). No
+endpoint changes — endpoint count unchanged at 241.
+
+This is **PR1** of the storage migration. **PR2** (v5.9.0) adds the
+re-kb FastAPI gateway so users running the re-universe Docker stack
+can have fun-doc state served from a shared remote service rather
+than a local file. PR2 is not in this release.
+
+### Added — storage abstraction (`fun-doc/storage/`)
+
+- **`storage/__init__.py`** — backend factory. Reads `FUN_DOC_DB_URL`
+  env var; SQLite (`sqlite:`) and Postgres (`postgresql:`) URLs are
+  both supported. Default when unset: SQLite at `fun-doc/state.db`.
+- **`storage/models.py`** — SQLAlchemy Core schema for
+  `functions_workflow`, `runs`, `inventory`, `global_inventory`,
+  `sessions`, `meta`. Hot fields (`run_count`, `audit_count`,
+  `escalation_count`, `last_run_at`, etc.) denormalized onto
+  `functions_workflow` rows so dashboard reads stay O(1).
+- **`storage/repository.py`** — CRUD layer. Single source of truth for
+  function-state reads/writes, run-row inserts, inventory rollups.
+- **`storage/slow_query_log.py`** — structured logging for queries
+  above the 100 ms threshold; logger name `fun_doc.storage.slow_query`.
+
+### Added — schema migrations
+
+- **`fun-doc/db/migrate.py`** — schema runner; idempotent.
+- **`fun-doc/db/migrations/0001_initial.sql`** — Postgres schema.
+- **`fun-doc/db/migrations/0001_initial.sqlite.sql`** — SQLite mirror
+  (`BIGSERIAL` → `INTEGER PRIMARY KEY AUTOINCREMENT`, `TIMESTAMPTZ` →
+  `TEXT` ISO-8601).
+
+### Added — migration tooling
+
+- **`fun-doc/scripts/migrate_state_to_sql.py`** — one-shot import:
+  `state.json` + `runs.jsonl` + `inventory.json` +
+  `global_inventory.json` → SQL store. Idempotent; safe to re-run.
+- **`fun-doc/scripts/verify_migration.py`** — zero-diff verifier
+  comparing SQL row counts and field values against the JSON sources.
+  Required pre-merge gate per the locked plan.
+
+### Added — pre-release smoke runbook
+
+- **`fun-doc/scripts/v58_smoke.py`** — single-command driver for the
+  migrate → pre-verify → worker spawn → check → post-verify cycle.
+  Subcommands: `prep`, `check`, `verify`, `post-verify`, `reset`.
+  Default backend: SQLite at `C:/tmp/v58-smoke.db` (disposable).
+  Caches pre-smoke counts to a snapshot for post-verify diffing.
+
+### Added — tier-2 doc-quality regression (`fun-doc/benchmark/bh/`)
+
+- **`fun-doc/benchmark/bh/grade.py`** — grades fun-doc's BH.dll
+  documentation against the upstream
+  [Project-Diablo-2/BH](https://github.com/Project-Diablo-2/BH)
+  source (Apache 2.0, license-compatible) as the ground-truth oracle.
+  Pulls each mapped function's current name, plate, signature, and
+  variables from a live Ghidra MCP server; scores against the truth;
+  emits per-function table + corpus aggregate + JSON for trend
+  tracking. `--compare` flag diffs two runs for regression-spotting.
+- **`fun-doc/benchmark/bh/mapping.yaml`** — 14 entries: 9 BH.dll
+  exports + 5 string-anchored internal-function placeholders.
+- **`fun-doc/benchmark/bh/runs/2026-05-10-baseline.json`** — baseline
+  corpus score 0.442 across 6 resolvable exports.
+- **`fun-doc/benchmark/bh/runs/2026-05-11-post-smoke.json`** — post-smoke
+  score 0.442 (no regression).
+
+### Changed
+
+- **fun-doc workers** read function state through `storage.repository`
+  instead of parsing `state.json` directly. The persistence-layer
+  swap is transparent to users — `load_state()` and `save_state()`
+  in `fun_doc.py` keep the same shapes; the backend changes underneath.
+- **Dashboard** (`fun-doc/web.py`) reads from the repository for all
+  function-listing, sessions, inventory, and stats endpoints. Same
+  rendered output; sub-100 ms per query on warmed indexes.
+- **`fun-doc/inventory_scorer.py`** rolls up to the repository instead
+  of writing `inventory.json` directly.
+- **`runs.jsonl`** is preserved as an append-only audit log for
+  back-compat and external tooling; the canonical source of truth is
+  now the SQL `runs` table.
+
+### Fixed (caught during smoke)
+
+- **`_invoke_provider_direct` minimax branch wraps through
+  `_wrap_result()`** so an early-exit return-None (missing API key,
+  missing `openai` package, etc.) yields a clean `(None, meta)` tuple
+  instead of crashing the caller's `text, meta = result` unpack with
+  TypeError. Same latent bug existed on v5.7.2; cherry-picked here.
+
+### Known follow-ups (not v5.8.0 blockers)
+
+- **Globals worker run-write path is JSON-only** — `process_global`
+  appends to `runs.jsonl` but doesn't call `repo.record_run()`. Affects
+  globals worker only; function workers are wired correctly.
+- **`runs.model` persists as `'unknown'`** — model name lookup
+  during the run-row insert isn't capturing the live model. Cosmetic
+  data-fidelity issue.
+- **`functions_workflow.run_count` denorm doesn't tick** on completed
+  runs. Denorm callback wiring incomplete.
+- **`/api/stats` slow** (~30 s on 61k function dataset). Aggregation
+  needs profiling.
+- **`tools/setup` doesn't auto-install the new SQLAlchemy + psycopg
+  dependencies** — users may need a manual `pip install -r
+  fun-doc/requirements.txt` after pulling.
+
+### Migration path
+
+For existing fun-doc users:
+
+```bash
+# 1. After updating to v5.8.0, install new deps:
+pip install -r fun-doc/requirements.txt
+
+# 2. Run the one-shot migration (idempotent; preserves state.json):
+python fun-doc/scripts/migrate_state_to_sql.py \
+    --state fun-doc/state.json \
+    --runs fun-doc/logs/runs.jsonl \
+    --inventory fun-doc/inventory.json \
+    --global-inventory fun-doc/global_inventory.json
+
+# 3. Verify zero-diff:
+python fun-doc/scripts/verify_migration.py [same args]
+
+# 4. Restart the dashboard. fun-doc/state.db (SQLite) is the new
+#    canonical store. state.json stays put as a back-compat copy.
+```
+
+For users with Postgres:
+
+```bash
+export FUN_DOC_DB_URL='postgresql://user:pass@host:5432/dbname'
+# then run the same migrate + verify + restart sequence
+```
+
+### Verification
+
+- Tier-0: 295 unit tests + 29 storage abstraction tests (SQLite +
+  cross-backend) pass; 17 PG-specific tests skip without Docker.
+- Tier-1 (mechanical smoke): post-migrate verifier zero-diff,
+  function-worker SQL write path confirmed end-to-end on BH.dll
+  (`ParseSignedShort @ 10052ba0`, score 0→37, atomic
+  `functions_workflow` + `runs` row update).
+- Tier-2 (BH grader): corpus score 0.442, identical to baseline —
+  no doc-quality regression.
+
+---
+
+## v5.7.2 - 2026-05-10 (critical bridge fix + Linux/Nix compat + toggle extension)
+
+Patch release bundling one critical bridge fix that affected all v5.7.0/v5.7.1
+users, two Linux/Nix setup compatibility fixes, and an extension of the
+v5.7.1 naming-enforcement toggle to cover global name-quality gates. No
+endpoint count change (still 241).
+
+### Fixed
+
+- **Bridge `_fetch_and_register_schema()` raised "duplicate parameter name:
+  'dry_run'" on startup, preventing tool registration.** Affected every
+  v5.7.0/v5.7.1 user whose Ghidra plugin exposed any endpoint that already
+  declared `dry_run` in its `@McpTool` schema (e.g.
+  `archive_ingest_function`, `archive_ingest_program`); the bridge was
+  unconditionally adding a synthetic `dry_run` parameter to every POST
+  endpoint, colliding with the schema-declared one. The bridge now skips
+  the synthetic injection when a schema-declared `dry_run` is present and
+  preserves the schema's declared `source` (`query` vs `body`). Includes
+  regression tests for synthetic, schema-declared-query, and
+  schema-declared-body variants. Closes
+  [#187](https://github.com/bethington/ghidra-mcp/issues/187) (community —
+  @synthol, [#193](https://github.com/bethington/ghidra-mcp/pull/193)).
+
+- **`tools.setup` pip discovery failed on Nix-managed Python
+  environments.** Setup invoked pip as `python -m pip` everywhere, but on
+  Nix the active interpreter can't import pip even though `pip` exists on
+  PATH. Reported by @Molkars
+  ([#190](https://github.com/bethington/ghidra-mcp/issues/190)), confirmed
+  by @letsjustfixit on Debian. New `pip_command(python_executable)` helper
+  probes `python -m pip` first (safer, venv-aware) and falls back to a
+  bare `pip` on PATH only when the module form fails; result is cached per
+  interpreter. Six new unit tests cover the matrix (Windows/Mac happy
+  path, Nix fallback, neither-form-works, caching, isolation across
+  interpreters, integration with `install_requirements_file`). Closes
+  [#190](https://github.com/bethington/ghidra-mcp/issues/190).
+
+- **`tools.setup deploy` failed on Linux because
+  `find_ghidra_executable` preferred `ghidraRun.bat` first.** Ghidra
+  release zips ship both `ghidraRun` (shell script) and `ghidraRun.bat`
+  (Windows batch) regardless of host OS, so `is_file()` returned the
+  Windows batch on Linux too; `subprocess.Popen` then tried to exec
+  `cmd.exe` and failed with `FileNotFoundError`. Candidate order is now
+  platform-aware. Reported and diagnosed by @Molkars
+  ([#191](https://github.com/bethington/ghidra-mcp/issues/191)). Closes
+  [#191](https://github.com/bethington/ghidra-mcp/issues/191).
+
+### Changed
+
+- **Strict Naming Enforcement now covers global name-quality gates.**
+  The existing Ghidra Tool Option remains strict by default, but when
+  disabled it now downgrades the hard name-quality rejects in
+  `rename_data`, `rename_global_variable`, `set_global`, and the
+  `apply_data_type` prefix/type guard to warnings, matching
+  `rename_function_by_address`'s behavior since v5.7.1. The legacy
+  **Strict Function Name Enforcement** Tool Option value is migrated
+  automatically. No endpoint schema changes. Community —
+  @Hummer12007, [#188](https://github.com/bethington/ghidra-mcp/pull/188).
+
+### Tests
+
+- Bridge soft-line-count cap raised from 2000 → 2100 to absorb the
+  `#187` fix's added conditional logic plus prior legitimate growth.
+  The cap remains a signal against gratuitous bloat — bump deliberately
+  on future trips, not reflexively (commit
+  [a0afe77](https://github.com/bethington/ghidra-mcp/commit/a0afe77)).
+
+## v5.7.1 - 2026-05-08 (community contributions + post-release triage)
+
+Patch release bundling five community-contributed PRs that landed on `main`
+in the 48 hours after v5.7.0 shipped, plus three post-release bug fixes
+diagnosed by users on the issue tracker. No breaking changes; endpoint
+count grows 231 → 241.
+
+### Added
+
+- **Function tags** (community — chompie1337, [#179](https://github.com/bethington/ghidra-mcp/pull/179))
+  — 10 new MCP endpoints for tagging functions with program-wide labels:
+  `add_function_tag`, `remove_function_tag`, `get_function_tags`,
+  `search_functions_by_tag`, `create_function_tag`, `delete_function_tag`,
+  `set_function_tag_comment`, `list_function_tags`,
+  `batch_add_function_tags`, `batch_remove_function_tags`. Tags
+  auto-create on first use, are stored in the Ghidra DB so they persist
+  across save/checkin, and cover the "carve curated subsets across
+  long analysis sessions" pattern (e.g. `crypto`, `parser`, `reviewed`).
+  See `docs/prompts/TOOL_USAGE_GUIDE.md` for the sweep-and-curate worked
+  example.
+- **`isThunk` / `isExternal` filters in `search_functions_enhanced`**
+  (community — c8rri3r, [#178](https://github.com/bethington/ghidra-mcp/pull/178))
+  — every result now carries `isThunk` and `isExternal` boolean fields,
+  and the endpoint accepts `is_thunk=true|false` and
+  `is_external=true|false` query parameters for filtering. Closes
+  [#177](https://github.com/bethington/ghidra-mcp/issues/177).
+- **GUI-configurable function-name enforcement** (community — Hummer12007,
+  [#171](https://github.com/bethington/ghidra-mcp/pull/171)) — the
+  **Strict Function Name Enforcement** Ghidra Tool Option controls
+  whether `rename_function_by_address` hard-rejects names that fail the
+  verb-tier or token-subset gates. The default remains strict. When
+  disabled, the rename proceeds while returning the same issues as
+  warnings. No endpoint schema change is required.
+
+### Fixed
+
+- **Headless server crashes on startup with "cannot add context to list"**
+  ([#180](https://github.com/bethington/ghidra-mcp/issues/180), originally
+  diagnosed by @MMOStars). `/create_folder` and `/delete_file` were
+  registered both via `@McpTool` annotations on `ProgramScriptService`
+  and manually in `GhidraMCPHeadlessServer.registerEndpoints()`,
+  tripping `HttpServerImpl.createContext` with
+  `IllegalArgumentException`. Removed the duplicate manual
+  registrations; updated `countEndpoints()` -2.
+- **Address-space name lowercasing breaks 8051 and other uppercase-space
+  architectures** ([#184](https://github.com/bethington/ghidra-mcp/issues/184),
+  reported by @Artem-B). `bridge_mcp_ghidra.py::sanitize_address` was
+  lowercasing the space-name component (`CODE:123` → `code:123`), but
+  Ghidra's `AddressFactory` is case-sensitive and 8051 declares
+  `RAM`/`CODE`/`INTMEM`/`EXTMEM` uppercase. Fix: pass the space name
+  through unchanged. Three regression tests added covering the 8051
+  spaces. Two unrelated pre-existing test scaffolding bugs cleaned up
+  in the same commit (camelCase param key, missing mock kwarg) — test
+  file goes 18 → 21 passing tests.
+- **Docker build can't resolve Ghidra Maven artifacts**
+  ([#183](https://github.com/bethington/ghidra-mcp/issues/183), reported
+  by @RocketMaDev). `Dockerfile` `GHIDRA_VERSION` ARG defaulted to
+  `12.0.3` from the v5.6.0 era but `pom.xml` bumped to `12.0.4` in
+  v5.7.0. The build downloaded 12.0.3 and stamped JARs as
+  `ghidra:*:12.0.3`, then Maven failed to resolve `ghidra:*:12.0.4`.
+  Bumped to `12.0.4` + `GHIDRA_DATE=20260303` and added a comment
+  marking this as a release-time sync point with `pom.xml`.
+- **Maven `OSError` on Windows when `M2_HOME` is set** (community —
+  deckbsd, [#176](https://github.com/bethington/ghidra-mcp/pull/176)).
+  `tools/setup/maven.py::candidate_maven_commands` was always adding
+  both `<M2_HOME>/bin/mvn` (shell script) and `<M2_HOME>/bin/mvn.cmd`
+  (Windows wrapper) as candidates. On Windows the shell script
+  triggered an `OSError` when the discovery code tried to exec it.
+  Now adds only the platform-appropriate executable.
+
+### Changed
+
+- Endpoint catalog: 231 → 241 endpoints. Tool-count references in
+  `README.md`, `CLAUDE.md`, `AGENTS.md`, `docs/NAMING_CONVENTIONS.md`,
+  `MANIFEST.MF`, and `extension.properties` updated to match.
+
+---
+
+## v5.7.0 - 2026-05-05 (globals quality, scope guard, archive integration)
+
+Release headline is bringing global variables up to the same documentation
+bar as functions: a four-axis "properly documented" standard
+(name + type + bytes formatted + plate comment) enforced at three layers
+(prompt + scorer + validator), three new MCP endpoints replacing the
+fragile 4-tool fix chain with a single atomic write, and a binary-wide
+bulk auditor mirroring the function inventory scorer pattern.
+
+Three additional themes added during release prep:
+
+- **Project-folder scope guard** — opt-in two-layer guard preventing
+  multi-version reverse-engineering from accidentally writing to the
+  wrong binary. Layer 1 fun-doc Python validation, Layer 2 Ghidra Java
+  `FrontEndProgramProvider` + `SecurityConfig.isPathInProjectScope`.
+  Off by default (env var `GHIDRA_MCP_PROJECT_FOLDER`); general users
+  see no behavior change.
+- **Cross-version doc archive integration** — fun-doc now mirrors
+  documented functions to a re-kb FastAPI service and reads from it
+  before invoking the LLM. On Q5-D gate pass (hash-exact OR BSim≥0.9
+  AND score≥80) it applies the archived name + plate via existing
+  MCP tools and skips the LLM. Two new MCP tools
+  (`archive_ingest_function`, `archive_ingest_program`).
+- **state.json truncation hardening** — root-caused and fixed an
+  incident where a duplicate `load_state()` in `web.py` raced a writer
+  for >3 retries, returned an empty stub, and saved that stub over
+  the real ~110 MB state.json. Now delegates to `fun_doc.load_state`
+  (5 retries → `.bak` fallback → raise) and uses `_atomic_write_state`
+  with a guardrail refusing to overwrite a populated state with an
+  empty-functions dict.
+
+### Added
+
+#### MCP endpoints
+
+- **`audit_global`** — read-only inspector. Returns address, name, type,
+  length, plate comment, xref count, and a structured `issues` list
+  (`generic_name`, `untyped`, `unformatted_bytes_length_mismatch`,
+  `unformatted_bytes_should_be_string`, `missing_plate_comment`,
+  `plate_comment_too_short`).
+- **`audit_globals_in_function`** — per-function bulk auditor. Walks
+  the function's instructions, collects unique data-reference targets,
+  audits each via the shared `auditGlobalAt` helper, and returns
+  `{function, globals: [...], summary: {total, fully_documented,
+  with_issues, issue_histogram}}`. The killer per-function pre-flight
+  tool — one MCP call instead of N.
+- **`set_global`** — atomic single-transaction write that applies type,
+  optional `array_length`, name, and plate comment as a unit. Pre-flight
+  validation rejects on naming/type/format failures with a structured
+  error (`status: "rejected"`, `error`, `issue`, `suggestion`). No
+  partial writes — either everything applies or nothing does. Replaces
+  the four-tool chain (`apply_data_type` → `rename_data` →
+  `batch_set_comments` → `create_label`).
+
+#### Per-function scorer deductions
+
+Four new categories surface bad globals in the work queue at scoring
+time, capped at -20 aggregate per function:
+
+- `untyped_global` -8 — referenced global has `undefined*` type.
+- `unformatted_global_bytes` -5 — wrong byte layout (length mismatch
+  or string-as-char).
+- `generic_global_name` -5 — auto-generated remnant or fails
+  `checkGlobalNameQuality`.
+- `missing_global_plate_comment` -3 — empty or `<4-word` first line.
+
+#### Binary-wide bulk scorer
+
+- **`fun-doc/global_scorer.py`** — opt-in idle-time daemon that walks
+  every binary in the Ghidra project tree, audits every global symbol,
+  and tallies per-binary `total_documentable` / `fully_documented`
+  counts. Mirrors `inventory_scorer.py`'s architecture: single-thread,
+  cooperative pause when doc workers run, session-only blacklist after
+  3 strikes, persisted to `fun-doc/global_inventory.json`. Most-globals-
+  with-issues-first ordering, reverse-alpha tiebreak.
+- **Dashboard "Global Inventory" panel** — per-binary table with coverage
+  bar, fully_documented / total / with_issues counts, percent, status,
+  last scan, and a Retry button on blacklisted rows. Live updates via
+  `global_inventory_status` WebSocket event.
+- **New endpoints** — `GET /api/global_inventory/status`,
+  `POST /api/global_inventory/toggle`,
+  `POST /api/global_inventory/clear_blacklist`.
+- **`global_inventory_enabled`** added to `DEFAULT_QUEUE_CONFIG` (default
+  False; opt-in via the dashboard toggle).
+
+#### Naming + plate-comment helpers
+
+- **`NamingConventions.checkGlobalNameQuality(name, type)`** — structured
+  global-name validator. Enforces `g_` prefix + Hungarian matching type +
+  ≥2-char descriptor + reject auto-generated remnants (`g_DAT_*`,
+  `g_PTR_*`, `g_FUN_*`, `g_LAB_*`, `g_SUB_*`, `g_<prefix>_<hex>`).
+  Conservative placeholders (`g_dwField1D0`, `g_pUnk20`) are accepted
+  per CLAUDE.md's underclaim convention.
+- **`NamingConventions.isAutoGeneratedGlobalName`** — recognizer for
+  Ghidra's auto-generated global symbols.
+- **`NamingConventions.checkGlobalPlateComment`** — shared helper used
+  by both `audit_global` and `set_global` so they apply the same
+  ≥4-word first-line rule.
+- **`DataTypeService.auditGlobalAt`** — public static helper; the
+  shared per-global audit routine called by `audit_global`,
+  `audit_globals_in_function`, and the new scorer deductions.
+
+#### Prompt
+
+- **`prompts/step-globals.md`** — new step module loaded by FULL and
+  recovery prompt builders. Documents the four-axis bar, the
+  Hungarian-vs-type table, the canonical `audit_globals_in_function` →
+  `set_global` workflow, and how to handle structured rejections.
+- **`prompts/hungarian-table.md`** — canonical single-source-of-truth
+  Hungarian prefix → type table, referenced by all the other globals
+  prompts (`step-globals.md`, `worker-globals.md`, `fix-hungarian.md`)
+  instead of being restated in each.
+- **`prompts/worker-globals.md`** — globals worker prompt covering the
+  Q1–Q12 design (process_global pre-audit short-circuit, completed/
+  no_change/regressed classification, runs.jsonl row shape with
+  `mode="globals"`).
+
+#### Globals worker
+
+- **`process_global`** in `fun_doc.py` — single-function globals
+  documentation entrypoint. Pre-audit short-circuits when the global
+  is already fully_documented; classifies completed/no_change/regressed
+  based on issue-list deltas; writes `runs.jsonl` rows with
+  `mode="globals"` for dashboard tracking.
+- **`run_globals_worker_pass`** — count-capped worker loop with
+  continuous-mode binary rotation and stop_flag interruption.
+- **`WorkerManager` mode dispatch** — recognizes `mode="globals"`,
+  requires a `binary` parameter, and rejects a second launch on the
+  same binary (Q11 per-binary lock prevents concurrent writes).
+
+#### Project-folder scope guard
+
+- **`SecurityConfig.isPathInProjectScope(domainFilePath)`** — collision-
+  safe equals-or-startsWith path matcher (a path "P/A" inside scope
+  "/P" must NOT match scope "/PA"). Reads `GHIDRA_MCP_PROJECT_FOLDER`
+  env var; null/unset disables the guard so general users see no
+  behavior change.
+- **`FrontEndProgramProvider.getProgram(name)`** — wraps existing
+  resolution with a scope check, returning a clear error if the
+  resolved DomainFile is outside the configured project folder.
+- **`scripts/launch-ghidra-scoped.ps1`** — convenience wrapper that
+  sets `$env:GHIDRA_MCP_PROJECT_FOLDER` then launches `ghidraRun.bat`.
+
+#### Cross-version doc archive integration
+
+- **`archive_ingest_function(address, program)`** — MCP tool in
+  `DocumentationHashService.java`. Builds the archive payload from the
+  current Ghidra state (locals, instruction comments, referenced data
+  types/globals/labels, equates, opcode hash, BSim signature when
+  available) and POSTs to the re-kb FastAPI service's
+  `/v1/doc_archive/upsert` endpoint.
+- **`archive_ingest_program(program)`** — bulk variant; iterates every
+  documented function in the program.
+- **fun-doc write hook** — after `save_program` in `process_function`,
+  pushes the freshly-documented function to the archive.
+- **fun-doc read hook** — before invoking the LLM, checks
+  `/v1/doc_archive/match`. On Q5-D gate pass (hash-exact OR BSim≥0.9
+  AND score≥80) applies the archived name + plate via existing MCP
+  tools and skips the LLM. Bus events `archive_pushed`,
+  `archive_lookup`, `archive_applied`, `archive_apply_failed`,
+  `archive_push_failed` for dashboard visibility.
+- Required env: `RE_KB_ARCHIVE_URL` (defaults to
+  `http://10.0.10.30:8422`); empty disables both hooks.
+
+### Changed
+
+- **`rename_data` / `rename_global_variable` validator gates** — hard-
+  reject names failing `checkGlobalNameQuality` with structured errors:
+  `{"status": "rejected", "error": "name_quality", "issue": ...,
+  "rejected_name": ..., "current_type": ..., "message": ...,
+  "suggestion": ...}`. Function unchanged on rejection. The model
+  retries informed by the error rather than ignoring soft warnings.
+- **`set_global` array bounds validation** — added pre-flight rejection
+  for `array_length < 0` (`invalid_array_length`), `array_length > 0`
+  with empty `type_name` (`array_length_requires_type`), zero-length
+  element types (`invalid_element_size`), and overflow / sane-cap
+  exceedance (`array_too_large`, 16 MiB cap). Previously these slipped
+  through with misleading "success" responses or silent overflow.
+- **`web.py` state I/O hardening** — `load_state()` now delegates to
+  `fun_doc.load_state` (5 retries → `.bak` fallback → raise on corrupt),
+  and `_save_state_inline()` uses `_atomic_write_state` with a guardrail
+  refusing to overwrite a populated state.json with an empty-functions
+  stub. Eliminates the silent-truncation race that nuked ~110 MB of
+  state during the 2026-05-03 incident.
+
+### Fixed
+
+Three commits targeting silent-failure modes the production log audit
+surfaced; pairs with the v5.7.0 globals work since the same patterns
+were biting the globals worker:
+
+- **`set_variables` empty-map success** — now returns success (not
+  error) when the variables map is empty; matches `batch_set_comments`
+  semantics and lets prompts pass `{}` to mean "no-op." (`8a6b58d`)
+- **`set_local_variable_type` SSA-churn awareness** — type changes that
+  trigger re-decompilation surface a churn-aware error directing the
+  worker to call `get_function_variables` and retry via `set_variables`,
+  rather than failing opaquely. (`c9b1381`)
+- **Chained-rename worker redirect** — workers that previously chained
+  `rename_data` → `apply_data_type` → `batch_set_comments` are pushed
+  to use `set_global` instead, eliminating partial-application risk.
+  (`3f8e904`)
+- **`set_global` / `rename_or_label` / `rename_global_variable` name
+  idempotency** — same name on re-run is a no-op success, not a
+  `DuplicateNameException`. (`16840c8`)
+- **Three high-impact silent-error patterns** from prod log audit
+  hardened across the worker tools. (`56808c9`)
+
+### Tests
+
+- **17 new offline JUnit tests** for `NamingConventions.checkGlobalNameQuality`
+  + `checkGlobalPlateComment` (53 total — was 47, +6 plate-comment).
+- **19 new offline Python tests** for `global_scorer.py` (ordering,
+  blacklist, pause-gate, persistence shape, threaded-class behavior).
+- **18 new live integration tests** in `tests/integration/test_global_endpoints.py`
+  exercising every rejection code, the no-partial-application contract
+  on `set_global`, the per-function bulk auditor's response shape, and
+  endpoint-catalog parity. Auto-skip with a clear "deploy first"
+  message when the live plugin doesn't have the new endpoints.
+- **`docs/releases/v5.7.0-VERIFY.md`** — manual verification checklist
+  walking the rejection table by hand for spot-checks.
+
+The fragile 4-tool fix chain still works for non-global data items;
+globals are encouraged to use `set_global` exclusively via the prompt.
+The validator + bulk scorer + per-function deductions provide three
+independent ways for sloppy globals to surface in the worker's
+attention.
+
+---
+
+## v5.6.0 - 2026-04-25 (release regression + fun-doc workflow)
+
+Release covering deploy/regression safety, live benchmark coverage, debugger
+endpoint validation, and a substantial fun-doc workflow upgrade: per-worker
+config freezing, quota-aware provider pause/resume, a continuously-running
+background inventory scorer, and verb-tier function-name quality
+enforcement at the rename layer.
+
+### Added
+
+#### Deploy / regression / debugger
+
+- **Live deploy release regression** — deploy can opt into benchmark-backed
+  read/write, multi-program, negative-contract, and debugger-live regression
+  tiers via `--test ...` or local `GHIDRA_MCP_DEPLOY_TESTS`.
+- **Benchmark debugger fixture** — `fun-doc/benchmark` now builds
+  `BenchmarkDebug.exe` alongside `Benchmark.dll` so debugger MCP endpoints
+  can be exercised against a real launched process.
+- **Scoped prompt policy endpoint** — `/prompt_policy` temporarily handles a
+  narrow allow-list of known Ghidra automation dialogs during
+  deploy/regression runs while leaving normal interactive prompts
+  untouched.
+
+#### fun-doc workflow
+
+- **Worker config snapshot** — workers freeze the dashboard's policy fields
+  (`good_enough_score`, `audit_provider`, `audit_min_delta`,
+  `complexity_handoff_provider`, `complexity_handoff_max`, per-provider
+  `provider_max_turns` + `provider_models`) at start and read from the
+  snapshot for the rest of their life. Mid-run live-config edits no longer
+  affect a running worker — restart-to-change semantics. Snapshot is
+  persisted to `events.jsonl` via a `worker.started` event so post-hoc log
+  analysis can join run records to the exact config under which they ran.
+  Dashboard shows a per-worker config sub-line and fires a toast when
+  saving the queue config diverges from any running worker's snapshot.
+- **Provider model + max-turns defaults backfill** — `priority_queue.json`
+  now backfills missing per-provider entries from a module-level
+  `DEFAULT_PROVIDER_MODELS` (gemini, claude, codex, minimax). Fresh
+  installs and partial configs get fully populated dashboard inputs
+  without manual setup.
+- **Background inventory scorer** — opt-in daemon that fills missing
+  `analyze_function_completeness` scores across every binary in the Ghidra
+  project tree. Idle-time backfill (yields when any doc worker is active),
+  most-missing-first ordering with reverse-alpha tiebreak, single-thread,
+  cooperative pause at chunk boundaries, session blacklist after 3
+  strikes, dedicated `fun-doc/inventory.json` persistence. Dashboard
+  widget plus an Inventory panel with sortable per-binary table (coverage
+  bar, scored, total, missing, %, status, last scan).
+- **Quota-aware provider pause/resume** — when a provider returns a quota-
+  wall error (gemini's "exhausted your capacity", claude's "credit balance
+  is too low", codex's "insufficient_quota", minimax's quota messages),
+  fun-doc parses the reset duration, installs a per-(provider, model)
+  pause in `fun-doc/provider_pauses.json`, and parks every worker on that
+  model until the timer fires. Soft rate limits (<5 min) stay in retry
+  logic; hard walls (≥5 min) install a pause. Dashboard surfaces a
+  `quota_paused` worker state with a live wake-time countdown. Manual
+  override via `POST /api/provider_pauses/clear`.
+- **Function-block visual** — per-function worker output is wrapped in a
+  three-sided gold bracket (top + left + bottom, open right). Header is
+  the function's start name; footer is the post-rescore name (so renames
+  are visible). Body indented; blank lines stripped within a block; one
+  blank line of breathing room between blocks. Worker abandon mid-function
+  emits a synthetic `(interrupted)` footer so headers never go orphaned.
+- **Three-column worker grid** — dashboard now shows 3 worker panes per
+  row instead of 2, fitting ~50% more workers without scrolling.
+
+#### Naming-quality enforcement
+
+- **Verb-tier function-name quality** — `NamingConventions` gains Tier 1 /
+  Tier 2 / Tier 3 verb classification, a weak-noun denylist, PascalCase
+  tokenization, and a `checkFunctionNameQuality` API returning structured
+  rejection (`vague_verb`, `weak_noun_only`, `missing_specifier`). Tier 3
+  verbs (`Process`, `Handle`, `Manage`, …) require ≥2 specifier tokens
+  after the verb; weak nouns (`Data`, `Info`, `Stuff`, …) don't count as
+  specifiers.
+- **Token-subset duplicate detection** —
+  `NamingConventions.findTokenSubsetCollision` flags function-name
+  collisions where one name's tokens are a strict subset of another's
+  within the same module-prefix scope (e.g., `SendStateUpdate` ⊂
+  `SendStateUpdateCommand`).
+- **Three new completeness deductions** — `low_name_quality` (-8),
+  `name_collision` (-10), `missing_module_prefix` (-5; fires when name has
+  no `UPPERCASE_` prefix and ≥3 callees share one). Surfaces existing bad
+  legacy names in the work queue with point pressure to fix them.
+
+#### New endpoints
+
+- `GET /api/inventory/status`, `POST /api/inventory/toggle`,
+  `POST /api/inventory/clear_blacklist` — background scorer surface.
+- `GET /api/provider_pauses`, `POST /api/provider_pauses/clear` —
+  quota-pause surface.
+
+### Changed
+
+- **Deploy lifecycle** — deploy now saves all open programs, attempts
+  graceful Ghidra exit, force-kills matching leftovers when needed,
+  installs the extension, starts Ghidra, waits for MCP/project readiness,
+  and runs schema smoke checks.
+- **Benchmark project reset** — benchmark tiers reset `/testing/benchmark`
+  in the active project, import both benchmark binaries, auto-analyze
+  them, and clear restored benchmark tool state before startup.
+- **`rename_function_by_address` validator gate** — hard-rejects names
+  failing the verb-tier rules or token-subset uniqueness with a structured
+  error: `{"status": "rejected", "error": …, "issue": …,
+  "rejected_name": …, "conflicts_with": …, "message": …, "suggestion": …}`.
+  Function is unchanged on rejection; the model retries with a better
+  name. Auto-generated names are exempt. `step-prototype.md` documents the
+  verb tiers, weak-noun list, a worked-example pass/fail table, and a
+  rejection round-trip guide.
+- **Complexity-handoff fall-through** — when handoff can't fire (no
+  provider configured, cap reached, or target walled), the worker now
+  continues with primary instead of skipping the function. Removes a
+  silent `consecutive_fails` increment on healthy functions for
+  config/transient reasons.
+- **Worker title color treatment** — provider/id token in the worker pane
+  header is now white (`text-primary`); the active function name is gold
+  (`accent-gold`) so the eye lands on what you're tracking.
+- **Audit / handoff under quota wall** — when the target provider+model is
+  walled, audits log `audit_outcome: quota_paused` and skip; handoffs
+  pre-empt and stick with primary. No `consecutive_fails` bump.
+
+### Fixed
+
+- **`list_functions_enhanced` thunk parity** — `isThunk` now uses the same
+  `AnalysisService.classifyFunction` path as
+  `analyze_function_completeness`, so single-jump thunk heuristics agree
+  across both tools. Thanks to PR #165 by c8rri3r.
+- **`create_struct` tool guidance** — MCP schema/catalog descriptions now
+  spell out the expected `fields` JSON array format, optional decimal
+  `offset`, accepted alternate field keys, and valid type sources so agents
+  stop trying C-like struct strings or CSV bodies.
+- **Gemini quota errors silently swallowed** — `_invoke_gemini`'s retry-
+  exhaust path now propagates `provider_error` / `provider_error_type`
+  into the run record so the dashboard and `runs.jsonl` show the actual
+  message ("exhausted your capacity, quota will reset after Xh") instead
+  of `output: null` / `error: null`.
+- **State lock reentrancy** — `_state_lock` switched from `Lock` to
+  `RLock` so `load_state` can be called from within a `with _state_lock:`
+  block without deadlocking.
+
+### Tests
+
+- 28 offline tests for the inventory scorer (ordering, blacklist,
+  pause-gate, scored definition, JSON shape stability).
+- 34 offline tests for the provider-pause module (parser, per-provider
+  detectors, threshold, manager round-trip, callback semantics).
+- 13 offline tests for the worker config snapshot (shape, freeze
+  guarantees, fall-through, conditional banner).
+- 31 offline tests for `NamingConventions` (tokenize, verb tiers,
+  specifier counting, all rejection codes, token-subset collision in
+  both directions, module-prefix scoping, exact-match exemption).
+- Updated `test_provider_selection.py` to cover the new
+  `DEFAULT_PROVIDER_MODELS` backfill behavior.
+
+## v5.5.0 - 2026-04-23 (maintenance)
+
+Maintenance release focused on cleanup and release readiness after the
+v5.4.1 security hardening work.
+
+### Fixed
+
+- **`FunctionService` decompiler lifetime handling** — closes owned
+  `DecompInterface` instances on all relevant success, early-return, and
+  exception paths to avoid leaking decompiler subprocesses during
+  decompilation and variable-update workflows.
+- **Claude/CAPI tool-name compatibility in the Python bridge** —
+  `bridge_mcp_ghidra.py` now enforces the stricter `^[a-zA-Z0-9_-]{1,64}$`
+  constraint when sanitizing and collision-suffixing tool names, matching
+  client expectations instead of emitting overlong names.
+- **Bundled Ghidra script resource ownership** — script-side
+  `DecompInterface` usage now follows scoped `try/finally` disposal in the
+  affected batch, export, survey, and audit helpers.
+- **Claude subprocess lifetime in bundled scripts** — the Claude-invoking
+  scripts now drain and close readers with try-with-resources and use
+  bounded `waitFor(timeout, TimeUnit.SECONDS)` handling with terminate/kill
+  fallback instead of unbounded waits.
+
+- **fun-doc logging diagnostics** - provider watchdog workers now inherit
+  per-run debug context, early exits are recorded in `runs.jsonl`, Ghidra
+  HTTP failures write structured diagnostics, and debug analyzers count
+  normalized provider error statuses.
+
+### Docs
+
+- **Release metadata refreshed to `5.5.0`** across Maven, plugin/headless
+  fallbacks, manifest metadata, endpoint catalog, operator docs, and the
+  release index.
+- **`CONTRIBUTING.md`** — added a concise resource-ownership checklist for
+  services and bundled scripts, covering disposable helpers,
+  transactions, child-process lifecycle, and timeout expectations.
+
 ## v5.4.1 - 2026-04-18 (security)
 
 Security + operational-readiness release on top of v5.4.0. Addresses the
@@ -59,6 +883,21 @@ New [`com.xebyte.core.SecurityConfig`](src/main/java/com/xebyte/core/SecurityCon
   parity tests (~3 s) were previously only run on developer machines;
   they now gate every push/PR on `main` and `develop`. Integration
   tests (which require live Ghidra on port 8089) remain excluded.
+
+### Fixed
+
+- **Python debugger startup + target query flow on Windows** — the
+  debugger backend now validates `WINDBG_DIR` before importing `pybag`,
+  falls back to a Microsoft Store WinDbg cache when the Windows Kits
+  debugger directory is incomplete, stops double-waiting after
+  `AttachProcess`, parses `pybag` module tuples correctly, and reads
+  x64 register sets (`RAX`-`R15`/`RIP`) instead of returning empty
+  register output on 64-bit targets.
+- **WOW64 register context** — when attached to 32-bit processes under
+  WOW64, debugger register reads now switch dbgeng's effective
+  processor to x86 so the API returns `EAX`/`ECX`/`ESP`/`EIP` instead of
+  the host-side 64-bit `R*` context. The same x86 view is used for
+  stack-context reads that depend on those registers.
 
 ### Docs
 
@@ -193,7 +1032,7 @@ count rises from 199 → 219 on main.
   scan the headless-only service so catalog drift in these endpoints
   now fails at `mvn test` time.
 
-- **`--use-venv` flag for Linux setup** (#120) — `ghidra-mcp-setup.sh`
+- **`--use-venv` flag for Linux setup** (#120) — the legacy Linux setup flow
   can now install Python deps into a local `.venv` instead of the
   system Python, required on Ubuntu 24.04+ where system Python is
   externally-managed.
@@ -451,6 +1290,8 @@ Deadlocks:   0 since test start
 
 #### Fixed
 
+- **fun-doc run/debug log provenance** — `runs.jsonl` now records `run_id`, requested vs effective provider, provider chain, `tool_calls_known`, prompt size, token metadata, and the concrete debug log path. Debug traces are now one file per run attempt instead of co-mingling multiple providers in a single per-function file, and tool names are normalized across Gemini/Claude/Codex/MiniMax while preserving the raw provider-specific name.
+- **fun-doc dashboard + handoff analysis follow-up** — provider cards now compute average tool counts from known samples only, explicitly count unknown tool-call runs, surface handoff/provider-chain summaries, ship a dedicated `fun-doc/analyze_runs.py` CLI for requested→effective provider analysis, and move the live complexity handoff target from Codex to Gemini.
 - **Cold-start lane infinite re-processing loop** — `_sync_func_state` didn't stamp `last_processed`, so the selector kept re-picking already-scored functions. Worst seen: SafeDelete stuck at 83% across hundreds of iterations.
 - **"Stale at X%" misleading message** — The cached score was captured after `_sync_func_state` had already overwritten it, so the log always showed the live value. Captures `original_cached_score` before sync now.
 - **`RETRY_SIZE` vs client timeout math** — Retry batch was 10 × 90 s = 900 s > 600 s client budget. Reduced to `RETRY_SIZE = 3` (270 s, fits with 330 s margin).
@@ -642,8 +1483,8 @@ This is a contract change. If you have scripts or prompts built against earlier 
 
 - **Fixed POST endpoint data format** (#66): `safe_post()` was sending form-urlencoded data while the Java server expected JSON. Changed to send `json=data` instead of `data=data`, fixing `rename_function_by_address` and all other POST-based endpoints.
 - **Added segment:offset address support** (#65): Bridge now accepts segment-prefixed addresses (e.g., `mem:20de`, `code:00169d`) used by non-x86/segmented architectures. Updated `sanitize_address()`, `validate_hex_address()`, and `normalize_address()` to pass through segment-qualified addresses without incorrect `0x` prefixing.
-- **Relaxed Ghidra version compatibility check** (#64): Setup scripts (`ghidra-mcp-setup.ps1` and `ghidra-mcp-setup.sh`) now warn instead of error when deploying to a Ghidra installation with a different patch version (e.g., building with 12.0.3 and deploying to 12.0.4). Major.minor mismatches still block deployment.
-- **Fixed Linux phantom process detection** (#63): Tightened `get_ghidra_pids()` regex in `ghidra-mcp-setup.sh` to match only the Java class name pattern (`ghidra.GhidraRun`/`ghidra.GhidraLauncher`), removing overly broad alternatives that caused false positives.
+- **Relaxed Ghidra version compatibility check** (#64): The legacy setup flow now warns instead of error when deploying to a Ghidra installation with a different patch version (e.g., building with 12.0.3 and deploying to 12.0.4). Major.minor mismatches still block deployment.
+- **Fixed Linux phantom process detection** (#63): Tightened the legacy Linux setup process detection regex to match only the Java class name pattern (`ghidra.GhidraRun`/`ghidra.GhidraLauncher`), removing overly broad alternatives that caused false positives.
 - **Fixed FrontEndProgramProvider multi-version bugs**: Fixed consumer reference leak on cache overwrite, `pathToName` not cleared in `releaseAll()`, and `getAllOpenPrograms()` deduplicating by name instead of identity (hiding same-named programs from different versions).
 - **Reduced MCP response token usage ~30-40%**: Optimized JSON response payloads across service endpoints.
 
@@ -793,8 +1634,8 @@ This is a contract change. If you have scripts or prompts built against earlier 
 #### Infrastructure
 - **Fixed ENDPOINT_COUNT** -- Corrected from 146 to 149 to match actual `createContext` registration count
 - **Centralized version in extension.properties** -- Description now uses `${project.version}` Maven filtering instead of hardcoded version string
-- **Expanded bump-version.ps1** -- Now covers 11 files (up from 7): added README badge, AGENTS.md, docs/releases/README.md. Extension.properties is now Maven-dynamic.
-- **Version consistency audit** -- Fixed stale 3.0.0 references across ghidra-mcp-setup.ps1, tests/endpoints.json, README.md, AGENTS.md, and docs/releases/README.md
+- **Expanded version bump workflow** -- Now covers 11 files (up from 7): added README badge, AGENTS.md, docs/releases/README.md. Extension.properties is now Maven-dynamic.
+- **Version consistency audit** -- Fixed stale 3.0.0 references across setup/config files, tests/endpoints.json, README.md, AGENTS.md, and docs/releases/README.md
 
 ---
 
@@ -862,7 +1703,7 @@ This is a contract change. If you have scripts or prompts built against earlier 
 - `run_analysis` Ã¢â‚¬â€ trigger analysis programmatically
 
 #### Ã°Å¸â€Â§ Infrastructure
-- **`bump-version.ps1`**: Single-command version bump across all 7 project files
+- **Version bump workflow**: Single-command version bump across all 7 project files
 - **`tests/unit/`**: New unit test suite Ã¢â‚¬â€ endpoint catalog consistency, MCP tool functions, response schemas
 - **`.markdownlintrc`**: Markdown lint config for CI quality gate
 - **`mcp-config.json`**: Fixed env key to match bridge (`GHIDRA_SERVER_URL`)
@@ -914,7 +1755,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
 
 ## v2.0.1 - 2026-02-19
 
-### Patch Release - CI Fixes, Documentation, PowerShell Improvements
+### Patch Release - CI Fixes, Documentation, Setup Workflow Improvements
 
 #### Ã°Å¸â€Â§ CI/Build Fixes
 - **Fixed CI workflow**: Ghidra JARs now properly installed to Maven repository instead of just copied to lib/ (PR #23)
@@ -927,7 +1768,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
 - **Verification steps**: Added curl commands to verify server is working
 - **Better error guidance**: Covers 500 errors, 404s, missing menus, and installation issues
 
-#### Ã°Å¸â€“Â¥Ã¯Â¸Â PowerShell Setup Script
+#### Ã°Å¸â€“Â¥Ã¯Â¸Â Setup Workflow
 - **Fixed version sorting bug**: Now uses semantic version sorting instead of string sorting (PR #21)
 - **Correct Ghidra detection**: Properly selects `ghidra_12.0.2_PUBLIC` over `ghidra_12.0_PUBLIC`
 - Fixes issue #19
@@ -1070,7 +1911,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
 **Documentation Organization:**
 - Ã¢Å“â€¦ Created comprehensive `PROJECT_STRUCTURE.md` documenting entire project layout
 - Ã¢Å“â€¦ Consolidated `DOCUMENTATION_INDEX.md` merging duplicate indexes
-- Ã¢Å“â€¦ Enhanced `scripts/README.md` with categorization and workflows  
+- Ã¢Å“â€¦ Enhanced `scripts/README.md` with categorization and workflows
 - Ã¢Å“â€¦ Established markdown naming standards (`MARKDOWN_NAMING.md`)
 - Ã¢Å“â€¦ Organized 40+ root-level files into clear categories
 
@@ -1111,7 +1952,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
 
 - Ã¢Å“â€¦ Version consistency verification across all files
 - Ã¢Å“â€¦ Build configuration validated (Maven 3.9+, Java 21)
-- Ã¢Å“â€¦ Plugin deployment verified with Ghidra 11.4.2  
+- Ã¢Å“â€¦ Plugin deployment verified with Ghidra 11.4.2
 - Ã¢Å“â€¦ Python dependencies current (`requirements.txt`)
 - Ã¢Å“â€¦ All core functionality tested and working
 
@@ -1281,7 +2122,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
 
 ### Bug Fixes
 - Ã¢Å“â€¦ **Fixed DocumentFunctionWithClaude.java** - Windows compatibility
-  - Resolved "claude: CreateProcess error=2" 
+  - Resolved "claude: CreateProcess error=2"
   - Now uses full path: `%APPDATA%\npm\claude.cmd`
   - Changed keybinding from Ctrl+Shift+D to Ctrl+Shift+P
 
@@ -1291,7 +2132,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
   - `ClearCallReturnOverrides.java` - Clean orphaned flow overrides
 - Ã¢Å“â€¦ **mcp-config.json** - Claude MCP configuration template
 - Ã¢Å“â€¦ **mcp_function_processor.py** - Batch function processing automation
-- Ã¢Å“â€¦ **scripts/hybrid-function-processor.ps1** - Automated analysis workflows
+- Ã¢Å“â€¦ **hybrid function processor workflow** - Automated analysis workflows
 
 ### Enhanced Documentation
 - Ã¢Å“â€¦ **examples/punit/** - Complete UnitAny structure case study (8 files)
@@ -1344,7 +2185,7 @@ code = decompile_function(address='0x401000', offset=100, limit=100)
   - create_d2_typedefs.py - Type definition generation
   - populate_d2_structs.py - Structure population automation
   - test_data_xrefs_tool.py - Unit tests for xref tools
-  - data-extract.ps1, data-process.ps1, function-process.ps1, functions-extract.ps1 - PowerShell automation
+  - data extraction and function-processing helpers - automation utilities used during that release cycle
 
 ### Project Organization
 - Ã¢Å“â€¦ **Restructured Documentation**

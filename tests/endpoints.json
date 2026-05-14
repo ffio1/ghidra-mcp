@@ -1,7 +1,7 @@
 {
-  "version": "5.4.1",
+  "version": "5.9.0",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 222,
+  "total_endpoints": 243,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -20,6 +20,17 @@
     "emulation": "P-code emulation (run functions with controlled inputs)"
   },
   "endpoints": [
+    {
+      "path": "/add_function_tag",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "function",
+        "tags",
+        "program"
+      ],
+      "description": "Attach one or more tags to a function. Tags are comma-separated and will be auto-created if they do not already exist."
+    },
     {
       "path": "/add_struct_field",
       "method": "POST",
@@ -124,7 +135,7 @@
         "include_completeness",
         "program"
       ],
-      "description": "Comprehensive single-call function analysis. Requires function name — if you only have an address, call get_function_by_address first."
+      "description": "Comprehensive single-call function analysis. Accepts function name or address."
     },
     {
       "path": "/analyze_function_completeness",
@@ -202,6 +213,61 @@
       "description": "Apply function documentation"
     },
     {
+      "path": "/archive_ingest_function",
+      "method": "POST",
+      "category": "documentation",
+      "params": [
+        "address",
+        "program",
+        "version_override",
+        "dry_run"
+      ],
+      "description": "Ingest a single function's documentation into the cross-version archive (re_kb.functions on bsim Postgres). Idempotent; field-level merge resolution happens on the archive side. Use archive_ingest_program for bulk."
+    },
+    {
+      "path": "/archive_ingest_program",
+      "method": "POST",
+      "category": "documentation",
+      "params": [
+        "program",
+        "version_override",
+        "limit",
+        "skip_default_named",
+        "dry_run"
+      ],
+      "description": "Bulk-ingest every function in a program into the cross-version documentation archive. Posts each to /v1/doc_archive/upsert. Returns per-binary counts (created / updated / conflicts_enqueued / errors)."
+    },
+    {
+      "path": "/audit_global",
+      "method": "GET",
+      "category": "datatype",
+      "params": [
+        "address",
+        "program"
+      ],
+      "description": "Audit a global variable's documentation state. Returns name, type, length, plate comment, xref count, and list of issues. Use this before set_global so you know exactly what's missing."
+    },
+    {
+      "path": "/audit_globals_in_function",
+      "method": "GET",
+      "category": "datatype",
+      "params": [
+        "address",
+        "program"
+      ],
+      "description": "Audit every global variable referenced from within a function in one call. Walks the function's instructions, collects unique data references, and returns the per-global audit (same shape as audit_global) plus a summary of how many are fully documented vs have issues. The killer per-function pre-flight tool — start every doc pass with this when the function has global xrefs."
+    },
+    {
+      "path": "/batch_add_function_tags",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "assignments",
+        "program"
+      ],
+      "description": "Attach tags to many functions in one transaction. Body: [{\"function\":\"0x140200ae6\",\"tags\":\"syscall,lpe-surface\"}, ...]. Tags auto-create."
+    },
+    {
       "path": "/batch_analyze_completeness",
       "method": "POST",
       "category": "analysis",
@@ -249,7 +315,7 @@
         "functions",
         "program"
       ],
-      "description": "Batch decompile functions"
+      "description": "Decompile multiple functions at once. Accepts comma-separated function names or addresses."
     },
     {
       "path": "/batch_delete_labels",
@@ -260,6 +326,16 @@
         "program"
       ],
       "description": "Delete multiple labels"
+    },
+    {
+      "path": "/batch_remove_function_tags",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "assignments",
+        "program"
+      ],
+      "description": "Detach tags from many functions in one transaction. Body shape matches /batch_add_function_tags."
     },
     {
       "path": "/batch_rename_function_components",
@@ -391,11 +467,11 @@
     {
       "path": "/close_program",
       "method": "POST",
-      "category": "headless",
+      "category": "program",
       "params": [
         "name"
       ],
-      "description": "Close a loaded program and free its resources"
+      "description": "Close an open program by project path or name"
     },
     {
       "path": "/close_project",
@@ -503,6 +579,17 @@
       "description": "Create function signature type"
     },
     {
+      "path": "/create_function_tag",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "name",
+        "comment",
+        "program"
+      ],
+      "description": "Create a program-wide function tag definition with an optional comment. Use add_function_tag to attach it to functions."
+    },
+    {
       "path": "/create_label",
       "method": "POST",
       "category": "rename",
@@ -560,7 +647,7 @@
         "fields",
         "program"
       ],
-      "description": "Create structure"
+      "description": "Create structure. Body fields must be a JSON array of objects with name and type, plus optional decimal offset. Example fields: [{\"name\":\"dwId\",\"type\":\"uint\",\"offset\":0},{\"name\":\"pNext\",\"type\":\"void *\",\"offset\":4}]. Type may be any resolvable Ghidra data type or existing struct name."
     },
     {
       "path": "/create_typedef",
@@ -599,6 +686,21 @@
       "category": "debugger",
       "params": [],
       "description": "Interrupt (break into) the running target"
+    },
+    {
+      "path": "/debugger/launch",
+      "method": "POST",
+      "category": "debugger",
+      "params": [
+        "executable_path",
+        "args",
+        "cwd",
+        "timeout_seconds",
+        "program",
+        "offer",
+        "python_executable"
+      ],
+      "description": "Launch an executable through Ghidra's Trace RMI debugger launcher"
     },
     {
       "path": "/debugger/launch_offers",
@@ -769,6 +871,16 @@
         "program"
       ],
       "description": "Delete function at address"
+    },
+    {
+      "path": "/delete_function_tag",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "name",
+        "program"
+      ],
+      "description": "Delete a program-wide function tag definition. This detaches the tag from every function that had it."
     },
     {
       "path": "/delete_label",
@@ -1246,6 +1358,17 @@
       "description": "Get labels in function"
     },
     {
+      "path": "/get_function_pcode",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "function_address",
+        "granularity",
+        "program"
+      ],
+      "description": "Dump raw P-code for a function (issue #192). Returns low (basic-iter) and high (HighFunction) P-code with basic blocks and varnodes. Granularity controls output: 'basic' = basic-block iter only (less memory), 'high' = HighFunction graph (default; includes both BB iter and op-iter). For P-code emulators / ML pipelines / alternative decompilers."
+    },
+    {
       "path": "/get_function_signature",
       "method": "GET",
       "category": "utility",
@@ -1256,16 +1379,27 @@
       "description": "Get function feature signature"
     },
     {
+      "path": "/get_function_tags",
+      "method": "GET",
+      "category": "function",
+      "params": [
+        "function",
+        "program"
+      ],
+      "description": "List all tags assigned to a specific function. Accepts either a function address or a function name."
+    },
+    {
       "path": "/get_function_variables",
       "method": "GET",
       "category": "getter",
       "params": [
         "function_name",
+        "address",
         "program",
         "limit",
         "filter"
       ],
-      "description": "Get function variables"
+      "description": "List all variables in a function. Accepts function_name or address (address takes precedence). Use address to avoid name-lookup issues after a recent rename."
     },
     {
       "path": "/get_function_xrefs",
@@ -1279,6 +1413,17 @@
         "program"
       ],
       "description": "Get function cross-references"
+    },
+    {
+      "path": "/get_language_metadata",
+      "method": "GET",
+      "category": "program",
+      "params": [
+        "include_registers",
+        "include_default_symbols",
+        "program"
+      ],
+      "description": "Dump the program's language description: address spaces, registers, default symbols, endianness, pointer size (issue #192). Use for P-code emulators / ML pipelines that need the SLEIGH-level facts. include_registers/include_default_symbols toggle expensive sections."
     },
     {
       "path": "/get_metadata",
@@ -1468,6 +1613,10 @@
         "offset",
         "limit",
         "format",
+        "filter",
+        "type_filter",
+        "min_xrefs",
+        "include_all_sections",
         "program"
       ],
       "description": "List data sorted by xref count"
@@ -1518,6 +1667,17 @@
       "description": "List external locations"
     },
     {
+      "path": "/list_function_tags",
+      "method": "GET",
+      "category": "function",
+      "params": [
+        "offset",
+        "limit",
+        "program"
+      ],
+      "description": "List all program-wide function tag definitions with their use counts."
+    },
+    {
       "path": "/list_functions",
       "method": "GET",
       "category": "listing",
@@ -1545,6 +1705,10 @@
         "offset",
         "limit",
         "filter",
+        "type_filter",
+        "min_xrefs",
+        "include_all_sections",
+        "name_substring",
         "program"
       ],
       "description": "List global variables"
@@ -1672,6 +1836,17 @@
       "description": "Machine-readable API schema with endpoint metadata"
     },
     {
+      "path": "/merge_program_documentation",
+      "method": "POST",
+      "category": "documentation",
+      "params": [
+        "source",
+        "target",
+        "dry_run"
+      ],
+      "description": "Bulk merge: copy all RE documentation (function names, signatures, plate comments, instruction comments at EOL/PRE/POST, non-default labels & global symbols) from one program to another at matching addresses. Server-side iteration in a single transaction. Designed for the orphan-rescue workflow: source is typically '<name>_recovered', target is the original '<name>.dll'. Set dry_run=true to count without writing."
+    },
+    {
       "path": "/modify_struct_field",
       "method": "POST",
       "category": "datatype",
@@ -1742,6 +1917,17 @@
       "description": "Get detailed project info including running tools and open programs"
     },
     {
+      "path": "/prompt_policy",
+      "method": "POST",
+      "category": "system",
+      "params": [
+        "action",
+        "reason",
+        "seconds"
+      ],
+      "description": "Temporarily enable, disable, or query scoped automation prompt handling"
+    },
+    {
       "path": "/read_memory",
       "method": "GET",
       "category": "analysis",
@@ -1760,6 +1946,17 @@
         "program"
       ],
       "description": "Trigger full auto-analysis on a program"
+    },
+    {
+      "path": "/remove_function_tag",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "function",
+        "tags",
+        "program"
+      ],
+      "description": "Detach one or more tags from a function. Does not delete the program-wide tag definition — use delete_function_tag for that."
     },
     {
       "path": "/remove_struct_field",
@@ -1856,11 +2053,12 @@
       "category": "rename",
       "params": [
         "functionName",
+        "function_address",
         "oldName",
         "newName",
         "program"
       ],
-      "description": "Rename variable"
+      "description": "Rename a variable in a function. Accepts functionName or function_address; address is more stable after recent renames."
     },
     {
       "path": "/rename_variables",
@@ -1902,9 +2100,17 @@
       "category": "script",
       "params": [
         "code",
-        "args"
+        "args",
+        "program"
       ],
       "description": "Run inline script code"
+    },
+    {
+      "path": "/save_all_programs",
+      "method": "GET",
+      "category": "program",
+      "params": [],
+      "description": "Save all open programs"
     },
     {
       "path": "/save_program",
@@ -1951,6 +2157,18 @@
       "description": "Search functions by name"
     },
     {
+      "path": "/search_functions_by_tag",
+      "method": "GET",
+      "category": "function",
+      "params": [
+        "tag",
+        "offset",
+        "limit",
+        "program"
+      ],
+      "description": "List all functions that have a specified tag attached. Returns name + entry address."
+    },
+    {
       "path": "/search_functions_enhanced",
       "method": "GET",
       "category": "search",
@@ -1960,6 +2178,8 @@
         "max_xrefs",
         "calling_convention",
         "has_custom_name",
+        "is_thunk",
+        "is_external",
         "regex",
         "sort_by",
         "offset",
@@ -2206,7 +2426,32 @@
         "calling_convention",
         "program"
       ],
-      "description": "Set function prototype"
+      "description": "Set function prototype (return type, param types, calling convention). NOTE: the function name in the prototype string does NOT rename the function — call rename_function_by_address separately if needed."
+    },
+    {
+      "path": "/set_function_tag_comment",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "name",
+        "comment",
+        "program"
+      ],
+      "description": "Update the comment/description on an existing program-wide function tag."
+    },
+    {
+      "path": "/set_global",
+      "method": "POST",
+      "category": "datatype",
+      "params": [
+        "address",
+        "name",
+        "type_name",
+        "array_length",
+        "plate_comment",
+        "program"
+      ],
+      "description": "Atomically apply name + type + plate-comment + array length to a global variable. Single-transaction; rejects on validation failure with no partial write. Replaces the 4-tool chain (apply_data_type → rename_data → batch_set_comments → create_label)."
     },
     {
       "path": "/set_image_base",

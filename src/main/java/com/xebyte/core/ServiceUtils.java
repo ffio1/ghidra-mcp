@@ -263,6 +263,31 @@ public final class ServiceUtils {
             return result;
         }
 
+        if (obj instanceof String json) {
+            String trimmed = json.trim();
+            if (trimmed.isEmpty()) {
+                return null;
+            }
+
+            Object parsed = JsonHelper.parseJson(trimmed);
+            List<Map<String, String>> parsedList = JsonHelper.toMapStringList(parsed);
+            if (parsedList != null) {
+                return parsedList;
+            }
+
+            // Some providers stringify arrays directly; parseJson() only handles objects.
+            if (trimmed.startsWith("[")) {
+                try {
+                    parsedList = JsonHelper.toMapStringList(
+                        com.google.gson.JsonParser.parseString(trimmed));
+                } catch (Exception ignored) {
+                    // Fall through and return null below.
+                }
+            }
+
+            return parsedList;
+        }
+
         return null;
     }
 
@@ -509,7 +534,7 @@ public final class ServiceUtils {
     public static ProgramOrError getProgramOrError(ProgramProvider provider, String programName) {
         Program program = null;
         if (programName != null && !programName.isEmpty()) {
-            program = provider.resolveProgram(programName);
+            program = provider.getProgram(programName);
         } else {
             program = provider.getCurrentProgram();
         }
@@ -565,6 +590,23 @@ public final class ServiceUtils {
             return null;
         }
         addressStr = addressStr.strip();
+
+        // Detect array-shaped input. Workers occasionally send a JSON array
+        // of addresses for the `address` parameter when they meant to use the
+        // batch-comments inner lists (decompiler_comments / disassembly_comments).
+        // The default error message ("could not be resolved... try <space>:<hex>")
+        // misled at least one worker into prepending "ram:" to the array, then
+        // retrying with the same wrong shape. Detect and fail fast with a
+        // structured hint instead.
+        if (addressStr.startsWith("[")) {
+            lastParseError.set("Address must be a single string, not an array. "
+                    + "Got: " + (addressStr.length() > 80 ? addressStr.substring(0, 80) + "..." : addressStr) + ". "
+                    + "If you're calling batch_set_comments, the top-level `address` is the "
+                    + "function entry only; per-line addresses go inside the `decompiler_comments` "
+                    + "and `disassembly_comments` arrays as objects like {\"address\": \"0x...\", \"comment\": \"...\"}. "
+                    + "If you're addressing a single location, pass one hex string like \"0x6ff6a4a0\".");
+            return null;
+        }
 
         // Detect if this is a segment:offset form for better error messages
         boolean hasColon = addressStr.contains(":");

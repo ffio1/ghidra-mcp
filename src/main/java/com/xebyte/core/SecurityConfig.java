@@ -46,6 +46,7 @@ public final class SecurityConfig {
     private final boolean scriptsAllowed;
     private final String fileRoot;       // null if disabled
     private final Path fileRootCanonical;
+    private final String projectFolderScope; // null = no enforcement (default)
 
     private SecurityConfig() {
         String rawToken = System.getenv("GHIDRA_MCP_AUTH_TOKEN");
@@ -72,6 +73,24 @@ public final class SecurityConfig {
         } else {
             this.fileRoot = null;
             this.fileRootCanonical = null;
+        }
+
+        // Project-folder scope guard. When set, FrontEndProgramProvider
+        // refuses to return Programs whose DomainFile path falls outside
+        // this prefix. Default unset = no enforcement (back-compat for all
+        // general users — only opt-in via env var changes behavior).
+        // Trailing slash normalized so collision-safe `path == prefix or
+        // startsWith(prefix + "/")` matching works.
+        String rawScope = System.getenv("GHIDRA_MCP_PROJECT_FOLDER");
+        if (rawScope != null) {
+            String trimmed = rawScope.trim();
+            // Strip trailing slash unless the value is just "/"
+            if (trimmed.length() > 1 && trimmed.endsWith("/")) {
+                trimmed = trimmed.substring(0, trimmed.length() - 1);
+            }
+            this.projectFolderScope = trimmed.isEmpty() ? null : trimmed;
+        } else {
+            this.projectFolderScope = null;
         }
     }
 
@@ -109,6 +128,40 @@ public final class SecurityConfig {
     /** True when {@code GHIDRA_MCP_ALLOW_SCRIPTS} opts in. */
     public boolean areScriptsAllowed() {
         return scriptsAllowed;
+    }
+
+    /** True when {@code GHIDRA_MCP_PROJECT_FOLDER} is set (any value). */
+    public boolean hasProjectFolderScope() {
+        return projectFolderScope != null;
+    }
+
+    /**
+     * Return the configured project-folder scope prefix (e.g.
+     * {@code "/Mods/PD2-S12"}), or {@code null} when unset (default).
+     * Trailing slash already normalized at construction.
+     */
+    public String getProjectFolderScope() {
+        return projectFolderScope;
+    }
+
+    /**
+     * Test whether {@code domainFilePath} falls under the configured project
+     * folder scope. Always returns {@code true} when no scope is configured
+     * (default — preserves general-user behavior).
+     *
+     * Uses the {@code path == prefix || path.startsWith(prefix + "/")} idiom
+     * to prevent prefix-collision attacks (e.g. {@code /Mods/PD2-S12-OTHER}
+     * does NOT match scope {@code /Mods/PD2-S12}).
+     *
+     * @param domainFilePath the project-relative path of a Ghidra DomainFile
+     *                       (e.g. {@code "/Mods/PD2-S12/Bnclient.dll"});
+     *                       null returns true (unscoped equivalent)
+     */
+    public boolean isPathInProjectScope(String domainFilePath) {
+        if (projectFolderScope == null) return true;
+        if (domainFilePath == null) return true;
+        if (domainFilePath.equals(projectFolderScope)) return true;
+        return domainFilePath.startsWith(projectFolderScope + "/");
     }
 
     /** True when {@code GHIDRA_MCP_FILE_ROOT} is set. */

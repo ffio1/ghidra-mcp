@@ -75,47 +75,100 @@ public class FrontEndProgramProvider implements ProgramProvider {
 
     @Override
     public Program getProgram(String name) {
+        // Resolve the Program first (existing logic), then apply the
+        // optional project-folder scope guard. The guard is OFF by default
+        // (env var GHIDRA_MCP_PROJECT_FOLDER unset) so general users see no
+        // behavior change. Only when the user opts in via the env var does
+        // a Program whose DomainFile path is outside the configured prefix
+        // get treated as not-found (returns null).
+        Program resolved = getProgramInternal(name);
+        if (resolved == null) return null;
+        SecurityConfig sc = SecurityConfig.getInstance();
+        if (!sc.hasProjectFolderScope()) return resolved;
+        DomainFile df = resolved.getDomainFile();
+        String path = df != null ? df.getPathname() : null;
+        if (sc.isPathInProjectScope(path)) return resolved;
+        Msg.warn(this,
+            "Project-folder scope guard: refusing program at '" + path
+            + "' (request='" + name + "', scope='" + sc.getProjectFolderScope() + "')");
+        return null;
+    }
+
+    /**
+     * Existing program-resolution logic. Renamed from getProgram() so the
+     * public entry point can apply the project-folder scope guard around it
+     * without restructuring the resolution cascade.
+     */
+    private Program getProgramInternal(String name) {
         if (name == null || name.trim().isEmpty()) {
             return getCurrentProgram();
         }
 
         String searchName = name.trim();
 
-        // 1. Check path-based cache first (handles multi-version same-name DLLs)
+        // 1. Check all running CodeBrowsers for this program FIRST.
+        //
+        // This must precede the path/name caches. The cache can hold an
+        // orphaned Program whose underlying DomainFile was severed by a
+        // checkout/checkin cycle or project refresh; in that case the
+        // CodeBrowser will hold a different Program object for the same
+        // DomainFile path. Returning the cached orphan would route writes to
+        // a ghost Program — saves silently fail with "Location does not exist
+        // for a save operation!" and the user's CodeBrowser shows none of
+        // the applied changes (see Recover_OrphanedProgramSaveAs.java for
+        // the recovery procedure that motivated this fix).
+        List<Program> cbPrograms = collectCodeBrowserPrograms();
+
+        // 1a. Path match — only when an absolute project path is given. This
+        // is the precise check: identical DomainFile pathname implies the
+        // CodeBrowser has the live Program for the requested file.
         if (searchName.startsWith("/")) {
-            String cacheKey = pathToName.get(searchName);
-            if (cacheKey != null) {
-                Program cached = openPrograms.get(cacheKey);
-                if (cached != null) {
-                    return cached;
+            for (Program prog : cbPrograms) {
+                DomainFile df = prog.getDomainFile();
+                if (df != null && searchName.equals(df.getPathname())) {
+                    return prog;
                 }
             }
         }
 
-        // 2. Check all running CodeBrowsers for this program
-        List<Program> cbPrograms = collectCodeBrowserPrograms();
+        // 1b. Exact name match (program filename)
         for (Program prog : cbPrograms) {
             if (prog.getName().equalsIgnoreCase(searchName)) {
                 return prog;
             }
         }
-        // Partial match on CodeBrowser programs
+        // 1c. Partial name match
         for (Program prog : cbPrograms) {
             if (prog.getName().toLowerCase().contains(searchName.toLowerCase())) {
                 return prog;
             }
         }
 
-        // 3. Check our cache (only for non-path lookups to avoid collisions)
+        // 2. Path-based cache (only when no CodeBrowser has the program).
+        // Validate the cached entry is still usable; skip if closed.
+        if (searchName.startsWith("/")) {
+            String cacheKey = pathToName.get(searchName);
+            if (cacheKey != null) {
+                Program cached = openPrograms.get(cacheKey);
+                if (cached != null && !cached.isClosed()) {
+                    return cached;
+                }
+            }
+        }
+
+        // 3. Name-based cache (avoid path-form collisions)
         if (!searchName.startsWith("/")) {
             Program cached = openPrograms.get(searchName);
-            if (cached != null) {
+            if (cached != null && !cached.isClosed()) {
                 return cached;
             }
             // Case-insensitive cache lookup
             for (Map.Entry<String, Program> entry : openPrograms.entrySet()) {
                 if (entry.getKey().equalsIgnoreCase(searchName)) {
-                    return entry.getValue();
+                    Program p = entry.getValue();
+                    if (p != null && !p.isClosed()) {
+                        return p;
+                    }
                 }
             }
         }
@@ -375,6 +428,57 @@ public class FrontEndProgramProvider implements ProgramProvider {
         openPrograms.clear();
         pathToName.clear();
         currentProgram = null;
+    }
+
+    /**
+     * Release a cached program opened directly by this provider.
+     *
+     * @param nameOrPath Program name or project path
+     * @return true if a cached program reference was released
+     */
+    public boolean releaseCachedProgram(String nameOrPath) {
+        if (nameOrPath == null || nameOrPath.trim().isEmpty()) {
+            return false;
+        }
+
+        String search = nameOrPath.trim();
+        List<String> keys = new ArrayList<>();
+        String directKey = pathToName.get(search);
+        if (directKey != null) {
+            keys.add(directKey);
+        }
+        keys.add(search);
+
+        for (Map.Entry<String, Program> entry : openPrograms.entrySet()) {
+            Program program = entry.getValue();
+            if (program.getName().equalsIgnoreCase(search) ||
+                    (program.getDomainFile() != null &&
+                            program.getDomainFile().getPathname().equalsIgnoreCase(search))) {
+                keys.add(entry.getKey());
+            }
+        }
+
+        boolean released = false;
+        for (String key : new ArrayList<>(keys)) {
+            Program program = openPrograms.remove(key);
+            if (program == null) {
+                continue;
+            }
+            try {
+                program.release(consumer);
+                released = true;
+                if (program == currentProgram) {
+                    currentProgram = null;
+                }
+                Msg.info(this, "Released cached program: " + key);
+            } catch (Exception e) {
+                Msg.warn(this, "Error releasing cached program " + key + ": " + e.getMessage());
+            }
+        }
+
+        pathToName.entrySet().removeIf(entry -> keys.contains(entry.getValue()) ||
+                entry.getKey().equalsIgnoreCase(search));
+        return released;
     }
 
     /**

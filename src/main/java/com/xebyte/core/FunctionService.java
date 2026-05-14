@@ -99,17 +99,24 @@ public class FunctionService {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(program);
-        for (Function func : program.getFunctionManager().getFunctions(true)) {
-            if (func.getName().equals(name)) {
-                DecompileResults result =
-                    decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
-                if (result != null && result.decompileCompleted()) {
-                    return Response.text(result.getDecompiledFunction().getC());
-                } else {
-                    return Response.text("Decompilation failed");
+        DecompInterface decomp = null;
+        try {
+            decomp = new DecompInterface();
+            decomp.openProgram(program);
+            for (Function func : program.getFunctionManager().getFunctions(true)) {
+                if (func.getName().equals(name)) {
+                    DecompileResults result =
+                        decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
+                    if (result != null && result.decompileCompleted()) {
+                        return Response.text(result.getDecompiledFunction().getC());
+                    } else {
+                        return Response.text("Decompilation failed");
+                    }
                 }
+            }
+        } finally {
+            if (decomp != null) {
+                try { decomp.dispose(); } catch (Exception ignored) {}
             }
         }
         return Response.text("Function not found");
@@ -140,11 +147,12 @@ public class FunctionService {
         Program program = pe.program();
         if (addressStr == null || addressStr.isEmpty()) return Response.err("Address or function name is required");
 
+        DecompInterface decomp = null;
         try {
             Function func = ServiceUtils.resolveFunction(program, addressStr);
             if (func == null) return Response.err("No function found for " + addressStr);
 
-            DecompInterface decomp = new DecompInterface();
+            decomp = new DecompInterface();
             decomp.openProgram(program);
             DecompileResults decompResult = decomp.decompileFunction(func, timeoutSeconds, new ConsoleTaskMonitor());
 
@@ -177,6 +185,10 @@ public class FunctionService {
         } catch (Throwable e) {
             String msg = e.getMessage() != null ? e.getMessage() : e.toString();
             return Response.err("Error decompiling function: " + msg);
+        } finally {
+            if (decomp != null) {
+                try { decomp.dispose(); } catch (Exception ignored) {}
+            }
         }
     }
 
@@ -297,9 +309,9 @@ public class FunctionService {
     /**
      * Batch decompile multiple functions by name.
      */
-    @McpTool(path = "/batch_decompile", description = "Decompile multiple functions at once", category = "function")
+        @McpTool(path = "/batch_decompile", description = "Decompile multiple functions at once. Accepts comma-separated function names or addresses.", category = "function")
     public Response batchDecompileFunctions(
-            @Param(value = "functions", description = "Comma-separated function names") String functionsParam,
+            @Param(value = "functions", description = "Comma-separated function references (names or addresses)") String functionsParam,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -310,50 +322,40 @@ public class FunctionService {
         }
 
         try {
-            String[] functionNames = functionsParam.split(",");
+            String[] functionRefs = functionsParam.split(",");
             Map<String, Object> resultMap = new LinkedHashMap<>();
-
-            FunctionManager funcManager = program.getFunctionManager();
             final int MAX_FUNCTIONS = 20; // Limit to prevent overload
 
-            for (int i = 0; i < functionNames.length && i < MAX_FUNCTIONS; i++) {
-                String funcName = functionNames[i].trim();
-                if (funcName.isEmpty()) continue;
+            for (int i = 0; i < functionRefs.length && i < MAX_FUNCTIONS; i++) {
+                String funcRef = functionRefs[i].trim();
+                if (funcRef.isEmpty()) continue;
 
-                // Find function by name
-                Function function = null;
-                SymbolTable symbolTable = program.getSymbolTable();
-                SymbolIterator symbols = symbolTable.getSymbols(funcName);
-
-                while (symbols.hasNext()) {
-                    Symbol symbol = symbols.next();
-                    if (symbol.getSymbolType() == SymbolType.FUNCTION) {
-                        function = funcManager.getFunctionAt(symbol.getAddress());
-                        break;
-                    }
-                }
+                Function function = ServiceUtils.resolveFunction(program, funcRef);
 
                 if (function == null) {
-                    resultMap.put(funcName, "Error: Function not found");
+                    resultMap.put(funcRef, "Error: Function not found");
                     continue;
                 }
 
                 // Decompile the function
+                DecompInterface decompiler = null;
                 try {
-                    DecompInterface decompiler = new DecompInterface();
+                    decompiler = new DecompInterface();
                     decompiler.openProgram(program);
                     DecompileResults decompResults = decompiler.decompileFunction(function, 30, null);
 
                     if (decompResults != null && decompResults.decompileCompleted()) {
                         String decompCode = decompResults.getDecompiledFunction().getC();
-                        resultMap.put(funcName, decompCode);
+                        resultMap.put(funcRef, decompCode);
                     } else {
-                        resultMap.put(funcName, "Error: Decompilation failed");
+                        resultMap.put(funcRef, "Error: Decompilation failed");
                     }
-
-                    decompiler.dispose();
                 } catch (Exception e) {
-                    resultMap.put(funcName, "Error: " + e.getMessage());
+                    resultMap.put(funcRef, "Error: " + e.getMessage());
+                } finally {
+                    if (decompiler != null) {
+                        try { decompiler.dispose(); } catch (Exception ignored) {}
+                    }
                 }
             }
 
@@ -1055,9 +1057,10 @@ public class FunctionService {
     /**
      * Rename a variable in a function.
      */
-    @McpTool(path = "/rename_variable", method = "POST", description = "Rename a variable in a function", category = "function")
+    @McpTool(path = "/rename_variable", method = "POST", description = "Rename a variable in a function. Accepts functionName or function_address; address is more stable after recent renames.", category = "function")
     public Response renameVariableInFunction(
-            @Param(value = "functionName", source = ParamSource.BODY) String functionName,
+            @Param(value = "functionName", source = ParamSource.BODY, defaultValue = "") String functionName,
+            @Param(value = "function_address", paramType = "address", source = ParamSource.BODY, defaultValue = "") String functionAddress,
             @Param(value = "oldName", source = ParamSource.BODY) String oldVarName,
             @Param(value = "newName", source = ParamSource.BODY) String newVarName,
             @Param(value = "program", defaultValue = "") String programName) {
@@ -1065,62 +1068,60 @@ public class FunctionService {
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
 
+        if ((functionName == null || functionName.isEmpty()) && (functionAddress == null || functionAddress.isEmpty())) {
+            return Response.err("Function name or address is required");
+        }
+
         DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(program);
-
-        Function func = null;
-        for (Function f : program.getFunctionManager().getFunctions(true)) {
-            if (f.getName().equals(functionName)) {
-                func = f;
-                break;
-            }
-        }
-
-        if (func == null) {
-            return Response.text("Function not found");
-        }
-
-        DecompileResults result = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
-        if (result == null || !result.decompileCompleted()) {
-            return Response.text("Decompilation failed");
-        }
-
-        HighFunction highFunction = result.getHighFunction();
-        if (highFunction == null) {
-            return Response.text("Decompilation failed (no high function)");
-        }
-
-        LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
-        if (localSymbolMap == null) {
-            return Response.text("Decompilation failed (no local symbol map)");
-        }
-
-        HighSymbol highSymbol = null;
-        Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
-        while (symbols.hasNext()) {
-            HighSymbol symbol = symbols.next();
-            String symbolName = symbol.getName();
-
-            if (symbolName.equals(oldVarName)) {
-                highSymbol = symbol;
-            }
-            if (symbolName.equals(newVarName)) {
-                return Response.err("A variable with name '" + newVarName + "' already exists in this function");
-            }
-        }
-
-        if (highSymbol == null) {
-            return Response.text("Variable not found");
-        }
-
-        boolean commitRequired = checkFullCommit(highSymbol, highFunction);
-
-        final HighSymbol finalHighSymbol = highSymbol;
-        final HighFunction finalHighFunction = highFunction;
-        final Function finalFunction = func;
-        AtomicBoolean successFlag = new AtomicBoolean(false);
-
         try {
+            decomp.openProgram(program);
+
+            String functionRef = (functionAddress != null && !functionAddress.isEmpty()) ? functionAddress : functionName;
+            Function func = ServiceUtils.resolveFunction(program, functionRef);
+            if (func == null) {
+                return Response.err("Function not found: " + functionRef);
+            }
+
+            DecompileResults result = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
+            if (result == null || !result.decompileCompleted()) {
+                return Response.err("Decompilation failed");
+            }
+
+            HighFunction highFunction = result.getHighFunction();
+            if (highFunction == null) {
+                return Response.err("Decompilation failed (no high function)");
+            }
+
+            LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
+            if (localSymbolMap == null) {
+                return Response.err("Decompilation failed (no local symbol map)");
+            }
+
+            HighSymbol highSymbol = null;
+            Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
+            while (symbols.hasNext()) {
+                HighSymbol symbol = symbols.next();
+                String symbolName = symbol.getName();
+
+                if (symbolName.equals(oldVarName)) {
+                    highSymbol = symbol;
+                }
+                if (symbolName.equals(newVarName)) {
+                    return Response.err("A variable with name '" + newVarName + "' already exists in this function");
+                }
+            }
+
+            if (highSymbol == null) {
+                return Response.err("Variable not found: " + oldVarName);
+            }
+
+            boolean commitRequired = checkFullCommit(highSymbol, highFunction);
+
+            final HighSymbol finalHighSymbol = highSymbol;
+            final HighFunction finalHighFunction = highFunction;
+            final Function finalFunction = func;
+            AtomicBoolean successFlag = new AtomicBoolean(false);
+
             threadingStrategy.executeWrite(program, "Rename variable", () -> {
                 if (commitRequired) {
                     HighFunctionDBUtil.commitParamsToDatabase(finalHighFunction, false,
@@ -1135,24 +1136,31 @@ public class FunctionService {
                 successFlag.set(true);
                 return null;
             });
+
+            if (successFlag.get()) {
+                String varType = finalHighSymbol.getDataType().getName();
+                String hungarianWarning = NamingConventions.validateHungarianPrefix(newVarName, varType);
+                if (hungarianWarning != null) {
+                    return Response.ok(JsonHelper.mapOf("status", "success", "message", "Variable renamed", "warnings", List.of(hungarianWarning)));
+                }
+                return Response.text("Variable renamed");
+            }
         } catch (Exception e) {
             String errorMsg = "Failed to execute rename on Swing thread: " + e.getMessage();
             Msg.error(this, errorMsg, e);
-            return Response.text(errorMsg);
-        }
-        if (successFlag.get()) {
-            String varType = finalHighSymbol.getDataType().getName();
-            String hungarianWarning = NamingConventions.validateHungarianPrefix(newVarName, varType);
-            if (hungarianWarning != null) {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message", "Variable renamed", "warnings", List.of(hungarianWarning)));
-            }
-            return Response.text("Variable renamed");
+            return Response.err(errorMsg);
+        } finally {
+            decomp.dispose();
         }
         return Response.text("Failed to rename variable");
     }
 
     public Response renameVariableInFunction(String functionName, String oldVarName, String newVarName) {
-        return renameVariableInFunction(functionName, oldVarName, newVarName, null);
+        return renameVariableInFunction(functionName, null, oldVarName, newVarName, null);
+    }
+
+    public Response renameVariableInFunction(String functionName, String oldVarName, String newVarName, String programName) {
+        return renameVariableInFunction(functionName, null, oldVarName, newVarName, programName);
     }
 
     /**
@@ -1229,18 +1237,55 @@ public class FunctionService {
             return Response.err("New function name is required");
         }
 
+        Function targetFunc = ServiceUtils.resolveFunction(program, functionAddrStr);
+        if (targetFunc == null) {
+            return Response.err("No function found for " + functionAddrStr);
+        }
+
+        boolean enforceStrictNaming = NamingPolicy.getInstance().isStrictNamingEnforcement();
+        List<String> enforcementWarnings = new ArrayList<>();
+
+        // ---- Q1-Q5 validator gate (defense in depth) ----------------------
+        // Hard-reject names that fail verb-tier specificity (Q2/Q4) or
+        // collide via token-subset with another function in this program
+        // (Q3/Q4). Auto-generated names are exempt — the model may
+        // legitimately restore one in rare recovery flows.
+        if (!ServiceUtils.isAutoGeneratedName(newName)) {
+            NamingConventions.NameQualityResult quality =
+                    NamingConventions.checkFunctionNameQuality(newName);
+            if (!quality.ok) {
+                Map<String, Object> rejection = nameQualityRejection(newName, quality);
+                if (enforceStrictNaming) {
+                    return Response.ok(rejection);
+                }
+                enforcementWarnings.add(disabledEnforcementWarning(rejection));
+            }
+            // Token-subset collision check against every function in the
+            // program. Iteration is read-only and fast enough for in-line
+            // execution even on 5k-function binaries.
+            List<String> existingNames = new ArrayList<>();
+            for (Function f : program.getFunctionManager().getFunctions(true)) {
+                if (f == targetFunc) continue;
+                String n = f.getName();
+                if (n != null && !n.isEmpty()) existingNames.add(n);
+            }
+            String collidesWith =
+                    NamingConventions.findTokenSubsetCollision(newName, existingNames);
+            if (collidesWith != null) {
+                Map<String, Object> rejection = tokenSubsetCollisionRejection(newName, collidesWith);
+                if (enforceStrictNaming) {
+                    return Response.ok(rejection);
+                }
+                enforcementWarnings.add(disabledEnforcementWarning(rejection));
+            }
+        }
+
         final StringBuilder resultMsg = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
 
         try {
             threadingStrategy.executeWrite(program, "Rename function by address", () -> {
-                Function func = ServiceUtils.resolveFunction(program, functionAddrStr);
-                if (func == null) {
-                    resultMsg.append("Error: No function found for ").append(functionAddrStr);
-                    return null;
-                }
-
-                String oldName = func.getName();
+                String oldName = targetFunc.getName();
 
                 if (namespacePath != null && !namespacePath.trim().isEmpty()) {
                     // Build or find the target namespace, creating intermediate nodes as needed
@@ -1254,16 +1299,15 @@ public class FunctionService {
                         }
                         ns = child;
                     }
-                    func.getSymbol().setNameAndNamespace(newName, ns, SourceType.USER_DEFINED);
+                    targetFunc.getSymbol().setNameAndNamespace(newName, ns, SourceType.USER_DEFINED);
                     resultMsg.append("Success: Renamed function at ").append(functionAddrStr)
                             .append(" from '").append(oldName).append("' to '")
                             .append(namespacePath).append("::").append(newName).append("'");
                 } else {
-                    func.setName(newName, SourceType.USER_DEFINED);
+                    targetFunc.setName(newName, SourceType.USER_DEFINED);
                     resultMsg.append("Success: Renamed function at ").append(functionAddrStr)
                             .append(" from '").append(oldName).append("' to '").append(newName).append("'");
                 }
-
                 success.set(true);
                 return null;
             });
@@ -1274,13 +1318,13 @@ public class FunctionService {
 
         String text = resultMsg.length() > 0 ? resultMsg.toString() : "Error: Unknown failure";
         if (success.get()) {
-            List<String> nameWarnings = NamingConventions.validateFunctionName(newName, false);
-            if (nameWarnings.isEmpty()) {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message", text));
-            } else {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message", text,
-                        "warnings", nameWarnings));
+            List<String> nameWarnings = new ArrayList<>(NamingConventions.validateFunctionName(newName, false));
+            nameWarnings.addAll(enforcementWarnings);
+            Map<String, Object> data = JsonHelper.mapOf("status", "success", "message", text);
+            if (!nameWarnings.isEmpty()) {
+                data.put("warnings", nameWarnings);
             }
+            return Response.ok(data);
         }
         return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
     }
@@ -1447,6 +1491,43 @@ public class FunctionService {
         return Response.ok(result);
     }
 
+    private static Map<String, Object> nameQualityRejection(
+            String rejectedName, NamingConventions.NameQualityResult quality) {
+        return JsonHelper.mapOf(
+                "status", "rejected",
+                "error", "name_quality",
+                "issue", quality.issue,
+                "rejected_name", rejectedName,
+                "message", quality.message,
+                "suggestion", quality.suggestion
+        );
+    }
+
+    private static Map<String, Object> tokenSubsetCollisionRejection(
+            String rejectedName, String collidesWith) {
+        return JsonHelper.mapOf(
+                "status", "rejected",
+                "error", "name_collision",
+                "issue", "token_subset_duplicate",
+                "rejected_name", rejectedName,
+                "conflicts_with", collidesWith,
+                "message", "Token-subset collision: '" + rejectedName + "' shares the same token set "
+                        + "as existing function '" + collidesWith + "' in this program. "
+                        + "Names that differ only by an added/removed trailing token are usually "
+                        + "a sign that the function needs a more meaningful distinguisher.",
+                "suggestion", "Pick a name with a distinguishing token that captures *why* this "
+                        + "function differs from '" + collidesWith + "' (e.g., add 'Broadcast', "
+                        + "'Local', 'ByIndex', 'ForPlayer', 'WithRetry', ...) rather than just "
+                        + "trimming/extending '" + collidesWith + "'."
+        );
+    }
+
+    private static String disabledEnforcementWarning(Map<String, Object> rejection) {
+        return "Strict naming enforcement disabled: would have rejected "
+                + rejection.get("error") + "/" + rejection.get("issue") + " - "
+                + rejection.get("message");
+    }
+
     // ========================================================================
     // Prototype / Signature methods
     // ========================================================================
@@ -1518,7 +1599,7 @@ public class FunctionService {
     /**
      * Endpoint wrapper for setFunctionPrototype that converts PrototypeResult to Response.
      */
-    @McpTool(path = "/set_function_prototype", method = "POST", description = "Set function prototype with calling convention. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/set_function_prototype", method = "POST", description = "Set function prototype (return type, parameter types, calling convention) by address. NOTE: the function name in the prototype string is used only for parsing — it does NOT rename the function. To rename, call rename_function_by_address separately. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
     public Response setFunctionPrototypeEndpoint(
             @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -1829,6 +1910,28 @@ public class FunctionService {
                             resultMsg.append("Available variables: ")
                                     .append(String.join(", ", availableNames))
                                     .append(". ");
+                        }
+
+                        // SSA churn hint: when the failed name follows the
+                        // <prefix><digit>+ pattern of a Ghidra SSA temporary
+                        // (iVar5, psVar7, puVar2, ...) and there is a similar
+                        // name in the available list with a *different* digit,
+                        // the most likely cause is that a previous
+                        // set_local_variable_type call retyped a variable in
+                        // the same function and re-decompilation renumbered
+                        // SSA temporaries. Recommend the atomic batch tool
+                        // explicitly rather than leaving the worker to guess.
+                        if (variableName.matches("^[a-z]+Var\\d+$")) {
+                            String prefix = variableName.replaceAll("\\d+$", "");
+                            boolean hasSamePrefix = availableNames.stream()
+                                    .anyMatch(n -> n.startsWith(prefix) && n.matches("^[a-z]+Var\\d+$"));
+                            if (hasSamePrefix) {
+                                resultMsg.append("Hint: this looks like SSA-renumber drift from a previous ")
+                                        .append("set_local_variable_type call in the same function. ")
+                                        .append("Use set_variables for ALL variable type+rename changes in one ")
+                                        .append("atomic call to avoid this — individual set_local_variable_type ")
+                                        .append("calls trigger re-decompilation that renumbers SSA temporaries. ");
+                            }
                         }
 
                         // Check if variable exists in low-level API but not high-level (phantom variable)
@@ -2422,9 +2525,10 @@ public class FunctionService {
     /**
      * Get detailed information about a function's variables (parameters and locals).
      */
-    @McpTool(path = "/get_function_variables", description = "List all variables in a function", category = "function")
+    @McpTool(path = "/get_function_variables", description = "List all variables in a function. Accepts function_name (by name) or address (by address). If both are given, address takes precedence. Useful when the function was recently renamed — use address to avoid name-lookup race conditions.", category = "function")
     public Response getFunctionVariables(
-            @Param(value = "function_name", description = "Function name") String functionName,
+            @Param(value = "function_name", description = "Function name (ignored if address is provided)", defaultValue = "") String functionName,
+            @Param(value = "address", description = "Function address (hex, e.g. 6fc583f0). If provided, overrides function_name lookup.", defaultValue = "") String address,
             @Param(value = "program", defaultValue = "") String programName,
             @Param(value = "limit", description = "Max local variables to return (default 200, 0 = unlimited)", defaultValue = "200") String limitStr,
             @Param(value = "filter", description = "Filter locals: 'all' (default), 'needs_work' (only needs_type or needs_rename), 'named' (only non-generic names)", defaultValue = "all") String filter) {
@@ -2432,8 +2536,8 @@ public class FunctionService {
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
 
-        if (functionName == null || functionName.isEmpty()) {
-            return Response.err("Function name is required");
+        if ((functionName == null || functionName.isEmpty()) && (address == null || address.isEmpty())) {
+            return Response.err("Either function_name or address is required");
         }
 
         final int limit = (limitStr != null && !limitStr.isEmpty()) ? Integer.parseInt(limitStr) : 200;
@@ -2446,12 +2550,23 @@ public class FunctionService {
         try {
             threadingStrategy.executeRead(() -> {
                 try {
-                    // Find function by name
+                    // Find function — address lookup takes precedence over name scan
                     Function func = null;
-                    for (Function f : finalProgram.getFunctionManager().getFunctions(true)) {
-                        if (f.getName().equals(functionName)) {
-                            func = f;
-                            break;
+                    if (address != null && !address.isEmpty()) {
+                        Address addr = ServiceUtils.parseAddress(finalProgram, address);
+                        if (addr != null) {
+                            func = ServiceUtils.getFunctionForAddress(finalProgram, addr);
+                        }
+                        if (func == null) {
+                            errorMsg.set("No function at address: " + address);
+                            return null;
+                        }
+                    } else {
+                        for (Function f : finalProgram.getFunctionManager().getFunctions(true)) {
+                            if (f.getName().equals(functionName)) {
+                                func = f;
+                                break;
+                            }
                         }
                     }
 
@@ -2583,7 +2698,7 @@ public class FunctionService {
 
     // Backward compatibility overload
     public Response getFunctionVariables(String functionName) {
-        return getFunctionVariables(functionName, null, null, null);
+        return getFunctionVariables(functionName, null, null, null, null);
     }
 
     /** Suggest a concrete type for an undefined Ghidra type based on size. */
@@ -3168,106 +3283,111 @@ public class FunctionService {
 
                     if (variableRenames != null && !variableRenames.isEmpty()) {
                         // Use decompiler to access SSA variables (the ones that appear in decompiled code)
-                        DecompInterface decomp = new DecompInterface();
-                        decomp.openProgram(program);
+                        DecompInterface decomp = null;
+                        try {
+                            decomp = new DecompInterface();
+                            decomp.openProgram(program);
 
-                        DecompileResults decompResult = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
-                        if (decompResult != null && decompResult.decompileCompleted()) {
-                            HighFunction highFunction = decompResult.getHighFunction();
-                            if (highFunction != null) {
-                                LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
-                                if (localSymbolMap != null) {
-                                    // Check for name conflicts first
-                                    Set<String> existingNames = new HashSet<>();
-                                    Iterator<HighSymbol> checkSymbols = localSymbolMap.getSymbols();
-                                    while (checkSymbols.hasNext()) {
-                                        existingNames.add(checkSymbols.next().getName());
-                                    }
-
-                                    // Validate no conflicts
-                                    for (Map.Entry<String, String> entry : variableRenames.entrySet()) {
-                                        String newName = entry.getValue();
-                                        if (!entry.getKey().equals(newName) && existingNames.contains(newName)) {
-                                            variablesFailed.incrementAndGet();
-                                            errors.add("Variable name '" + newName + "' already exists in function");
+                            DecompileResults decompResult = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
+                            if (decompResult != null && decompResult.decompileCompleted()) {
+                                HighFunction highFunction = decompResult.getHighFunction();
+                                if (highFunction != null) {
+                                    LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
+                                    if (localSymbolMap != null) {
+                                        // Check for name conflicts first
+                                        Set<String> existingNames = new HashSet<>();
+                                        Iterator<HighSymbol> checkSymbols = localSymbolMap.getSymbols();
+                                        while (checkSymbols.hasNext()) {
+                                            existingNames.add(checkSymbols.next().getName());
                                         }
-                                    }
 
-                                    // Commit parameters if needed
-                                    boolean commitRequired = false;
-                                    Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
-                                    if (symbols.hasNext()) {
-                                        HighSymbol firstSymbol = symbols.next();
-                                        commitRequired = checkFullCommit(firstSymbol, highFunction);
-                                    }
-
-                                    if (commitRequired) {
-                                        HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
-                                            ReturnCommitOption.NO_COMMIT, func.getSignatureSource());
-                                    }
-
-                                    // PATH 1: Rename SSA variables from LocalSymbolMap (decompiler variables)
-                                    Set<String> renamedVars = new HashSet<>();
-                                    // hungarianWarnings collected into shared 'warnings' list
-                                    Iterator<HighSymbol> renameSymbols = localSymbolMap.getSymbols();
-                                    while (renameSymbols.hasNext()) {
-                                        HighSymbol symbol = renameSymbols.next();
-                                        String oldName = symbol.getName();
-                                        String newName = variableRenames.get(oldName);
-
-                                        if (newName != null && !newName.isEmpty() && !oldName.equals(newName)) {
-                                            try {
-                                                HighFunctionDBUtil.updateDBVariable(
-                                                    symbol,
-                                                    newName,
-                                                    null,
-                                                    SourceType.USER_DEFINED
-                                                );
-                                                variablesRenamed.incrementAndGet();
-                                                renamedVars.add(oldName);
-                                                // Validate Hungarian prefix against type
-                                                String varType = symbol.getDataType().getName();
-                                                String hw = NamingConventions.validateHungarianPrefix(newName, varType);
-                                                if (hw != null) warnings.add(hw);
-                                            } catch (Exception e) {
+                                        // Validate no conflicts
+                                        for (Map.Entry<String, String> entry : variableRenames.entrySet()) {
+                                            String newName = entry.getValue();
+                                            if (!entry.getKey().equals(newName) && existingNames.contains(newName)) {
                                                 variablesFailed.incrementAndGet();
-                                                errors.add("Failed to rename SSA variable " + oldName + " to " + newName + ": " + e.getMessage());
+                                                errors.add("Variable name '" + newName + "' already exists in function");
                                             }
                                         }
-                                    }
 
-                                    // PATH 2: Rename storage-based variables from Function.getAllVariables()
-                                    try {
-                                        Variable[] allVars = func.getAllVariables();
-                                        for (Variable var : allVars) {
-                                            String oldName = var.getName();
+                                        // Commit parameters if needed
+                                        boolean commitRequired = false;
+                                        Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
+                                        if (symbols.hasNext()) {
+                                            HighSymbol firstSymbol = symbols.next();
+                                            commitRequired = checkFullCommit(firstSymbol, highFunction);
+                                        }
+
+                                        if (commitRequired) {
+                                            HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
+                                                ReturnCommitOption.NO_COMMIT, func.getSignatureSource());
+                                        }
+
+                                        // PATH 1: Rename SSA variables from LocalSymbolMap (decompiler variables)
+                                        Set<String> renamedVars = new HashSet<>();
+                                        // hungarianWarnings collected into shared 'warnings' list
+                                        Iterator<HighSymbol> renameSymbols = localSymbolMap.getSymbols();
+                                        while (renameSymbols.hasNext()) {
+                                            HighSymbol symbol = renameSymbols.next();
+                                            String oldName = symbol.getName();
                                             String newName = variableRenames.get(oldName);
 
-                                            if (newName != null && !newName.isEmpty() && !oldName.equals(newName) && !renamedVars.contains(oldName)) {
+                                            if (newName != null && !newName.isEmpty() && !oldName.equals(newName)) {
                                                 try {
-                                                    var.setName(newName, SourceType.USER_DEFINED);
+                                                    HighFunctionDBUtil.updateDBVariable(
+                                                        symbol,
+                                                        newName,
+                                                        null,
+                                                        SourceType.USER_DEFINED
+                                                    );
                                                     variablesRenamed.incrementAndGet();
                                                     renamedVars.add(oldName);
+                                                    // Validate Hungarian prefix against type
+                                                    String varType = symbol.getDataType().getName();
+                                                    String hw = NamingConventions.validateHungarianPrefix(newName, varType);
+                                                    if (hw != null) warnings.add(hw);
                                                 } catch (Exception e) {
                                                     variablesFailed.incrementAndGet();
-                                                    errors.add("Failed to rename storage variable " + oldName + " to " + newName + ": " + e.getMessage());
+                                                    errors.add("Failed to rename SSA variable " + oldName + " to " + newName + ": " + e.getMessage());
                                                 }
                                             }
                                         }
-                                    } catch (Exception e) {
-                                        Msg.warn(this, "Storage variable rename encountered error: " + e.getMessage());
+
+                                        // PATH 2: Rename storage-based variables from Function.getAllVariables()
+                                        try {
+                                            Variable[] allVars = func.getAllVariables();
+                                            for (Variable var : allVars) {
+                                                String oldName = var.getName();
+                                                String newName = variableRenames.get(oldName);
+
+                                                if (newName != null && !newName.isEmpty() && !oldName.equals(newName) && !renamedVars.contains(oldName)) {
+                                                    try {
+                                                        var.setName(newName, SourceType.USER_DEFINED);
+                                                        variablesRenamed.incrementAndGet();
+                                                        renamedVars.add(oldName);
+                                                    } catch (Exception e) {
+                                                        variablesFailed.incrementAndGet();
+                                                        errors.add("Failed to rename storage variable " + oldName + " to " + newName + ": " + e.getMessage());
+                                                    }
+                                                }
+                                            }
+                                        } catch (Exception e) {
+                                            Msg.warn(this, "Storage variable rename encountered error: " + e.getMessage());
+                                        }
+                                    } else {
+                                        errors.add("Failed to get LocalSymbolMap from decompiler");
                                     }
                                 } else {
-                                    errors.add("Failed to get LocalSymbolMap from decompiler");
+                                    errors.add("Failed to get HighFunction from decompiler");
                                 }
                             } else {
-                                errors.add("Failed to get HighFunction from decompiler");
+                                errors.add("Decompilation failed or did not complete");
                             }
-                        } else {
-                            errors.add("Decompilation failed or did not complete");
+                        } finally {
+                            if (decomp != null) {
+                                try { decomp.dispose(); } catch (Exception ignored) {}
+                            }
                         }
-
-                        decomp.dispose();
                     }
 
                     success.set(true);
@@ -3291,11 +3411,17 @@ public class FunctionService {
                     // Invalidate decompiler cache after successful renames
                     if (success.get() && variablesRenamed.get() > 0 && funcRef.get() != null) {
                         try {
-                            DecompInterface tempDecomp = new DecompInterface();
-                            tempDecomp.openProgram(program);
-                            tempDecomp.flushCache();
-                            tempDecomp.decompileFunction(funcRef.get(), DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
-                            tempDecomp.dispose();
+                            DecompInterface tempDecomp = null;
+                            try {
+                                tempDecomp = new DecompInterface();
+                                tempDecomp.openProgram(program);
+                                tempDecomp.flushCache();
+                                tempDecomp.decompileFunction(funcRef.get(), DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
+                            } finally {
+                                if (tempDecomp != null) {
+                                    try { tempDecomp.dispose(); } catch (Exception ignored) {}
+                                }
+                            }
                             Msg.info(this, "Invalidated decompiler cache after renaming " + variablesRenamed.get() + " variables");
                         } catch (Exception cacheEx) {
                             Msg.warn(this, "Failed to invalidate decompiler cache: " + cacheEx.getMessage());
@@ -3327,11 +3453,11 @@ public class FunctionService {
                 }
                 return Response.ok(resultMap);
             }
+
+            return Response.err("Unknown failure");
         } catch (Exception e) {
             return Response.err(e.getMessage());
         }
-
-        return Response.err("Unknown failure");
     }
 
     public Response batchRenameVariables(String functionAddress, Map<String, String> variableRenames, boolean forceIndividual) {
@@ -3358,18 +3484,58 @@ public class FunctionService {
         Address addr = ServiceUtils.parseAddress(program, functionAddress);
         if (addr == null) return Response.err(ServiceUtils.getLastParseError());
 
-        // Parse the variables JSON into a map of oldName -> {name?, type?}
+        // Parse the variables JSON into a map of oldName -> {name?, type?}.
+        // Tolerant of three worker shapes:
+        //   1. {"local_8": {"name": "dwFlags", "type": "uint"}}  (canonical)
+        //   2. {"local_8": "dwFlags"}                              (rename-only)
+        //   3. {"local_8": ["dwFlags", "uint"]}                    (positional)
+        // Anything else gets a structured error explaining the canonical shape
+        // — workers in production logs hit the cast at oldName→ArrayList /
+        //   oldName→String paths and the cryptic "cannot be cast" message
+        //   was unrecoverable.
         Map<String, Map<String, String>> variables;
         try {
+            Object rawParsed;
+            // variablesJson can arrive as either a JSON-encoded string OR an
+            // already-parsed object/array. parseJson handles the string case;
+            // for non-string raw input we already have it.
+            try {
+                rawParsed = JsonHelper.parseJson(variablesJson);
+            } catch (Exception ignored) {
+                rawParsed = variablesJson;
+            }
+            if (!(rawParsed instanceof Map)) {
+                return Response.err("variables must be a JSON object mapping oldName to "
+                        + "{name?, type?}. Got: " + rawParsed.getClass().getSimpleName()
+                        + ". Example: {\"local_8\": {\"name\": \"dwFlags\", \"type\": \"uint\"}, "
+                        + "\"local_c\": {\"type\": \"int\"}}");
+            }
             @SuppressWarnings("unchecked")
-            Map<String, Object> raw = (Map<String, Object>) JsonHelper.parseJson(variablesJson);
+            Map<String, Object> raw = (Map<String, Object>) rawParsed;
             variables = new LinkedHashMap<>();
             for (Map.Entry<String, Object> entry : raw.entrySet()) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> val = (Map<String, Object>) entry.getValue();
+                Object value = entry.getValue();
                 Map<String, String> spec = new LinkedHashMap<>();
-                if (val.containsKey("name")) spec.put("name", String.valueOf(val.get("name")));
-                if (val.containsKey("type")) spec.put("type", String.valueOf(val.get("type")));
+                if (value instanceof Map<?, ?> mapVal) {
+                    if (mapVal.containsKey("name")) spec.put("name", String.valueOf(mapVal.get("name")));
+                    if (mapVal.containsKey("type")) spec.put("type", String.valueOf(mapVal.get("type")));
+                } else if (value instanceof String strVal) {
+                    // Shape 2: {"local_8": "dwFlags"} — rename-only shorthand.
+                    if (!strVal.isEmpty()) spec.put("name", strVal);
+                } else if (value instanceof List<?> listVal) {
+                    // Shape 3: {"local_8": ["dwFlags", "uint"]} — positional.
+                    if (listVal.size() >= 1 && listVal.get(0) != null) {
+                        spec.put("name", String.valueOf(listVal.get(0)));
+                    }
+                    if (listVal.size() >= 2 && listVal.get(1) != null) {
+                        spec.put("type", String.valueOf(listVal.get(1)));
+                    }
+                } else if (value != null) {
+                    return Response.err("variables['" + entry.getKey() + "'] must be an object "
+                            + "({\"name\": ..., \"type\": ...}), a string (rename-only), or a "
+                            + "[name, type] array. Got: " + value.getClass().getSimpleName()
+                            + ". Example: {\"" + entry.getKey() + "\": {\"name\": \"dwFlags\", \"type\": \"uint\"}}");
+                }
                 variables.put(entry.getKey(), spec);
             }
         } catch (Exception e) {
@@ -3377,7 +3543,18 @@ public class FunctionService {
                     + ". Expected: {\"local_8\": {\"name\": \"dwFlags\", \"type\": \"uint\"}}");
         }
 
-        if (variables.isEmpty()) return Response.err("No variables specified");
+        // Empty variables map is a no-op success — matches set_global's convention.
+        // Workers reach this state when their analysis concludes nothing needs
+        // changing; rejecting forces error-handling that the worker can't recover
+        // from. Returning a success-shaped no-op lets the worker move on.
+        if (variables.isEmpty()) {
+            return Response.ok(JsonHelper.mapOf(
+                "success", true,
+                "types_set", 0,
+                "names_set", 0,
+                "failed", 0,
+                "message", "No variables to set (empty payload)"));
+        }
 
         final AtomicInteger typesSet = new AtomicInteger(0);
         final AtomicInteger namesSet = new AtomicInteger(0);
@@ -3442,60 +3619,111 @@ public class FunctionService {
                     }
 
                     // Phase 2: Decompile to get fresh SSA variables for renaming
-                    DecompInterface decomp = new DecompInterface();
-                    decomp.openProgram(program);
-                    DecompileResults decompResult = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
-                    if (decompResult == null || !decompResult.decompileCompleted()) {
-                        errors.add("Decompilation failed after type changes; renames skipped");
-                        decomp.dispose();
-                        return;
-                    }
-                    HighFunction highFunction = decompResult.getHighFunction();
-                    if (highFunction == null) {
-                        errors.add("No HighFunction after decompile; renames skipped");
-                        decomp.dispose();
-                        return;
-                    }
-
-                    // Commit params if needed
-                    LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
-                    Iterator<HighSymbol> checkSymbols = localSymbolMap.getSymbols();
-                    if (checkSymbols.hasNext()) {
-                        HighSymbol first = checkSymbols.next();
-                        if (checkFullCommit(first, highFunction)) {
-                            HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
-                                    ReturnCommitOption.NO_COMMIT, func.getSignatureSource());
+                    DecompInterface decomp = null;
+                    try {
+                        decomp = new DecompInterface();
+                        decomp.openProgram(program);
+                        DecompileResults decompResult = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
+                        if (decompResult == null || !decompResult.decompileCompleted()) {
+                            errors.add("Decompilation failed after type changes; renames skipped");
+                            return;
                         }
-                    }
-
-                    // Phase 3: Rename with Hungarian validation
-                    Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
-                    while (symbols.hasNext()) {
-                        HighSymbol symbol = symbols.next();
-                        String currentName = symbol.getName();
-                        Map<String, String> spec = variables.get(currentName);
-                        if (spec == null || !spec.containsKey("name")) continue;
-
-                        String newName = spec.get("name");
-                        if (newName == null || newName.isEmpty() || newName.equals(currentName)) continue;
-
-                        // Validate Hungarian prefix against actual type
-                        String actualType = symbol.getDataType().getName();
-                        String hungarianWarning = NamingConventions.validateHungarianPrefix(newName, actualType);
-                        if (hungarianWarning != null) {
-                            warnings.add(hungarianWarning);
+                        HighFunction highFunction = decompResult.getHighFunction();
+                        if (highFunction == null) {
+                            errors.add("No HighFunction after decompile; renames skipped");
+                            return;
                         }
 
+                        // Commit params if needed
+                        LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
+                        Iterator<HighSymbol> checkSymbols = localSymbolMap.getSymbols();
+                        if (checkSymbols.hasNext()) {
+                            HighSymbol first = checkSymbols.next();
+                            if (checkFullCommit(first, highFunction)) {
+                                HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
+                                        ReturnCommitOption.NO_COMMIT, func.getSignatureSource());
+                            }
+                        }
+
+                        // Phase 3a: Rename via HighSymbol (decompiler-visible variables).
+                        // This is the primary path for SSA temporaries (iVar*, psVar*, etc.)
+                        // and for register-backed parameters/locals.
+                        Set<String> renamedHere = new HashSet<>();
+                        Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
+                        while (symbols.hasNext()) {
+                            HighSymbol symbol = symbols.next();
+                            String currentName = symbol.getName();
+                            Map<String, String> spec = variables.get(currentName);
+                            if (spec == null || !spec.containsKey("name")) continue;
+
+                            String newName = spec.get("name");
+                            if (newName == null || newName.isEmpty() || newName.equals(currentName)) continue;
+
+                            // Validate Hungarian prefix against actual type
+                            String actualType = symbol.getDataType().getName();
+                            String hungarianWarning = NamingConventions.validateHungarianPrefix(newName, actualType);
+                            if (hungarianWarning != null) {
+                                warnings.add(hungarianWarning);
+                            }
+
+                            try {
+                                HighFunctionDBUtil.updateDBVariable(symbol, newName, null, SourceType.USER_DEFINED);
+                                namesSet.incrementAndGet();
+                                renamedHere.add(currentName);
+                            } catch (Exception e) {
+                                errors.add("Failed to rename " + currentName + " -> " + newName + ": " + e.getMessage());
+                                failed.incrementAndGet();
+                            }
+                        }
+
+                        // Phase 3b: Storage-based fallback. Stack-frame-only variables
+                        // (local_4, local_148, etc.) are not promoted to HighSymbol
+                        // form — they live only in func.getAllVariables(). Without
+                        // this fallback, a worker calling set_variables with
+                        // {local_4: {name: nStackDepth, ...}} sees types_set++ but
+                        // names_set silently stays at zero, then fails subsequent
+                        // calls with "Variable not found: nStackDepth".
                         try {
-                            HighFunctionDBUtil.updateDBVariable(symbol, newName, null, SourceType.USER_DEFINED);
-                            namesSet.incrementAndGet();
+                            for (Variable lowVar : func.getAllVariables()) {
+                                String oldName = lowVar.getName();
+                                if (renamedHere.contains(oldName)) continue;
+                                Map<String, String> spec = variables.get(oldName);
+                                if (spec == null || !spec.containsKey("name")) continue;
+                                String newName = spec.get("name");
+                                if (newName == null || newName.isEmpty() || newName.equals(oldName)) continue;
+                                try {
+                                    lowVar.setName(newName, SourceType.USER_DEFINED);
+                                    namesSet.incrementAndGet();
+                                    renamedHere.add(oldName);
+                                } catch (Exception e) {
+                                    errors.add("Failed to rename storage variable " + oldName + " -> " + newName + ": " + e.getMessage());
+                                    failed.incrementAndGet();
+                                }
+                            }
                         } catch (Exception e) {
-                            errors.add("Failed to rename " + currentName + " -> " + newName + ": " + e.getMessage());
-                            failed.incrementAndGet();
+                            Msg.warn(this, "set_variables storage-rename fallback encountered error: " + e.getMessage());
+                        }
+
+                        // Phase 3c: Caller-visibility — surface any rename specs
+                        // that matched neither path so workers can tell at a
+                        // glance that part of their request didn't apply.
+                        for (Map.Entry<String, Map<String, String>> e : variables.entrySet()) {
+                            String oldName = e.getKey();
+                            Map<String, String> spec = e.getValue();
+                            if (!spec.containsKey("name")) continue;
+                            String requestedNew = spec.get("name");
+                            if (requestedNew == null || requestedNew.isEmpty() || requestedNew.equals(oldName)) continue;
+                            if (!renamedHere.contains(oldName)) {
+                                errors.add("Rename spec for '" + oldName + "' matched no high-level or storage variable; "
+                                        + "name unchanged. Re-fetch with get_function_variables before retrying.");
+                                failed.incrementAndGet();
+                            }
+                        }
+                    } finally {
+                        if (decomp != null) {
+                            try { decomp.dispose(); } catch (Exception ignored) {}
                         }
                     }
-
-                    decomp.dispose();
                 } catch (Exception e) {
                     errorRef.set(e.getMessage());
                 } finally {
@@ -3705,5 +3933,485 @@ public class FunctionService {
 
     public Response validateBatchOperationResults(String functionAddress, Map<String, String> expectedRenames, Map<String, String> expectedTypes) {
         return validateBatchOperationResults(functionAddress, expectedRenames, expectedTypes, null);
+    }
+
+    // ========================================================================
+    // Function tag methods
+    //
+    // Thin wrappers over Ghidra's FunctionTagManager / Function.addTag / removeTag.
+    // Tags are program-wide definitions (name + optional comment) that can be
+    // attached to any Function. Adding a tag by name to a Function auto-creates
+    // the tag definition if it does not already exist.
+    // ========================================================================
+
+    private static Map<String, Object> serializeTag(FunctionTag tag, Integer useCount) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", tag.getId());
+        m.put("name", tag.getName());
+        String comment = tag.getComment();
+        m.put("comment", comment != null ? comment : "");
+        if (useCount != null) m.put("use_count", useCount);
+        return m;
+    }
+
+    private static List<String> splitTagList(String raw) {
+        List<String> out = new ArrayList<>();
+        if (raw == null) return out;
+        for (String part : raw.split(",")) {
+            String t = part.trim();
+            if (!t.isEmpty()) out.add(t);
+        }
+        return out;
+    }
+
+    @McpTool(path = "/get_function_tags", description = "List all tags assigned to a specific function. Accepts either a function address or a function name.", category = "function")
+    public Response getFunctionTags(
+            @Param(value = "function", paramType = "address",
+                   description = "Function address (0x<hex> or <space>:<hex>) or function name") String functionRef,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (functionRef == null || functionRef.isEmpty()) {
+            return Response.err("function (address or name) is required");
+        }
+        Function func = ServiceUtils.resolveFunction(program, functionRef);
+        if (func == null) return Response.err("No function found for " + functionRef);
+
+        List<Map<String, Object>> tags = new ArrayList<>();
+        for (FunctionTag tag : func.getTags()) {
+            tags.add(serializeTag(tag, null));
+        }
+        tags.sort(Comparator.comparing(m -> ((String) m.get("name"))));
+        return Response.ok(JsonHelper.mapOf(
+                "function", func.getName(),
+                "address", func.getEntryPoint().toString(),
+                "tag_count", tags.size(),
+                "tags", tags));
+    }
+
+    @McpTool(path = "/add_function_tag", method = "POST",
+             description = "Attach one or more tags to a function. Tags are comma-separated and will be auto-created if they do not already exist.",
+             category = "function")
+    public Response addFunctionTag(
+            @Param(value = "function", source = ParamSource.BODY, paramType = "address",
+                   description = "Function address or function name") String functionRef,
+            @Param(value = "tags", source = ParamSource.BODY,
+                   description = "Comma-separated tag names to attach (e.g. \"syscall,lpe-surface\")") String tagsCsv,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (functionRef == null || functionRef.isEmpty()) return Response.err("function is required");
+        List<String> tagNames = splitTagList(tagsCsv);
+        if (tagNames.isEmpty()) return Response.err("tags is required (comma-separated list)");
+
+        Function func = ServiceUtils.resolveFunction(program, functionRef);
+        if (func == null) return Response.err("No function found for " + functionRef);
+
+        List<String> added = new ArrayList<>();
+        List<String> alreadyPresent = new ArrayList<>();
+        try {
+            threadingStrategy.executeWrite(program, "Add function tags via HTTP", () -> {
+                for (String name : tagNames) {
+                    if (func.addTag(name)) {
+                        added.add(name);
+                    } else {
+                        alreadyPresent.add(name);
+                    }
+                }
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Failed to add function tag(s)", e);
+            return Response.err("Failed to add tag(s): " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "function", func.getName(),
+                "address", func.getEntryPoint().toString(),
+                "added", added,
+                "already_present", alreadyPresent));
+    }
+
+    @McpTool(path = "/remove_function_tag", method = "POST",
+             description = "Detach one or more tags from a function. Does not delete the program-wide tag definition — use delete_function_tag for that.",
+             category = "function")
+    public Response removeFunctionTag(
+            @Param(value = "function", source = ParamSource.BODY, paramType = "address",
+                   description = "Function address or function name") String functionRef,
+            @Param(value = "tags", source = ParamSource.BODY,
+                   description = "Comma-separated tag names to detach") String tagsCsv,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (functionRef == null || functionRef.isEmpty()) return Response.err("function is required");
+        List<String> tagNames = splitTagList(tagsCsv);
+        if (tagNames.isEmpty()) return Response.err("tags is required (comma-separated list)");
+
+        Function func = ServiceUtils.resolveFunction(program, functionRef);
+        if (func == null) return Response.err("No function found for " + functionRef);
+
+        Set<String> currentBefore = new HashSet<>();
+        for (FunctionTag t : func.getTags()) currentBefore.add(t.getName());
+
+        List<String> removed = new ArrayList<>();
+        List<String> notPresent = new ArrayList<>();
+        try {
+            threadingStrategy.executeWrite(program, "Remove function tags via HTTP", () -> {
+                for (String name : tagNames) {
+                    if (currentBefore.contains(name)) {
+                        func.removeTag(name);
+                        removed.add(name);
+                    } else {
+                        notPresent.add(name);
+                    }
+                }
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Failed to remove function tag(s)", e);
+            return Response.err("Failed to remove tag(s): " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "function", func.getName(),
+                "address", func.getEntryPoint().toString(),
+                "removed", removed,
+                "not_present", notPresent));
+    }
+
+    @McpTool(path = "/list_function_tags",
+             description = "List all program-wide function tag definitions with their use counts.",
+             category = "function")
+    public Response listFunctionTags(
+            @Param(value = "offset", defaultValue = "0") int offset,
+            @Param(value = "limit", defaultValue = "500",
+                   description = "Maximum number of tags to return (default 500, which covers most programs in full)") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        FunctionTagManager mgr = program.getFunctionManager().getFunctionTagManager();
+        List<? extends FunctionTag> all = mgr.getAllFunctionTags();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (FunctionTag tag : all) {
+            rows.add(serializeTag(tag, mgr.getUseCount(tag)));
+        }
+        rows.sort(Comparator.comparing(m -> ((String) m.get("name"))));
+
+        int total = rows.size();
+        int from = Math.max(0, offset);
+        int to = Math.min(total, from + Math.max(0, limit));
+        List<Map<String, Object>> page = from < to ? rows.subList(from, to) : List.of();
+        return Response.ok(JsonHelper.mapOf(
+                "total", total,
+                "offset", from,
+                "limit", limit,
+                "tags", page));
+    }
+
+    @McpTool(path = "/create_function_tag", method = "POST",
+             description = "Create a program-wide function tag definition with an optional comment. Use add_function_tag to attach it to functions.",
+             category = "function")
+    public Response createFunctionTag(
+            @Param(value = "name", source = ParamSource.BODY,
+                   description = "Tag name (case-sensitive; Ghidra treats whitespace-trimmed names as unique)") String name,
+            @Param(value = "comment", source = ParamSource.BODY, defaultValue = "",
+                   description = "Optional description for the tag") String comment,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (name == null || name.trim().isEmpty()) return Response.err("name is required");
+        final String tagName = name.trim();
+        final String tagComment = comment != null ? comment : "";
+
+        FunctionTagManager mgr = program.getFunctionManager().getFunctionTagManager();
+
+        AtomicReference<FunctionTag> created = new AtomicReference<>();
+        AtomicReference<String> conflict = new AtomicReference<>();
+        try {
+            threadingStrategy.executeWrite(program, "Create function tag via HTTP", () -> {
+                if (mgr.getFunctionTag(tagName) != null) {
+                    conflict.set(tagName);
+                    return null;
+                }
+                created.set(mgr.createFunctionTag(tagName, tagComment));
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Failed to create function tag", e);
+            return Response.err("Failed to create tag: " + e.getMessage());
+        }
+        if (conflict.get() != null) return Response.err("Tag already exists: " + conflict.get());
+        FunctionTag tag = created.get();
+        if (tag == null) return Response.err("createFunctionTag returned null");
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "tag", serializeTag(tag, 0)));
+    }
+
+    @McpTool(path = "/delete_function_tag", method = "POST",
+             description = "Delete a program-wide function tag definition. This detaches the tag from every function that had it.",
+             category = "function")
+    public Response deleteFunctionTag(
+            @Param(value = "name", source = ParamSource.BODY,
+                   description = "Tag name to delete program-wide") String name,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (name == null || name.isEmpty()) return Response.err("name is required");
+
+        FunctionTagManager mgr = program.getFunctionManager().getFunctionTagManager();
+        FunctionTag tag = mgr.getFunctionTag(name);
+        if (tag == null) return Response.err("Tag not found: " + name);
+
+        final int useCount = mgr.getUseCount(tag);
+        try {
+            threadingStrategy.executeWrite(program, "Delete function tag via HTTP", () -> {
+                tag.delete();
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Failed to delete function tag", e);
+            return Response.err("Failed to delete tag: " + e.getMessage());
+        }
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "name", name,
+                "detached_from_functions", useCount));
+    }
+
+    @McpTool(path = "/set_function_tag_comment", method = "POST",
+             description = "Update the comment/description on an existing program-wide function tag.",
+             category = "function")
+    public Response setFunctionTagComment(
+            @Param(value = "name", source = ParamSource.BODY,
+                   description = "Tag name") String name,
+            @Param(value = "comment", source = ParamSource.BODY,
+                   description = "New comment text (pass an empty string to clear)") String comment,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (name == null || name.isEmpty()) return Response.err("name is required");
+
+        FunctionTagManager mgr = program.getFunctionManager().getFunctionTagManager();
+        FunctionTag tag = mgr.getFunctionTag(name);
+        if (tag == null) return Response.err("Tag not found: " + name);
+
+        final String newComment = comment != null ? comment : "";
+        try {
+            threadingStrategy.executeWrite(program, "Update function tag comment via HTTP", () -> {
+                tag.setComment(newComment);
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Failed to update tag comment", e);
+            return Response.err("Failed to update comment: " + e.getMessage());
+        }
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "tag", serializeTag(tag, mgr.getUseCount(tag))));
+    }
+
+    @McpTool(path = "/search_functions_by_tag",
+             description = "List all functions that have a specified tag attached. Returns name + entry address.",
+             category = "function")
+    public Response searchFunctionsByTag(
+            @Param(value = "tag", description = "Tag name to search for") String tagName,
+            @Param(value = "offset", defaultValue = "0") int offset,
+            @Param(value = "limit", defaultValue = "1000") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (tagName == null || tagName.isEmpty()) return Response.err("tag is required");
+
+        FunctionTagManager mgr = program.getFunctionManager().getFunctionTagManager();
+        if (mgr.getFunctionTag(tagName) == null) {
+            return Response.err("Tag not found: " + tagName);
+        }
+
+        List<Map<String, Object>> matches = new ArrayList<>();
+        for (Function func : program.getFunctionManager().getFunctions(true)) {
+            for (FunctionTag t : func.getTags()) {
+                if (t.getName().equals(tagName)) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("name", func.getName());
+                    row.put("address", func.getEntryPoint().toString());
+                    matches.add(row);
+                    break;
+                }
+            }
+        }
+        matches.sort(Comparator.comparing(m -> ((String) m.get("address"))));
+        int total = matches.size();
+        int from = Math.max(0, offset);
+        int to = Math.min(total, from + Math.max(0, limit));
+        List<Map<String, Object>> page = from < to ? matches.subList(from, to) : List.of();
+        return Response.ok(JsonHelper.mapOf(
+                "tag", tagName,
+                "total", total,
+                "offset", from,
+                "limit", limit,
+                "functions", page));
+    }
+
+    @McpTool(path = "/batch_add_function_tags", method = "POST",
+             description = "Attach tags to many functions in one transaction. Body: [{\"function\":\"0x140200ae6\",\"tags\":\"syscall,lpe-surface\"}, ...]. Tags auto-create.",
+             category = "function")
+    public Response batchAddFunctionTags(
+            @Param(value = "assignments", source = ParamSource.BODY,
+                   description = "Array of {function, tags} objects. `function` may be an address or name; `tags` is a comma-separated list.") List<Map<String, String>> assignments,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (assignments == null || assignments.isEmpty()) return Response.err("assignments is required (non-empty array)");
+
+        List<Map<String, Object>> results = new ArrayList<>();
+        AtomicInteger tagsAdded = new AtomicInteger(0);
+        AtomicInteger funcsTouched = new AtomicInteger(0);
+        try {
+            threadingStrategy.executeWrite(program, "Batch add function tags via HTTP", () -> {
+                for (Map<String, String> entry : assignments) {
+                    String ref = entry.get("function");
+                    String tagsCsv = entry.get("tags");
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("function", ref);
+                    if (ref == null || ref.isEmpty()) {
+                        row.put("status", "error");
+                        row.put("error", "missing function field");
+                        results.add(row);
+                        continue;
+                    }
+                    Function func = ServiceUtils.resolveFunction(program, ref);
+                    if (func == null) {
+                        row.put("status", "error");
+                        row.put("error", "function not found");
+                        results.add(row);
+                        continue;
+                    }
+                    List<String> names = splitTagList(tagsCsv);
+                    if (names.isEmpty()) {
+                        row.put("status", "error");
+                        row.put("error", "missing/empty tags field");
+                        results.add(row);
+                        continue;
+                    }
+                    List<String> added = new ArrayList<>();
+                    List<String> already = new ArrayList<>();
+                    for (String n : names) {
+                        if (func.addTag(n)) added.add(n);
+                        else already.add(n);
+                    }
+                    tagsAdded.addAndGet(added.size());
+                    if (!added.isEmpty()) funcsTouched.incrementAndGet();
+                    row.put("status", "success");
+                    row.put("address", func.getEntryPoint().toString());
+                    row.put("added", added);
+                    row.put("already_present", already);
+                    results.add(row);
+                }
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Batch add function tags failed", e);
+            return Response.err("Batch failed: " + e.getMessage());
+        }
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "functions_touched", funcsTouched.get(),
+                "tags_added", tagsAdded.get(),
+                "results", results));
+    }
+
+    @McpTool(path = "/batch_remove_function_tags", method = "POST",
+             description = "Detach tags from many functions in one transaction. Body shape matches /batch_add_function_tags.",
+             category = "function")
+    public Response batchRemoveFunctionTags(
+            @Param(value = "assignments", source = ParamSource.BODY,
+                   description = "Array of {function, tags} objects.") List<Map<String, String>> assignments,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        if (assignments == null || assignments.isEmpty()) return Response.err("assignments is required (non-empty array)");
+
+        List<Map<String, Object>> results = new ArrayList<>();
+        AtomicInteger tagsRemoved = new AtomicInteger(0);
+        AtomicInteger funcsTouched = new AtomicInteger(0);
+        try {
+            threadingStrategy.executeWrite(program, "Batch remove function tags via HTTP", () -> {
+                for (Map<String, String> entry : assignments) {
+                    String ref = entry.get("function");
+                    String tagsCsv = entry.get("tags");
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("function", ref);
+                    if (ref == null || ref.isEmpty()) {
+                        row.put("status", "error");
+                        row.put("error", "missing function field");
+                        results.add(row);
+                        continue;
+                    }
+                    Function func = ServiceUtils.resolveFunction(program, ref);
+                    if (func == null) {
+                        row.put("status", "error");
+                        row.put("error", "function not found");
+                        results.add(row);
+                        continue;
+                    }
+                    List<String> names = splitTagList(tagsCsv);
+                    if (names.isEmpty()) {
+                        row.put("status", "error");
+                        row.put("error", "missing/empty tags field");
+                        results.add(row);
+                        continue;
+                    }
+                    Set<String> have = new HashSet<>();
+                    for (FunctionTag t : func.getTags()) have.add(t.getName());
+                    List<String> removed = new ArrayList<>();
+                    List<String> notPresent = new ArrayList<>();
+                    for (String n : names) {
+                        if (have.contains(n)) {
+                            func.removeTag(n);
+                            removed.add(n);
+                        } else {
+                            notPresent.add(n);
+                        }
+                    }
+                    tagsRemoved.addAndGet(removed.size());
+                    if (!removed.isEmpty()) funcsTouched.incrementAndGet();
+                    row.put("status", "success");
+                    row.put("address", func.getEntryPoint().toString());
+                    row.put("removed", removed);
+                    row.put("not_present", notPresent);
+                    results.add(row);
+                }
+                return null;
+            });
+            program.flushEvents();
+        } catch (Exception e) {
+            Msg.error(this, "Batch remove function tags failed", e);
+            return Response.err("Batch failed: " + e.getMessage());
+        }
+        return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "functions_touched", funcsTouched.get(),
+                "tags_removed", tagsRemoved.get(),
+                "results", results));
     }
 }

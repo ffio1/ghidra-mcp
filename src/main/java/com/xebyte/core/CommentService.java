@@ -245,7 +245,8 @@ public class CommentService {
                                + "address is unambiguous.") String functionAddress,
             @Param(value = "decompiler_comments", source = ParamSource.BODY, defaultValue = "[]") List<Map<String, String>> decompilerComments,
             @Param(value = "disassembly_comments", source = ParamSource.BODY, defaultValue = "[]") List<Map<String, String>> disassemblyComments,
-            @Param(value = "plate_comment", source = ParamSource.BODY, description = "Plate comment text. Omit to leave existing plate untouched. Pass empty string to explicitly clear.") String plateComment,
+            @Param(value = "plate_comment", source = ParamSource.BODY, defaultValue = "null",
+                   description = "Plate comment text. Omit to leave existing plate untouched. Pass empty string to explicitly clear.") String plateComment,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -260,6 +261,38 @@ public class CommentService {
             funcAddr = null;
         }
 
+        // Pre-flight plate-quality gate (option B enforcement). When the
+        // target address is a data global (defined data, no function),
+        // applying a sub-quality plate via batch_set_comments would have
+        // been an escape hatch around set_global's upfront validator. Run
+        // the same check that set_global runs so a single-tool plate write
+        // can't ship a 1-word summary into a global. Function-target plate
+        // comments retain the existing (warning-only) flow because
+        // function plates have their own structural rules in
+        // validatePlateCommentStructure called below.
+        if (funcAddr != null
+                && plateComment != null
+                && !plateComment.equals("null")
+                && !plateComment.isEmpty()) {
+            Function preFunc = program.getFunctionManager().getFunctionAt(funcAddr);
+            if (preFunc == null) {
+                Data preData = program.getListing().getDefinedDataAt(funcAddr);
+                if (preData != null) {
+                    String[] plateIssue = NamingConventions.checkGlobalPlateComment(plateComment);
+                    if (plateIssue != null) {
+                        return Response.ok(JsonHelper.mapOf(
+                                "status", "rejected",
+                                "error", plateIssue[0],
+                                "address", functionAddress,
+                                "first_line", plateIssue[1],
+                                "message", "Plate-comment first line must be a >=4-word summary describing what the global represents.",
+                                "suggestion", "Replace with a one-liner like 'Bitmap of currently-active quests for the player' or 'Pointer to the head of the linked unit list.'"
+                        ));
+                    }
+                }
+            }
+        }
+
         final AtomicBoolean success = new AtomicBoolean(false);
         final AtomicReference<String> errorMsg = new AtomicReference<>();
         final AtomicInteger decompilerCount = new AtomicInteger(0);
@@ -272,6 +305,12 @@ public class CommentService {
                 int tx = program.startTransaction("Batch Set Comments");
                 try {
                     // Set or clear plate comment (v3.0.1: null=skip, ""=clear, non-empty=set)
+                    // - Function target → use Function.setComment (existing behavior).
+                    // - Data-global target → use Listing.setComment(addr, PLATE_COMMENT, …).
+                    //   Without this, plate writes on data addresses silently no-op'd
+                    //   (returning success with `plate_comment_set: false`), which is
+                    //   exactly what made the globals worker think it had set a plate
+                    //   when nothing actually landed.
                     if (plateComment != null && !plateComment.equals("null") && funcAddr != null) {
                         Function func = program.getFunctionManager().getFunctionAt(funcAddr);
                         if (func != null) {
@@ -280,6 +319,29 @@ public class CommentService {
                                 overwrittenCount.incrementAndGet();
                             }
                             func.setComment(plateComment.isEmpty() ? null : plateComment);
+                            plateSet.set(true);
+                        } else {
+                            // Data-global path. Previously gated on
+                            // `getDefinedDataAt(funcAddr) != null` which
+                            // silently skipped the plate write when the
+                            // address had no defined data yet (the most
+                            // common pre-documentation state — symbol
+                            // exists but type hasn't been applied). The
+                            // caller would see `plate_comment_set: false`
+                            // hidden inside an overall success response.
+                            // Listing.setComment works on any in-memory
+                            // address regardless of defined-data status,
+                            // so the gate was never necessary.
+                            Listing dataListing = program.getListing();
+                            String existingPlate = dataListing.getComment(
+                                    CodeUnit.PLATE_COMMENT, funcAddr);
+                            if (existingPlate != null && !existingPlate.isEmpty()) {
+                                overwrittenCount.incrementAndGet();
+                            }
+                            dataListing.setComment(
+                                    funcAddr,
+                                    CodeUnit.PLATE_COMMENT,
+                                    plateComment.isEmpty() ? null : plateComment);
                             plateSet.set(true);
                         }
                     }

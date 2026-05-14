@@ -25,6 +25,7 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.CodeViewerService;
+import ghidra.app.services.DebuggerTraceManagerService;
 import ghidra.app.services.GoToService;
 
 import ghidra.app.script.GhidraScriptUtil;
@@ -41,6 +42,7 @@ import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.util.ProgramLocation;
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
+import ghidra.trace.model.Trace;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
@@ -64,6 +66,7 @@ import com.xebyte.core.AnnotationScanner;
 import com.xebyte.core.EndpointDef;
 import com.xebyte.core.FrontEndProgramProvider;
 import com.xebyte.core.JsonHelper;
+import com.xebyte.core.NamingPolicy;
 import com.xebyte.core.ServerManager;
 
 import ghidra.framework.main.ApplicationLevelPlugin;
@@ -92,6 +95,7 @@ import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -99,12 +103,12 @@ import java.util.regex.Pattern;
 
 // Load version from properties file (populated by Maven during build)
 class VersionInfo {
-    private static String VERSION = "5.4.1"; // Default fallback
+    private static String VERSION = "5.9.0"; // Default fallback
     private static String APP_NAME = "GhidraMCP";
     private static String GHIDRA_VERSION = "unknown"; // Loaded from version.properties (Maven-filtered)
     private static String BUILD_TIMESTAMP = "dev"; // Will be replaced by Maven
     private static String BUILD_NUMBER = "0"; // Will be replaced by Maven
-    private static final int ENDPOINT_COUNT = 175;
+    private static final int ENDPOINT_COUNT = 177;
 
     static {
         // v5.4.2: loading "/version.properties" from the classpath root was
@@ -163,7 +167,7 @@ class VersionInfo {
     category = PluginCategoryNames.COMMON,
     shortDescription = "GhidraMCP - HTTP server plugin",
     description = "GhidraMCP - Starts an embedded HTTP server to expose program data via REST API and MCP bridge. " +
-                  "Provides 165 endpoints for reverse engineering automation. " +
+                  "Provides 177 endpoints for reverse engineering automation. " +
                   "Port configurable via Tool Options. " +
                   "Features: function analysis, decompilation, symbol management, cross-references, label operations, " +
                   "high-performance batch data analysis, field-level structure analysis, advanced call graph analysis, " +
@@ -184,8 +188,25 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     private static final int DEFAULT_PORT = 8089;
     private static final String UDS_ENABLED_OPTION = "Enable UDS Transport";
     private static final String TCP_ENABLED_OPTION = "Enable TCP Transport";
-    private static final boolean DEFAULT_UDS_ENABLED = !System.getProperty("os.name", "").toLowerCase().contains("win");
-    private static final boolean DEFAULT_TCP_ENABLED = System.getProperty("os.name", "").toLowerCase().contains("win");
+    private static final String STRICT_NAMING_ENFORCEMENT_OPTION = "Strict Naming Enforcement";
+    private static final String LEGACY_STRICT_FUNCTION_NAMES_OPTION = "Strict Function Name Enforcement";
+    // Both transports default ON. UDS gives per-PID socket files so multi-
+    // instance setups don't race for the same TCP port (issue #175 primary
+    // fix). TCP stays on by default because many users have HTTP-only
+    // tooling pointed at 127.0.0.1:8089 (the release deploy/smoke test
+    // itself uses it). When 8089 is in use, the port-range fallback below
+    // walks 8089..8089+TCP_PORT_FALLBACK_RANGE-1 and surfaces the actual
+    // bound port via /mcp/instance_info → tcp_port for bridge discovery.
+    //
+    // Users who want UDS-only (no TCP listener at all) can disable TCP via
+    // Tool Options → GhidraMCP HTTP Server → "Enable TCP Transport".
+    private static final boolean DEFAULT_UDS_ENABLED = true;
+    private static final boolean DEFAULT_TCP_ENABLED = true;
+    // Maximum TCP port-range fallback. If the configured port is in use, the
+    // plugin tries port..port+TCP_PORT_FALLBACK_RANGE-1 and uses the first
+    // that binds. Surfaces the actual port via /mcp/instance_info so the
+    // bridge can discover it without hard-coding 8089.
+    private static final int TCP_PORT_FALLBACK_RANGE = 16;
 
     // Field analysis constants (v1.4.0)
     private static final int MAX_FUNCTIONS_TO_ANALYZE = 100;
@@ -235,6 +256,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     private final com.xebyte.core.ProgramScriptService programScriptService;
     private final com.xebyte.core.EmulationService emulationService;
     private final com.xebyte.core.DebuggerService debuggerService;
+    private final com.xebyte.core.PromptPolicyService promptPolicyService;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -256,17 +278,25 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         this.programScriptService = new com.xebyte.core.ProgramScriptService(programProvider, threadingStrategy);
         this.emulationService = new com.xebyte.core.EmulationService(programProvider, threadingStrategy);
         this.debuggerService = new com.xebyte.core.DebuggerService(programProvider, threadingStrategy, tool);
+        this.promptPolicyService = new com.xebyte.core.PromptPolicyService();
         Msg.info(this, "============================================");
         Msg.info(this, "GhidraMCP " + VersionInfo.getFullVersion());
         Msg.info(this, "Endpoints: " + VersionInfo.getEndpointCount());
         Msg.info(this, "============================================");
 
-        // Server authenticator: GhidraMCPAuthInitializer (ModuleInitializer) handles
-        // early registration from GHIDRA_SERVER_PASSWORD env var — runs before project opens.
-        // The /server/authenticate endpoint handles runtime credential updates.
+        // Server authenticator: ensure credentials are registered before any project opens.
+        // GhidraMCPAuthInitializer implements ModuleInitializer, but that ExtensionPoint
+        // is only reliable for Ghidra's own built-in modules — user extensions may not be
+        // discovered by ClassSearcher in time. Call run() explicitly here as a guaranteed
+        // fallback; it has an idempotency guard so double-invocation is safe.
+        if (!com.xebyte.core.GhidraMCPAuthInitializer.isRegistered()) {
+            new com.xebyte.core.GhidraMCPAuthInitializer().run();
+        }
         if (com.xebyte.core.GhidraMCPAuthInitializer.isRegistered()) {
             this.authenticator = com.xebyte.core.GhidraMCPAuthInitializer.getAuthenticator();
-            Msg.info(this, "GhidraMCP: Server authenticator was registered at startup");
+            Msg.info(this, "GhidraMCP: Server authenticator registered — auto-login active");
+        } else {
+            Msg.info(this, "GhidraMCP: No server credentials configured — GUI auth will be used");
         }
 
         // Register configuration options
@@ -279,6 +309,15 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
             "Enable Unix Domain Socket transport for local multi-instance support.");
         options.registerOption(TCP_ENABLED_OPTION, DEFAULT_TCP_ENABLED, null,
             "Enable TCP transport for remote/network access.");
+        options.registerOption(STRICT_NAMING_ENFORCEMENT_OPTION,
+            NamingPolicy.defaultStrictNamingEnforcement(), null,
+            "Reject function/global names that fail the built-in name-quality checks " +
+            "on rename_function_by_address, rename_data, rename_global_variable, " +
+            "set_global, and related write guards. Disable when your naming convention " +
+            "does not match the built-in heuristic; convention warnings are still returned. " +
+            "Takes effect when the MCP server starts or restarts.");
+        migrateLegacyNamingOption(options);
+        refreshNamingPolicyFromOptions();
 
         boolean udsEnabled = options.getBoolean(UDS_ENABLED_OPTION, DEFAULT_UDS_ENABLED);
         boolean tcpEnabled = options.getBoolean(TCP_ENABLED_OPTION, DEFAULT_TCP_ENABLED);
@@ -303,11 +342,20 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 try {
                     startServer();
                     ownsServer = true;
-                    int port = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
+                    // Surface the ACTUAL bound port (may differ from the
+                    // configured port when port-range fallback fired -- see
+                    // Copilot review on #175). Falls back to configured port
+                    // if for some reason the bound-port wasn't recorded.
+                    int actualPort = ServerManager.getInstance().getBoundTcpPort();
+                    int configuredPort = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
+                    int displayedPort = actualPort > 0 ? actualPort : configuredPort;
+                    String portStr = displayedPort == configuredPort
+                        ? String.valueOf(displayedPort)
+                        : (displayedPort + " (fallback; configured " + configuredPort + " was in use)");
                     if (!tcpEnabled) {
-                        Msg.warn(this, "GhidraMCP: Both transports disabled or UDS failed — started TCP on port " + port + " as safety net.");
+                        Msg.warn(this, "GhidraMCP: UDS failed or disabled — started TCP on port " + portStr + " as safety net.");
                     } else {
-                        Msg.info(this, "GhidraMCP TCP server active on port " + port);
+                        Msg.info(this, "GhidraMCP TCP server active on port " + portStr);
                     }
                 } catch (IOException e) {
                     Msg.error(this, "Failed to start TCP server: " + e.getMessage(), e);
@@ -328,6 +376,27 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         return server != null;
     }
 
+    private void refreshNamingPolicyFromOptions() {
+        Options options = tool.getOptions(OPTION_CATEGORY_NAME);
+        boolean strict = options.getBoolean(STRICT_NAMING_ENFORCEMENT_OPTION,
+            NamingPolicy.defaultStrictNamingEnforcement());
+        NamingPolicy.getInstance().setStrictNamingEnforcement(strict, "tool_options");
+        Msg.info(this, "GhidraMCP strict naming enforcement: " + strict);
+    }
+
+    private void migrateLegacyNamingOption(Options options) {
+        if (!options.contains(LEGACY_STRICT_FUNCTION_NAMES_OPTION)
+                || !options.isDefaultValue(STRICT_NAMING_ENFORCEMENT_OPTION)) {
+            return;
+        }
+
+        boolean legacyStrict = options.getBoolean(LEGACY_STRICT_FUNCTION_NAMES_OPTION,
+                NamingPolicy.defaultStrictNamingEnforcement());
+        options.setBoolean(STRICT_NAMING_ENFORCEMENT_OPTION, legacyStrict);
+        options.removeOption(LEGACY_STRICT_FUNCTION_NAMES_OPTION);
+        Msg.info(this, "Migrated GhidraMCP naming enforcement option from legacy function-name setting");
+    }
+
     private void stopServer() {
         if (server != null) {
             Msg.info(this, "Stopping GhidraMCP HTTP server...");
@@ -338,6 +407,10 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 Thread.currentThread().interrupt();
             }
             server = null;
+            // Clear the advertised TCP port so /mcp/instance_info doesn't
+            // report a stale port after the listener stops (Copilot #196
+            // review item).
+            ServerManager.getInstance().setBoundTcpPort(-1);
             Msg.info(this, "GhidraMCP HTTP server stopped.");
         }
     }
@@ -354,6 +427,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
             @Override
             public void actionPerformed(ActionContext context) {
                 Options opts = tool.getOptions(OPTION_CATEGORY_NAME);
+                refreshNamingPolicyFromOptions();
                 boolean uds = opts.getBoolean(UDS_ENABLED_OPTION, DEFAULT_UDS_ENABLED);
                 boolean tcp = opts.getBoolean(TCP_ENABLED_OPTION, DEFAULT_TCP_ENABLED);
                 StringBuilder started = new StringBuilder();
@@ -421,6 +495,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 String message = "GhidraMCP Server Status\n\n" +
                     "UDS: " + udsStatus + "\n" +
                     "TCP: " + tcpStatus + "\n" +
+                    "Strict naming enforcement: " + NamingPolicy.getInstance().isStrictNamingEnforcement() + "\n" +
                     "Version: " + VersionInfo.getFullVersion() + "\n" +
                     "Endpoints: " + VersionInfo.getEndpointCount();
                 Msg.showInfo(getClass(), null, "GhidraMCP", message);
@@ -439,6 +514,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     private void startServer() throws IOException {
         // Read the configured port
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
+        refreshNamingPolicyFromOptions();
         int port = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
 
         // Stop existing server if running (e.g., if plugin is reloaded)
@@ -453,22 +529,45 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 Msg.warn(this, "Interrupted while waiting for server to stop");
             }
             server = null;
+            // Reset bound-port advertisement before re-binding so a transient
+            // window between stop and bind doesn't expose the stale value.
+            ServerManager.getInstance().setBoundTcpPort(-1);
         }
 
-        // Create new server - if port is in use, try to handle gracefully
-        try {
-            server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
-            Msg.info(this, "HTTP server created successfully on 127.0.0.1:" + port);
-        } catch (java.net.BindException e) {
-            Msg.error(this, "Port " + port + " is already in use. " +
-                "Another instance may be running or port is not released yet. " +
-                "Please wait a few seconds and restart Ghidra, or change the port in Tool Options.");
-            throw e;
-        } catch (IllegalArgumentException e) {
-            Msg.error(this, "Cannot create HTTP server contexts - they may already exist. " +
-                "Please restart Ghidra completely. Error: " + e.getMessage());
-            throw new IOException("Server context creation failed", e);
+        // Create new server. If the configured port is in use (multiple
+        // Ghidra instances are the common case -- issue #175), scan the
+        // next TCP_PORT_FALLBACK_RANGE-1 ports and use the first that binds.
+        // The actual port is recorded via setBoundTcpPort so /mcp/instance_info
+        // can surface it to the bridge.
+        java.net.BindException lastBindException = null;
+        int boundPort = -1;
+        for (int candidate = port; candidate < port + TCP_PORT_FALLBACK_RANGE; candidate++) {
+            try {
+                server = HttpServer.create(new InetSocketAddress("127.0.0.1", candidate), 0);
+                boundPort = candidate;
+                if (candidate == port) {
+                    Msg.info(this, "HTTP server created successfully on 127.0.0.1:" + candidate);
+                } else {
+                    Msg.warn(this, "Port " + port + " was in use; HTTP server bound to fallback port "
+                        + candidate + " (range " + port + "-" + (port + TCP_PORT_FALLBACK_RANGE - 1)
+                        + "). The bridge discovers this port via /mcp/instance_info.");
+                }
+                break;
+            } catch (java.net.BindException e) {
+                lastBindException = e;
+            } catch (IllegalArgumentException e) {
+                Msg.error(this, "Cannot create HTTP server contexts - they may already exist. " +
+                    "Please restart Ghidra completely. Error: " + e.getMessage());
+                throw new IOException("Server context creation failed", e);
+            }
         }
+        if (server == null) {
+            Msg.error(this, "All ports in range " + port + "-" + (port + TCP_PORT_FALLBACK_RANGE - 1)
+                + " are in use. Either too many Ghidra instances are running, or another process "
+                + "is squatting on this range. Change Server Port in Tool Options to a free range.");
+            throw lastBindException;
+        }
+        ServerManager.getInstance().setBoundTcpPort(boundPort);
 
         // ==========================================================================
         // SHARED ENDPOINTS — Annotation-driven registration via AnnotationScanner
@@ -479,7 +578,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
             listingService, functionService, commentService, symbolLabelService,
             xrefCallGraphService, dataTypeService, analysisService,
             documentationHashService, malwareSecurityService, programScriptService,
-            emulationService, debuggerService);
+            emulationService, debuggerService, promptPolicyService);
 
         for (EndpointDef ep : scanner.getEndpoints()) {
             server.createContext(ep.path(), safeHandler(exchange -> {
@@ -503,6 +602,23 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         String schemaJson = scanner.generateSchema();
         server.createContext("/mcp/schema", safeHandler(exchange -> {
             sendResponse(exchange, schemaJson);
+        }));
+
+        // ==========================================================================
+        // INSTANCE INFO ENDPOINT (TCP mirror of the UDS endpoint)
+        // The UDS server exposes /mcp/instance_info for in-band discovery. We
+        // need the same endpoint on TCP so the bridge's port-range scanner
+        // (issue #175 + Copilot review) can identify which project lives on
+        // which port without already having to be connected. The body is the
+        // same JSON the UDS handler emits via ServerManager.
+        // ==========================================================================
+        server.createContext("/mcp/instance_info", safeHandler(exchange -> {
+            try {
+                String json = ServerManager.getInstance().buildInstanceInfoJson();
+                sendResponse(exchange, json);
+            } catch (Exception e) {
+                sendResponse(exchange, com.xebyte.core.Response.err(e.getMessage()).toJson());
+            }
         }));
 
         // ==========================================================================
@@ -646,15 +762,18 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
 
         server.createContext("/exit_ghidra", safeHandler(exchange -> {
             try {
-                // Save first, then exit
-                String saveResult = saveCurrentProgram(null);
-                sendResponse(exchange, "{\"success\": true, \"message\": \"Saving and exiting Ghidra\", \"save\": " + saveResult + "}");
+                promptPolicyService.enableFor("exit_ghidra", 30);
+                Map<String, Object> saveResult = saveEverythingBeforeExit();
+                sendResponse(exchange, JsonHelper.toJson(JsonHelper.mapOf(
+                    "success", true,
+                    "message", "Saving all open programs and traces, then exiting Ghidra",
+                    "save", saveResult
+                )));
                 // Schedule exit after response is sent
                 new Thread(() -> {
                     try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                     SwingUtilities.invokeLater(() -> {
-                        PluginTool t = getTool();
-                        if (t != null) t.close();
+                        closeGhidraWithoutSavingToolLayouts();
                     });
                 }).start();
             } catch (Throwable e) {
@@ -1728,6 +1847,113 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         return programScriptService.saveCurrentProgram(programName).toJson();
     }
 
+    private Map<String, Object> saveEverythingBeforeExit() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("programs", JsonHelper.parseJson(programScriptService.saveAllOpenPrograms().toJson()));
+        result.put("traces", saveAllOpenDebuggerTraces());
+        return result;
+    }
+
+    private void closeGhidraWithoutSavingToolLayouts() {
+        PluginTool currentTool = getTool();
+        if (currentTool == null) {
+            return;
+        }
+
+        Set<PluginTool> tools = Collections.newSetFromMap(new IdentityHashMap<>());
+        tools.add(currentTool);
+        try {
+            Project project = currentTool.getProject();
+            if (project != null && project.getToolManager() != null) {
+                for (PluginTool runningTool : project.getToolManager().getRunningTools()) {
+                    if (runningTool != null) {
+                        tools.add(runningTool);
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            Msg.warn(this, "Unable to enumerate running tools before exit: " + e.getMessage());
+        }
+
+        for (PluginTool tool : tools) {
+            try {
+                tool.setConfigChanged(false);
+            } catch (Throwable e) {
+                Msg.warn(this, "Unable to clear tool layout change flag: " + e.getMessage());
+            }
+        }
+
+        currentTool.close();
+    }
+
+    private Map<String, Object> saveAllOpenDebuggerTraces() {
+        List<Map<String, Object>> saved = new ArrayList<>();
+        List<Map<String, Object>> errors = new ArrayList<>();
+        Set<Trace> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+
+        PluginTool currentTool = getTool();
+        if (currentTool == null || currentTool.getProject() == null) {
+            return JsonHelper.mapOf(
+                "success", true,
+                "saved_count", 0,
+                "traces", saved,
+                "errors", errors,
+                "message", "No project/tool available for trace save"
+            );
+        }
+
+        List<PluginTool> tools = new ArrayList<>();
+        tools.add(currentTool);
+        try {
+            ghidra.framework.model.ToolManager tm = currentTool.getProject().getToolManager();
+            if (tm != null) {
+                for (PluginTool runningTool : tm.getRunningTools()) {
+                    if (runningTool != null && !tools.contains(runningTool)) {
+                        tools.add(runningTool);
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            errors.add(JsonHelper.mapOf(
+                "error", "Unable to enumerate running tools: " +
+                    (e.getMessage() != null ? e.getMessage() : e.toString())
+            ));
+        }
+
+        for (PluginTool runningTool : tools) {
+            DebuggerTraceManagerService traceMgr = runningTool.getService(DebuggerTraceManagerService.class);
+            if (traceMgr == null) {
+                continue;
+            }
+            List<Trace> traces = new ArrayList<>(traceMgr.getOpenTraces());
+            for (Trace trace : traces) {
+                if (trace == null || !seen.add(trace)) {
+                    continue;
+                }
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("trace", trace.getName());
+                info.put("tool", runningTool.getName());
+                try {
+                    traceMgr.saveTrace(trace).get(30, TimeUnit.SECONDS);
+                    traceMgr.closeTraceNoConfirm(trace);
+                    saved.add(info);
+                } catch (Throwable e) {
+                    info.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+                    errors.add(info);
+                    Msg.error(this, "Error saving debugger trace " + trace.getName(), e);
+                }
+            }
+        }
+
+        return JsonHelper.mapOf(
+            "success", errors.isEmpty(),
+            "saved_count", saved.size(),
+            "traces", saved,
+            "errors", errors
+        );
+    }
+
     private String listOpenPrograms() {
         return programScriptService.listOpenPrograms().toJson();
     }
@@ -2592,7 +2818,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      */
     @SuppressWarnings("deprecation")
     private String getFunctionVariables(String functionName, String programName) {
-        return functionService.getFunctionVariables(functionName, programName, null, null).toJson();
+        return functionService.getFunctionVariables(functionName, null, programName, null, null).toJson();
     }
 
     // Backward compatibility overload
@@ -2999,9 +3225,10 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      * NEW v1.6.0: Enhanced function search with filtering and sorting
      */
     private String searchFunctionsEnhanced(String namePattern, Integer minXrefs, Integer maxXrefs,
-                                          String callingConvention, Boolean hasCustomName, boolean regex,
+                                          String callingConvention, Boolean hasCustomName,
+                                          Boolean isThunk, Boolean isExternal, boolean regex,
                                           String sortBy, int offset, int limit, String programName) {
-        return analysisService.searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, callingConvention, hasCustomName, regex, sortBy, offset, limit, programName).toJson();
+        return analysisService.searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, callingConvention, hasCustomName, isThunk, isExternal, regex, sortBy, offset, limit, programName).toJson();
     }
 
     /**

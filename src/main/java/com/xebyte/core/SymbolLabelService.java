@@ -389,7 +389,7 @@ public class SymbolLabelService {
                     @SuppressWarnings("unchecked")
                     java.util.Map<String, Object> okData = okResp.data() instanceof java.util.Map
                             ? (java.util.Map<String, Object>) okResp.data() : new java.util.LinkedHashMap<>();
-                    okData.put("warnings", conventions);
+                    appendWarnings(okData, conventions);
                     return Response.ok(okData);
                 }
                 return result;
@@ -401,7 +401,7 @@ public class SymbolLabelService {
                     @SuppressWarnings("unchecked")
                     java.util.Map<String, Object> okData = okResp.data() instanceof java.util.Map
                             ? (java.util.Map<String, Object>) okResp.data() : new java.util.LinkedHashMap<>();
-                    okData.put("warnings", conventions);
+                    appendWarnings(okData, conventions);
                     return Response.ok(okData);
                 }
                 return result;
@@ -618,6 +618,45 @@ public class SymbolLabelService {
         Address addr = ServiceUtils.parseAddress(program, addressStr);
         if (addr == null) return Response.err(ServiceUtils.getLastParseError());
 
+        // Q3/Q4 validator gate (v5.7.0): hard-reject names that fail global
+        // naming rules. Pull the existing data type (if any) so the
+        // Hungarian-vs-type check has the right input.
+        Listing listingForCheck = program.getListing();
+        Data existingData = listingForCheck.getDefinedDataAt(addr);
+        String existingTypeName = (existingData != null && existingData.getDataType() != null)
+                ? existingData.getDataType().getName() : null;
+        NamingConventions.GlobalNameResult quality =
+                NamingConventions.checkGlobalNameQuality(newName, existingTypeName);
+        List<String> enforcementWarnings = new ArrayList<>();
+        if (!quality.ok) {
+            // Append a structural hint nudging the worker toward set_global.
+            // Workers that hit name_quality repeatedly are usually mid-chain
+            // (apply_data_type then rename_or_label then batch_set_comments)
+            // and would have a higher success rate doing the whole write
+            // atomically through set_global instead. quality.suggestion
+            // already names the specific fix; this adds the workflow nudge.
+            String enrichedSuggestion = quality.suggestion
+                    + " For globals, prefer set_global("
+                    + "address=\"" + addressStr + "\", "
+                    + "type_name=..., name=..., plate_comment=...) — "
+                    + "single-transaction write that validates name + type "
+                    + "consistency before applying anything.";
+            Map<String, Object> rejection = JsonHelper.mapOf(
+                    "status", "rejected",
+                    "error", "name_quality",
+                    "issue", quality.issue,
+                    "rejected_name", newName,
+                    "address", addressStr,
+                    "current_type", existingTypeName != null ? existingTypeName : "",
+                    "message", quality.message,
+                    "suggestion", enrichedSuggestion
+            );
+            if (NamingPolicy.getInstance().isStrictNamingEnforcement()) {
+                return Response.ok(rejection);
+            }
+            enforcementWarnings.add(disabledGlobalEnforcementWarning(rejection));
+        }
+
         final AtomicBoolean success = new AtomicBoolean(false);
         final AtomicReference<String> errorMsg = new AtomicReference<>();
         final AtomicReference<String> successMsg = new AtomicReference<>();
@@ -633,8 +672,15 @@ public class SymbolLabelService {
                         SymbolTable symTable = program.getSymbolTable();
                         Symbol symbol = symTable.getPrimarySymbol(addr);
                         if (symbol != null) {
-                            symbol.setName(newName, SourceType.USER_DEFINED);
-                            successMsg.set("Renamed defined data at " + addressStr + " to '" + newName + "'");
+                            // Idempotent on name: if the address already has the
+                            // requested name, skip setName (Ghidra throws
+                            // DuplicateNameException for same-name reassignment).
+                            if (newName.equals(symbol.getName())) {
+                                successMsg.set("Defined data at " + addressStr + " is already named '" + newName + "' (no-op)");
+                            } else {
+                                symbol.setName(newName, SourceType.USER_DEFINED);
+                                successMsg.set("Renamed defined data at " + addressStr + " to '" + newName + "'");
+                            }
                             success.set(true);
                         } else {
                             symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
@@ -656,7 +702,11 @@ public class SymbolLabelService {
         }
 
         if (success.get()) {
-            return Response.ok(JsonHelper.mapOf("status", "success", "message", successMsg.get()));
+            Map<String, Object> result = JsonHelper.mapOf("status", "success", "message", successMsg.get());
+            if (!enforcementWarnings.isEmpty()) {
+                result.put("warnings", enforcementWarnings);
+            }
+            return Response.ok(result);
         }
         return Response.err(errorMsg.get() != null ? errorMsg.get() : "Unknown failure");
     }
@@ -679,6 +729,56 @@ public class SymbolLabelService {
         }
         if (newName == null || newName.isEmpty()) {
             return Response.err("New variable name is required");
+        }
+
+        // Q3/Q4 validator gate (v5.7.0): hard-reject names that fail global
+        // naming rules. Look up the symbol's existing data type for the
+        // Hungarian-vs-type check.
+        SymbolTable symTableForCheck = program.getSymbolTable();
+        Namespace globalNsForCheck = program.getGlobalNamespace();
+        List<Symbol> initialSymbols = symTableForCheck.getSymbols(oldName, globalNsForCheck);
+        if (initialSymbols.isEmpty()) {
+            SymbolIterator allSymbols = symTableForCheck.getSymbols(oldName);
+            while (allSymbols.hasNext()) {
+                Symbol s = allSymbols.next();
+                if (s.getSymbolType() != SymbolType.FUNCTION) {
+                    initialSymbols.add(s);
+                    break;
+                }
+            }
+        }
+        String existingTypeName = null;
+        if (!initialSymbols.isEmpty()) {
+            Address sa = initialSymbols.get(0).getAddress();
+            Data d = program.getListing().getDefinedDataAt(sa);
+            if (d != null && d.getDataType() != null) existingTypeName = d.getDataType().getName();
+        }
+        NamingConventions.GlobalNameResult quality =
+                NamingConventions.checkGlobalNameQuality(newName, existingTypeName);
+        List<String> enforcementWarnings = new ArrayList<>();
+        if (!quality.ok) {
+            String addrHint = !initialSymbols.isEmpty()
+                    ? "0x" + initialSymbols.get(0).getAddress().toString()
+                    : "<global address>";
+            String enrichedSuggestion = quality.suggestion
+                    + " For globals, prefer set_global("
+                    + "address=\"" + addrHint + "\", "
+                    + "type_name=..., name=..., plate_comment=...) — "
+                    + "single-transaction write that validates name + type "
+                    + "consistency before applying anything.";
+            Map<String, Object> rejection = JsonHelper.mapOf(
+                    "status", "rejected",
+                    "error", "name_quality",
+                    "issue", quality.issue,
+                    "rejected_name", newName,
+                    "current_type", existingTypeName != null ? existingTypeName : "",
+                    "message", quality.message,
+                    "suggestion", enrichedSuggestion
+            );
+            if (NamingPolicy.getInstance().isStrictNamingEnforcement()) {
+                return Response.ok(rejection);
+            }
+            enforcementWarnings.add(disabledGlobalEnforcementWarning(rejection));
         }
 
         int txId = program.startTransaction("Rename Global Variable");
@@ -706,18 +806,27 @@ public class SymbolLabelService {
 
             Symbol symbol = symbols.get(0);
             Address symbolAddr = symbol.getAddress();
+            // Idempotent: oldName == newName is a no-op success rather than
+            // a DuplicateNameException. Workers re-running rename_global_variable
+            // after a successful prior call hit this; treat as already-applied.
+            if (newName.equals(symbol.getName())) {
+                success = true;
+                Map<String, Object> result = JsonHelper.mapOf("status", "success", "message",
+                        "Global variable already named '" + newName + "' at " + symbolAddr + " (no-op)");
+                if (!enforcementWarnings.isEmpty()) {
+                    result.put("warnings", enforcementWarnings);
+                }
+                return Response.ok(result);
+            }
             symbol.setName(newName, SourceType.USER_DEFINED);
 
             success = true;
-            List<String> globalWarnings = NamingConventions.validateGlobalName(newName);
-            if (globalWarnings.isEmpty()) {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message",
-                        "Renamed global variable '" + oldName + "' to '" + newName + "' at " + symbolAddr));
-            } else {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message",
-                        "Renamed global variable '" + oldName + "' to '" + newName + "' at " + symbolAddr,
-                        "warnings", globalWarnings));
+            Map<String, Object> result = JsonHelper.mapOf("status", "success", "message",
+                    "Renamed global variable '" + oldName + "' to '" + newName + "' at " + symbolAddr);
+            if (!enforcementWarnings.isEmpty()) {
+                result.put("warnings", enforcementWarnings);
             }
+            return Response.ok(result);
 
         } catch (Exception e) {
             Msg.error(this, "Error renaming global variable: " + e.getMessage());
@@ -725,6 +834,25 @@ public class SymbolLabelService {
         } finally {
             program.endTransaction(txId, success);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void appendWarnings(Map<String, Object> responseData, List<String> warnings) {
+        if (warnings == null || warnings.isEmpty()) {
+            return;
+        }
+        Object existing = responseData.get("warnings");
+        List<String> merged = existing instanceof List
+                ? new ArrayList<>((List<String>) existing)
+                : new ArrayList<>();
+        merged.addAll(warnings);
+        responseData.put("warnings", merged);
+    }
+
+    private static String disabledGlobalEnforcementWarning(Map<String, Object> rejection) {
+        return "Strict naming enforcement disabled: would have rejected "
+                + rejection.get("error") + "/" + rejection.get("issue") + " - "
+                + rejection.get("message");
     }
 
     // -----------------------------------------------------------------------

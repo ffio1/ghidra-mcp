@@ -11,7 +11,9 @@ Features:
 """
 
 import json
+import os
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -27,23 +29,194 @@ import uuid
 # even with multiple concurrent workers hitting the threshold simultaneously.
 _adaptive_refresh_lock = threading.Lock()
 
+HEARTBEAT_INTERVAL_SEC = float(os.environ.get("FUNDOC_HEARTBEAT_INTERVAL_SEC", "30"))
+STALL_KILL_THRESHOLD_SEC = float(os.environ.get("FUNDOC_STALL_KILL_THRESHOLD_SEC", "900"))
+
 
 class WorkerManager:
     """Manages concurrent documentation worker threads (max 3)."""
 
     MAX_WORKERS = 12
+    RESTORE_META_KEY = "dashboard_active_workers"
 
-    def __init__(self, state_file, bus, socketio):
+    def __init__(self, state_file, bus, socketio, load_queue, save_queue):
         self._workers = {}
         self._lock = threading.Lock()
         self._state_file = state_file
         self._bus = bus
         self._socketio = socketio
         self._in_progress_keys = set()
+        self._load_queue = load_queue
+        self._save_queue = save_queue
+        # Q11: per-binary lock for globals workers. Holds the binary path
+        # of every binary currently being processed by a globals worker
+        # so a second launch on the same binary is rejected with a clear
+        # error rather than silently fighting the first worker for writes.
+        self._globals_active_binaries = set()
+        self._bus.on("provider_timeout", self._handle_provider_timeout)
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="fun-doc-worker-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _set_phase(self, worker_id, phase):
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if not worker:
+                return
+            worker["phase"] = phase
+            worker["phase_since"] = datetime.now().isoformat()
+
+    def _watchdog_loop(self):
+        from event_log import log_event
+
+        while not self._watchdog_stop.wait(HEARTBEAT_INTERVAL_SEC):
+            now = datetime.now()
+            heartbeats = []
+            kill_requests = []
+            with self._lock:
+                for worker_id, worker in self._workers.items():
+                    if worker.get("status") not in ("starting", "running", "stopping", "quota_paused"):
+                        continue
+                    last_raw = worker.get("last_heartbeat_at") or worker.get("started_at")
+                    try:
+                        last_dt = datetime.fromisoformat(last_raw)
+                    except (TypeError, ValueError):
+                        last_dt = now
+                    stale_sec = max(0.0, (now - last_dt).total_seconds())
+                    phase = worker.get("phase", "unknown")
+                    if stale_sec > STALL_KILL_THRESHOLD_SEC and not worker.get("stall_kill_fired", False):
+                        worker["stall_kill_fired"] = True
+                        worker["stop_flag"].set()
+                        worker["status"] = "stopping"
+                        worker["restore_on_restart"] = False
+                        worker["last_alert"] = {
+                            "type": "stalled_kill",
+                            "message": f"Worker stalled for {int(stale_sec)}s in phase {phase}",
+                            "phase": phase,
+                            "stale_sec": stale_sec,
+                            "at": now.isoformat(),
+                        }
+                        kill_requests.append((worker_id, phase, stale_sec))
+                        continue
+                    worker["last_heartbeat_at"] = now.isoformat()
+                    heartbeats.append({
+                        "worker_id": worker_id,
+                        "provider": worker.get("provider"),
+                        "status": worker.get("status"),
+                        "phase": phase,
+                        "stale_sec": stale_sec,
+                    })
+
+            for hb in heartbeats:
+                log_event("worker.heartbeat", **hb)
+
+            for worker_id, phase, stale_sec in kill_requests:
+                subprocesses_killed = 0
+                try:
+                    from fun_doc import kill_worker_subprocesses
+                    subprocesses_killed = kill_worker_subprocesses(worker_id)
+                except Exception:
+                    subprocesses_killed = 0
+                log_event(
+                    "worker.stalled_kill",
+                    worker_id=worker_id,
+                    phase=phase,
+                    stale_sec=stale_sec,
+                    threshold_sec=int(STALL_KILL_THRESHOLD_SEC),
+                    subprocesses_killed=subprocesses_killed,
+                )
+
+            if heartbeats or kill_requests:
+                self._emit_status()
+
+    def _serialize_worker(self, worker):
+        return {
+            "provider": worker["provider"],
+            "count": worker["count"],
+            "continuous": bool(worker.get("continuous", False)),
+            "model": worker.get("model"),
+            "binary": worker.get("binary"),
+        }
+
+    def _persist_active_workers(self):
+        try:
+            queue = self._load_queue()
+            meta = dict(queue.get("meta") or {})
+            meta[self.RESTORE_META_KEY] = [
+                self._serialize_worker(w)
+                for w in self._workers.values()
+                if w.get("restore_on_restart", True)
+                and w["status"] in ("starting", "running")
+            ]
+            queue["meta"] = meta
+            self._save_queue(queue)
+        except Exception as e:
+            print(f"  Worker restore-state persist failed: {e}")
+
+    def restore_workers(self):
+        try:
+            queue = self._load_queue()
+            specs = list((queue.get("meta") or {}).get(self.RESTORE_META_KEY) or [])
+        except Exception as e:
+            print(f"  Worker restore-state load failed: {e}")
+            return []
+
+        restored = []
+        for spec in specs[: self.MAX_WORKERS]:
+            try:
+                restored.append(
+                    self.start_worker(
+                        provider=spec.get("provider", "minimax"),
+                        count=spec.get("count", 5),
+                        model=spec.get("model"),
+                        binary=spec.get("binary"),
+                        continuous=bool(spec.get("continuous", False)),
+                        restored=True,
+                    )
+                )
+            except Exception as e:
+                print(f"  Worker restore skipped: {e}")
+        return restored
+
+    def _handle_provider_timeout(self, data):
+        if not isinstance(data, dict):
+            return
+        worker_id = data.get("worker_id")
+        if not worker_id:
+            return
+
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if not worker:
+                return
+            worker["timeout_count"] = worker.get("timeout_count", 0) + 1
+            worker["last_alert"] = {
+                "type": "provider_timeout",
+                "provider": data.get("provider"),
+                "timeout_secs": data.get("timeout_secs"),
+                "message": data.get("message") or "Provider timeout",
+                "at": datetime.now().isoformat(),
+            }
+        self._emit_status()
 
     def start_worker(
-        self, provider="minimax", count=5, model=None, binary=None, continuous=False
+        self,
+        provider="minimax",
+        count=5,
+        model=None,
+        binary=None,
+        continuous=False,
+        restored=False,
+        mode="functions",
     ):
+        # Q9: globals worker requires a binary — refuse early with a clear
+        # message rather than launching a worker that can't pick a target.
+        if mode == "globals" and not binary:
+            raise ValueError("Globals worker requires a binary — select one in the header.")
         with self._lock:
             active = {
                 wid: w
@@ -57,11 +230,42 @@ class WorkerManager:
                 raise ValueError(
                     f"Maximum {self.MAX_WORKERS} workers ({len(active)} active: {active_info})"
                 )
+            # Q11: per-binary lock for globals workers. Reject the launch
+            # if another globals worker is already on this binary.
+            if mode == "globals" and binary in self._globals_active_binaries:
+                raise ValueError(
+                    f"A globals worker is already running on {binary}. "
+                    "Wait for it to finish or stop it first."
+                )
+            if mode == "globals":
+                self._globals_active_binaries.add(binary)
 
             worker_id = str(uuid.uuid4())[:8]
             stop_flag = threading.Event()
+
+            # Capture a frozen snapshot of every queue.config field that
+            # should remain constant for this worker's lifetime. See
+            # fun_doc.build_worker_config_snapshot for the schema. The
+            # snapshot is opaque to WorkerManager — _run_worker passes
+            # it through to process_function on every iteration. Nothing
+            # mutates the snapshot after this point; live config edits via
+            # the dashboard apply only to workers started AFTER the edit.
+            try:
+                from fun_doc import build_worker_config_snapshot, load_priority_queue
+                config_snapshot = build_worker_config_snapshot(
+                    load_priority_queue(), provider
+                )
+            except Exception as e:
+                # Snapshot is best-effort. If we can't build one (rare —
+                # corrupt queue file etc.), fall back to None and the
+                # worker will use live config reads, matching pre-snapshot
+                # behavior.
+                print(f"  WARNING: config snapshot build failed: {e}")
+                config_snapshot = None
+
             worker = {
                 "id": worker_id,
+                "mode": mode,
                 "provider": provider,
                 "count": count,
                 "continuous": continuous,
@@ -71,6 +275,15 @@ class WorkerManager:
                 "stop_flag": stop_flag,
                 "started_at": datetime.now().isoformat(),
                 "status": "starting",
+                "restored": bool(restored),
+                "restore_on_restart": True,
+                "timeout_count": 0,
+                "last_alert": None,
+                "config_snapshot": config_snapshot,
+                "phase": "starting",
+                "phase_since": datetime.now().isoformat(),
+                "stall_kill_fired": False,
+                "last_heartbeat_at": datetime.now().isoformat(),
                 "progress": {
                     "completed": 0,
                     "skipped": 0,
@@ -79,6 +292,7 @@ class WorkerManager:
                 },
             }
             self._workers[worker_id] = worker
+            self._persist_active_workers()
 
         thread = threading.Thread(
             target=self._run_worker, args=(worker_id,), daemon=True
@@ -95,7 +309,19 @@ class WorkerManager:
                 raise ValueError(f"Unknown worker: {worker_id}")
             worker["stop_flag"].set()
             worker["status"] = "stopping"
+            worker["restore_on_restart"] = False
+            self._persist_active_workers()
         self._emit_status()
+
+    def has_active_workers(self):
+        """True if any doc worker is starting/running/stopping. Used by the
+        background InventoryScorer to yield MCP bandwidth (Q1 idle-time backfill,
+        Q7 cooperative pause)."""
+        with self._lock:
+            return any(
+                w["status"] in ("starting", "running", "stopping")
+                for w in self._workers.values()
+            )
 
     def get_status(self):
         with self._lock:
@@ -113,8 +339,25 @@ class WorkerManager:
             for wid in stale:
                 del self._workers[wid]
 
-            return [
-                {
+            rows = []
+            for w in self._workers.values():
+                try:
+                    phase_since_dt = (
+                        datetime.fromisoformat(w["phase_since"])
+                        if w.get("phase_since")
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    phase_since_dt = None
+                try:
+                    heartbeat_dt = datetime.fromisoformat(
+                        w.get("last_heartbeat_at") or w.get("started_at")
+                    )
+                    heartbeat_age = (now - heartbeat_dt).total_seconds()
+                except (TypeError, ValueError):
+                    heartbeat_age = 0.0
+                rows.append(
+                    {
                     "id": w["id"],
                     "provider": w["provider"],
                     "count": w["count"],
@@ -122,13 +365,47 @@ class WorkerManager:
                     "model": w["model"],
                     "binary": w["binary"],
                     "status": w["status"],
+                    "restored": bool(w.get("restored", False)),
+                    "timeout_count": int(w.get("timeout_count", 0) or 0),
+                    "last_alert": (
+                        dict(w["last_alert"]) if w.get("last_alert") else None
+                    ),
                     "progress": dict(w["progress"]),
                     "started_at": w["started_at"],
-                }
-                for w in self._workers.values()
-            ]
+                    # Snapshot is what the dashboard renders in the per-worker
+                    # config sub-line. Unconditionally emitted so the dashboard
+                    # can detect drift vs current live config and show the
+                    # save-time toast (Q5). None for legacy/CLI workers; the
+                    # dashboard renders no sub-line in that case.
+                    "config_snapshot": w.get("config_snapshot"),
+                    # Quota-pause fields populated when status == "quota_paused".
+                    "paused_until": w.get("paused_until"),
+                    "paused_reason": w.get("paused_reason"),
+                    "phase": w.get("phase"),
+                    "phase_since": w.get("phase_since"),
+                    "phase_age_sec": (
+                        max(0.0, (now - phase_since_dt).total_seconds())
+                        if phase_since_dt
+                        else None
+                    ),
+                    "last_heartbeat_at": w.get("last_heartbeat_at"),
+                    "stall_kill_fired": bool(w.get("stall_kill_fired", False)),
+                    "is_stale": heartbeat_age > STALL_KILL_THRESHOLD_SEC,
+                    }
+                )
+            return rows
 
     def _run_worker(self, worker_id):
+        """Worker loop entry point. Dispatches to the function-worker
+        pipeline (default) or the globals-worker pipeline based on the
+        `mode` field captured at start_worker time."""
+        worker = self._workers.get(worker_id)
+        if worker and worker.get("mode") == "globals":
+            self._run_worker_globals(worker_id)
+            return
+        self._run_worker_functions(worker_id)
+
+    def _run_worker_functions(self, worker_id):
         """Worker loop — fetches one function at a time to avoid conflicts with other workers."""
         from event_bus import set_worker_id
 
@@ -139,19 +416,20 @@ class WorkerManager:
         try:
             from fun_doc import (
                 load_state,
-                save_state,
                 get_next_functions,
                 start_session,
-                end_session,
+                finalize_worker_session,
                 process_function,
                 refresh_candidate_scores,
                 load_priority_queue,
                 reset_handoff_counter,
                 _bump_handoff_counter,
+                get_auto_escalation_provider,
                 update_function_state,
             )
 
             worker["status"] = "running"
+            self._set_phase(worker_id, "starting")
             self._emit_status()
             self._bus.emit(
                 "worker_started",
@@ -160,8 +438,33 @@ class WorkerManager:
                     "provider": worker["provider"],
                     "count": worker["count"],
                     "continuous": worker.get("continuous", False),
+                    "restored": worker.get("restored", False),
                 },
             )
+
+            # Persist worker.started to events.jsonl with the frozen config
+            # snapshot. This is the durable record that lets a future analysis
+            # of runs.jsonl join on worker_id to see the exact config under
+            # which each function was processed. Snapshot is None on workers
+            # that started before the snapshot field existed (legacy/CLI),
+            # which is fine — the field is just absent in those records.
+            try:
+                from event_log import log_event as _log_event
+                _log_event(
+                    "worker.started",
+                    worker_id=worker_id,
+                    provider=worker["provider"],
+                    count=worker["count"],
+                    continuous=bool(worker.get("continuous", False)),
+                    binary=worker.get("binary"),
+                    model=worker.get("model"),
+                    restored=bool(worker.get("restored", False)),
+                    config_snapshot=worker.get("config_snapshot"),
+                )
+            except Exception:
+                # Event-log failures must not abort worker startup; the worker
+                # is still functional, just less observable.
+                pass
 
             state = load_state()
             original_binary = state.get("active_binary")
@@ -183,6 +486,7 @@ class WorkerManager:
             #   4. Short timeout (60s) + no individual fallback — fail fast
             #   5. Count clamped to 20 (was 50)
             try:
+                self._set_phase(worker_id, "pre_refresh")
                 pre_queue = load_priority_queue()
                 pre_cfg = pre_queue.get("config") or {}
                 pre_meta = pre_queue.get("meta") or {}
@@ -241,6 +545,7 @@ class WorkerManager:
             except Exception as e:
                 print(f"  Pre-refresh failed (continuing with stale state): {e}")
 
+            self._set_phase(worker_id, "session_start")
             session = start_session(state)
             processed = 0
             # Threshold for adaptive refresh — this worker reads the shared
@@ -253,10 +558,77 @@ class WorkerManager:
                 load_priority_queue().get("config", {}).get("good_enough_score", 80)
             )
 
+            # Resolve the worker's primary FULL model from the frozen snapshot.
+            # The quota-pause gate keys on (provider, model); we check the
+            # FULL-mode model since that's the dominant call on most functions.
+            # Audit/handoff models on the same provider get their own pause
+            # treatment via the Q10 skip-silently path inside process_function.
+            def _worker_primary_model():
+                snap = worker.get("config_snapshot") or {}
+                providers = snap.get("providers") or {}
+                p_entry = providers.get(worker["provider"]) or {}
+                return (
+                    (p_entry.get("models") or {}).get("FULL")
+                    or worker.get("model")
+                )
+
+            def _yield_for_quota_pause():
+                """If our (provider, FULL-model) is walled, set status to
+                quota_paused and sleep until the pause clears or stop fires.
+                Returns True if we yielded (caller should `continue` the loop)."""
+                from provider_pause import get_default_manager as _get_pm
+
+                primary_model = _worker_primary_model()
+                if not primary_model:
+                    return False
+                pm = _get_pm()
+                paused_until = pm.wait_until(worker["provider"], primary_model)
+                if paused_until is None:
+                    return False
+                # Enter quota_paused state and sleep with periodic re-check.
+                worker["status"] = "quota_paused"
+                worker["paused_until"] = paused_until.isoformat()
+                worker["paused_reason"] = (
+                    pm.reason(worker["provider"], primary_model) or "quota wall"
+                )
+                self._emit_status()
+                while not worker["stop_flag"].is_set():
+                    now = datetime.now()
+                    remaining = (paused_until - now).total_seconds()
+                    if remaining <= 0:
+                        break
+                    # Re-check pause status every 30s so manual clears and
+                    # external pause-set mutations get picked up promptly.
+                    if worker["stop_flag"].wait(timeout=min(remaining, 30.0)):
+                        break  # stop requested mid-pause
+                    paused_until = pm.wait_until(worker["provider"], primary_model)
+                    if paused_until is None:
+                        break
+                if not worker["stop_flag"].is_set():
+                    worker["status"] = "running"
+                    worker.pop("paused_until", None)
+                    worker.pop("paused_reason", None)
+                    self._emit_status()
+                return True
+
+            # Q8: manual start during a pause — yield immediately at loop entry
+            # so the worker enters quota_paused without burning a redundant API
+            # call to discover the wall.
+            _yield_for_quota_pause()
+
             while not worker["stop_flag"].is_set() and (
                 worker["continuous"] or processed < worker["count"]
             ):
+                # Per-iteration pause check (Q1): another worker may have
+                # discovered the wall while we were idle/processing. Yield
+                # before picking the next function.
+                if _yield_for_quota_pause():
+                    if worker["stop_flag"].is_set():
+                        break
+                    continue
+
                 # Reload state each iteration to get fresh scores/queue
+                self._set_phase(worker_id, "select_function")
                 state = load_state()
                 if worker["binary"]:
                     state["active_binary"] = worker["binary"]
@@ -294,6 +666,7 @@ class WorkerManager:
                     },
                 )
 
+                self._set_phase(worker_id, "process_function")
                 result = process_function(
                     key,
                     func,
@@ -301,19 +674,11 @@ class WorkerManager:
                     model=worker["model"],
                     provider=worker["provider"],
                     stop_flag=worker["stop_flag"],
+                    config_snapshot=worker.get("config_snapshot"),
                 )
 
-                # Auto-escalation: if the function didn't reach good_enough
-                # (either it made progress but not enough, or it failed
-                # outright), immediately retry with a stronger model before
-                # releasing the key. The escalation order is:
-                # minimax → claude → codex → (give up).
-                ESCALATION_ORDER = {
-                    "minimax": "claude",
-                    "claude": "codex",
-                    "codex": None,  # no further escalation
-                    "gemini": "claude",
-                }
+                # Optional immediate retry: only use an explicitly configured
+                # provider. Do not silently fall back to a stronger provider.
                 if (
                     result in ("completed", "partial", "failed", "needs_redo")
                     and not worker["stop_flag"].is_set()
@@ -323,7 +688,9 @@ class WorkerManager:
                     fresh_func = fresh.get("functions", {}).get(key)
                     if fresh_func:
                         current_score = fresh_func.get("score", 0)
-                        escalate_to = ESCALATION_ORDER.get(worker["provider"])
+                        escalate_to = get_auto_escalation_provider(
+                            worker["provider"], queue=load_priority_queue()
+                        )
                         if (
                             current_score < good_enough
                             and current_score > 0
@@ -350,6 +717,7 @@ class WorkerManager:
                             fresh_func["last_escalation_from"] = worker["provider"]
                             fresh_func["last_escalation_to"] = escalate_to
                             update_function_state(key, fresh_func)
+                            self._set_phase(worker_id, "auto_escalate")
                             escalate_result = process_function(
                                 key,
                                 fresh_func,
@@ -357,6 +725,7 @@ class WorkerManager:
                                 model=None,  # auto-select for the escalation provider
                                 provider=escalate_to,
                                 stop_flag=worker["stop_flag"],
+                                config_snapshot=worker.get("config_snapshot"),
                             )
                             # Use the escalation result for stats
                             if escalate_result in ("completed", "partial"):
@@ -402,7 +771,7 @@ class WorkerManager:
                     session["completed"] += 1
                     session["functions"].append(key)
                     worker["_rate_limit_streak"] = 0  # reset on success
-                elif result in ("skipped", "decompile_timeout"):
+                elif result in ("skipped", "decompile_timeout", "library_code"):
                     worker["progress"]["skipped"] += 1
                     session["skipped"] += 1
                 elif result in ("failed", "blocked", "needs_redo"):
@@ -444,6 +813,7 @@ class WorkerManager:
                                 except (ValueError, TypeError):
                                     pass
                             if count >= STALE_STREAK_THRESHOLD and cooldown_ok:
+                                self._set_phase(worker_id, "adaptive_refresh")
                                 print(
                                     f"  Detected {count} stale skips — batch refreshing..."
                                 )
@@ -471,13 +841,16 @@ class WorkerManager:
 
                 self._emit_status()
 
-            end_session(state)
+            # Persist session + optional active_binary restore via a
+            # read-modify-write that leaves state["functions"] alone. A
+            # full-state save here would write the functions snapshot this
+            # worker loaded, clobbering per-function updates written
+            # concurrently by other workers via update_function_state().
+            self._set_phase(worker_id, "finalize_session")
             if worker["binary"] and original_binary != worker["binary"]:
-                if original_binary:
-                    state["active_binary"] = original_binary
-                else:
-                    state.pop("active_binary", None)
-            save_state(state)
+                finalize_worker_session(session, active_binary=original_binary)
+            else:
+                finalize_worker_session(session)
 
         except Exception as e:
             self._bus.emit(
@@ -487,17 +860,128 @@ class WorkerManager:
             worker["status"] = (
                 "finished" if not worker["stop_flag"].is_set() else "stopped"
             )
+            worker["restore_on_restart"] = False
             worker["finished_at"] = datetime.now().isoformat()
             worker["progress"]["current"] = None
             with self._lock:
                 if current_key:
                     self._in_progress_keys.discard(current_key)
+                # Release the per-binary lock for globals workers (no-op
+                # for function workers — set is empty for them).
+                if worker.get("mode") == "globals" and worker.get("binary"):
+                    self._globals_active_binaries.discard(worker["binary"])
+                self._persist_active_workers()
             self._emit_status()
             self._bus.emit(
                 "worker_stopped",
                 {
                     "worker_id": worker_id,
                     "reason": worker["status"],
+                    "progress": dict(worker["progress"]),
+                },
+            )
+
+    def _run_worker_globals(self, worker_id):
+        """Globals worker loop. Per Q1-Q12 design: pulls every issue-global
+        from the selected binary, invokes one provider call per global,
+        post-audits, logs to runs.jsonl with mode=globals. Continuous mode
+        rotates to the next most-needy binary when the current is drained.
+        Per-binary lock + invalidation are handled in start_worker / the
+        common finally block above."""
+        from event_bus import set_worker_id
+
+        set_worker_id(worker_id)
+        worker = self._workers[worker_id]
+        try:
+            from fun_doc import run_globals_worker_pass
+
+            worker["status"] = "running"
+            self._set_phase(worker_id, "globals_running")
+            self._emit_status()
+            self._bus.emit(
+                "worker_started",
+                {
+                    "worker_id": worker_id,
+                    "mode": "globals",
+                    "provider": worker["provider"],
+                    "count": worker["count"],
+                    "continuous": worker.get("continuous", False),
+                    "binary": worker.get("binary"),
+                    "restored": worker.get("restored", False),
+                },
+            )
+
+            def _on_progress(binary_path, address, result, processed, total):
+                bucket = "completed" if result == "completed" else (
+                    "skipped" if result == "skipped" else "failed"
+                )
+                worker["progress"][bucket] = worker["progress"].get(bucket, 0) + 1
+                worker["last_heartbeat_at"] = datetime.now().isoformat()
+                self._emit_status()
+
+            # Set the worker pane's "current item" title with the real
+            # symbol name + binary as soon as process_global discovers
+            # them post pre-audit (matches function-worker shape so the
+            # dashboard's `w.progress.current.name` read works). Called
+            # from process_global via the on_started callback parameter
+            # — avoids a bus subscription that would leak handlers
+            # across worker lifetimes (event_bus has no unsubscribe).
+            def _on_global_started(prog_path, address, name):
+                worker["progress"]["current"] = {
+                    "key": f"{prog_path}::{address.lstrip('0x')}",
+                    "name": name or address,
+                    "address": address.lstrip("0x"),
+                    "program": Path(prog_path).name,
+                }
+                worker["last_heartbeat_at"] = datetime.now().isoformat()
+                self._emit_status()
+
+            def _exclude_binaries():
+                with self._lock:
+                    return set(self._globals_active_binaries) - {worker.get("binary")}
+
+            summary = run_globals_worker_pass(
+                worker_id=worker_id,
+                initial_binary=worker.get("binary"),
+                provider=worker["provider"],
+                model=worker.get("model"),
+                count=int(worker.get("count") or 1),
+                continuous=bool(worker.get("continuous", False)),
+                stop_flag=worker["stop_flag"],
+                on_progress=_on_progress,
+                on_started=_on_global_started,
+                exclude_binaries_provider=_exclude_binaries,
+            )
+            print(
+                f"  [globals-worker {worker_id}] done: "
+                f"{summary['processed']} processed across "
+                f"{len(summary['binaries_visited'])} binar(y/ies) "
+                f"(reason={summary.get('stopped_reason')})",
+                flush=True,
+            )
+        except Exception as e:
+            self._bus.emit(
+                "worker_stopped",
+                {"worker_id": worker_id, "reason": f"error: {e}"},
+            )
+        finally:
+            worker["status"] = (
+                "finished" if not worker["stop_flag"].is_set() else "stopped"
+            )
+            worker["restore_on_restart"] = False
+            worker["finished_at"] = datetime.now().isoformat()
+            worker["progress"]["current"] = None
+            with self._lock:
+                if worker.get("binary"):
+                    self._globals_active_binaries.discard(worker["binary"])
+                self._persist_active_workers()
+            self._emit_status()
+            self._bus.emit(
+                "worker_stopped",
+                {
+                    "worker_id": worker_id,
+                    "reason": worker["status"],
+                    "mode": "globals",
                     "progress": dict(worker["progress"]),
                 },
             )
@@ -532,7 +1016,9 @@ def create_app(state_file, event_bus=None):
         "function_started",
         "function_mode",
         "function_complete",
-        "tool_call",
+        "global_started",
+        "global_complete",
+        "globals_binary_advanced",
         "tool_result",
         "model_text",
         "score_update",
@@ -542,49 +1028,43 @@ def create_app(state_file, event_bus=None):
         "worker_started",
         "worker_progress",
         "worker_stopped",
+        "provider_timeout",
     ]:
         bus.on(evt, bridge(evt))
 
     # --- Data loading helpers ---
 
     def load_state():
-        sf = app.config["STATE_FILE"]
-        if not sf.exists():
-            return {
-                "functions": {},
-                "sessions": [],
-                "project_folder": "unknown",
-                "last_scan": None,
-            }
-        # Retry on partial read (race with concurrent save_state)
-        for attempt in range(3):
-            try:
-                with open(sf, "r") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, ValueError):
-                if attempt < 2:
-                    import time
-
-                    time.sleep(0.1)
-        return {
-            "functions": {},
-            "sessions": [],
-            "project_folder": "unknown",
-            "last_scan": None,
-        }
+        """Delegate to fun_doc.load_state — backed by the storage repository
+        (Postgres or SQLite per the configured backend). The retry +
+        raise-on-corrupt semantics live in fun_doc itself; duplicating them
+        here was what caused the 2026-05-03 truncation incident, where
+        web.py's old implementation silently returned an empty stub on race
+        conditions which was then written back over the real state.json."""
+        from fun_doc import load_state as _fd_load_state
+        return _fd_load_state()
 
     def _save_state_inline(state):
-        """Save state from web.py context — uses fun_doc's lock if available."""
-        sf = app.config["STATE_FILE"]
-        try:
-            from fun_doc import _state_lock
+        """Delegate to fun_doc.save_state — backed by the storage repository.
+        Refuses to overwrite a populated state.json with an empty-functions
+        dict, which is the failure mode that nuked ~110 MB of state on
+        2026-05-03 (a load_state race returned an empty stub that this
+        function then persisted). The guardrail only fires for users
+        mid-migration — once state.json is renamed to .migrated-<ISO>,
+        sf.exists() is false and the repo backend's own integrity checks
+        take over."""
+        from fun_doc import save_state as _fd_save_state
 
-            with _state_lock:
-                with open(sf, "w") as f:
-                    json.dump(state, f, indent=2, default=str)
-        except ImportError:
-            with open(sf, "w") as f:
-                json.dump(state, f, indent=2, default=str)
+        sf = app.config["STATE_FILE"]
+        new_func_count = len(state.get("functions") or {})
+        if new_func_count == 0 and sf.exists() and sf.stat().st_size > 1024:
+            raise RuntimeError(
+                f"_save_state_inline refused: would overwrite "
+                f"{sf.stat().st_size:,}-byte state.json with empty-functions "
+                "stub. Caller likely raced load_state and is about to clobber "
+                "real data. Investigate the call site."
+            )
+        _fd_save_state(state)
 
     def load_queue():
         from fun_doc import load_priority_queue
@@ -596,47 +1076,94 @@ def create_app(state_file, event_bus=None):
 
         save_priority_queue(queue)
 
+    # Mtime-based memoization for the runs.jsonl reads. Both functions below
+    # used to read the entire 39 MB log file on every dashboard refresh,
+    # adding ~3 seconds to /api/stats. The log only grows during active fun-doc
+    # sessions; in between, mtime is stable and we can serve from cache.
+    _run_cache = {"mtime": None, "size": None,
+                  "logs": [], "totals": (0, 0)}
+
+    def _runs_cache_invalid(lf):
+        try:
+            st = lf.stat()
+        except FileNotFoundError:
+            return True, None
+        if (_run_cache["mtime"] != st.st_mtime
+                or _run_cache["size"] != st.st_size):
+            return True, st
+        return False, st
+
     def load_run_logs(max_lines=500):
+        """Tail of runs.jsonl, parsed as JSON. Cached by file mtime+size."""
         lf = app.config["LOG_FILE"]
         if not lf.exists():
             return []
-        lines = []
+        invalid, st = _runs_cache_invalid(lf)
+        if not invalid:
+            return _run_cache["logs"]
+        # Refresh from disk. Read only the tail — seek backwards an estimated
+        # window proportional to max_lines and discard the partial first line.
+        # Average runs.jsonl line is ~600 bytes; 500 lines * 4x safety = ~1.2 MB.
+        # Up the safety factor on smaller files to ensure we capture max_lines.
+        TAIL_BYTES = max(2_000_000, max_lines * 2400)
+        lines: list = []
         try:
-            with open(lf, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            lines.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-            return lines[-max_lines:]
+            with open(lf, "rb") as f:
+                size = st.st_size if st is not None else f.seek(0, 2) or 0
+                start = max(0, size - TAIL_BYTES)
+                f.seek(start)
+                if start > 0:
+                    f.readline()  # discard partial leading line
+                for raw in f:
+                    s = raw.decode("utf-8", errors="replace").strip()
+                    if not s:
+                        continue
+                    try:
+                        lines.append(json.loads(s))
+                    except json.JSONDecodeError:
+                        continue
         except Exception:
-            return []
+            lines = []
+        result = lines[-max_lines:]
+        _run_cache["mtime"] = st.st_mtime if st is not None else None
+        _run_cache["size"] = st.st_size if st is not None else None
+        _run_cache["logs"] = result
+        # Reset totals so count_run_totals recomputes them on next call against
+        # the same fresh mtime — they share the cache validity.
+        _run_cache["totals"] = None
+        return result
 
     def count_run_totals():
-        """Fast line-counting for today_runs and total_runs without parsing
-        every JSON entry. Only parses enough to check the date prefix."""
+        """Fast line-counting for today_runs and total_runs. Cached by mtime."""
         lf = app.config["LOG_FILE"]
         if not lf.exists():
             return 0, 0
+        invalid, st = _runs_cache_invalid(lf)
+        if not invalid and _run_cache["totals"] is not None:
+            return _run_cache["totals"]
         today = datetime.now().date().isoformat()
         total = 0
         today_count = 0
         try:
-            with open(lf, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+            # Whole-file scan is unavoidable for an exact total, but we
+            # avoid JSON parsing — just count lines and substring-match.
+            with open(lf, "rb") as f:
+                today_marker = f'"timestamp": "{today}'.encode("utf-8")
+                for raw in f:
+                    if not raw.strip():
                         continue
                     total += 1
-                    # Fast date check: timestamp is always the first field
-                    # in the JSON: {"timestamp": "2026-04-17T...
-                    if f'"timestamp": "{today}' in line:
+                    if today_marker in raw:
                         today_count += 1
         except Exception:
             pass
-        return total, today_count
+        result = (total, today_count)
+        _run_cache["totals"] = result
+        # Update mtime/size in case load_run_logs hasn't run yet.
+        if st is not None:
+            _run_cache["mtime"] = st.st_mtime
+            _run_cache["size"] = st.st_size
+        return result
 
     # --- Compute functions ---
 
@@ -708,6 +1235,7 @@ def create_app(state_file, event_bus=None):
             "avg_delta": 0,
             "success_rate": 0,
             "by_provider": {},
+            "handoffs": {"total": 0, "top_pairs": [], "top_chains": []},
             "stuck_functions": [],
             "failure_modes": {},
             "regressions": 0,
@@ -743,13 +1271,16 @@ def create_app(state_file, event_bus=None):
                 "deltas": [],
                 "success": 0,
                 "failed": 0,
-                "tool_calls": [],
+                "known_tool_calls": [],
+                "unknown_tool_runs": 0,
                 "today_runs": 0,
                 "today_deltas": [],
                 "today_success": 0,
             }
         )
         func_results = defaultdict(lambda: {"fails": 0, "name": "", "address": ""})
+        handoff_pairs = defaultdict(int)
+        handoff_chains = defaultdict(int)
 
         # Audit tracking
         audit_ran = 0
@@ -771,11 +1302,25 @@ def create_app(state_file, event_bus=None):
             after = l.get("score_after")
             result = l.get("result", "")
             provider = l.get("provider", "unknown")
+            requested_provider = l.get("requested_provider") or provider
+            provider_chain = l.get("provider_chain") or [requested_provider]
             delta = l.get("score_delta")
             tc = l.get("tool_calls")
+            tc_known = bool(l.get("tool_calls_known", tc is not None and tc >= 0))
             l_today = l.get("timestamp", "").startswith(today)
 
             bp = by_provider[provider]
+
+            if not isinstance(provider_chain, list) or not provider_chain:
+                provider_chain = (
+                    [requested_provider, provider]
+                    if requested_provider != provider
+                    else [provider]
+                )
+            chain_label = " -> ".join(str(x) for x in provider_chain)
+            if requested_provider != provider or len(provider_chain) > 1:
+                handoff_chains[chain_label] += 1
+                handoff_pairs[f"{requested_provider} -> {provider}"] += 1
 
             if before is not None and after is not None:
                 d = delta if delta is not None else (after - before)
@@ -792,8 +1337,10 @@ def create_app(state_file, event_bus=None):
             if l_today:
                 bp["today_runs"] += 1
 
-            if tc is not None:
-                bp["tool_calls"].append(tc)
+            if tc_known and isinstance(tc, (int, float)) and tc >= 0:
+                bp["known_tool_calls"].append(tc)
+            else:
+                bp["unknown_tool_runs"] += 1
 
             if result == "completed":
                 success += 1
@@ -842,13 +1389,15 @@ def create_app(state_file, event_bus=None):
             d = data["deltas"]
             r = data["runs"]
             td = data["today_deltas"]
-            tc = data["tool_calls"]
+            tc = data["known_tool_calls"]
             provider_stats[p] = {
                 "runs": r,
                 "avg_delta": round(sum(d) / len(d), 1) if d else 0,
                 "success_rate": round(data["success"] / r * 100, 1) if r else 0,
                 "fail_rate": round(data["failed"] / r * 100, 1) if r else 0,
                 "avg_tools": round(sum(tc) / len(tc), 1) if tc else 0,
+                "known_tool_runs": len(tc),
+                "unknown_tool_runs": data["unknown_tool_runs"],
                 "today_runs": data["today_runs"],
                 "today_avg_delta": round(sum(td) / len(td), 1) if td else 0,
                 "today_success_rate": (
@@ -893,6 +1442,25 @@ def create_app(state_file, event_bus=None):
             "avg_delta": round(sum(deltas) / len(deltas), 1) if deltas else 0,
             "success_rate": round(success / len(logs) * 100, 1) if logs else 0,
             "by_provider": provider_stats,
+            "handoffs": {
+                "total": sum(handoff_chains.values()),
+                "top_pairs": sorted(
+                    (
+                        {"pair": pair, "count": count}
+                        for pair, count in handoff_pairs.items()
+                    ),
+                    key=lambda x: x["count"],
+                    reverse=True,
+                )[:5],
+                "top_chains": sorted(
+                    (
+                        {"chain": chain, "count": count}
+                        for chain, count in handoff_chains.items()
+                    ),
+                    key=lambda x: x["count"],
+                    reverse=True,
+                )[:5],
+            },
             "stuck_functions": stuck,
             "failure_modes": dict(failure_modes),
             "regressions": regressions,
@@ -1045,10 +1613,21 @@ def create_app(state_file, event_bus=None):
                     # True when state.json has never had analyze_function_completeness
                     # run for this entry — score=0 here means "unknown", not "0% done"
                     "unscored": not func.get("last_processed"),
+                    "tool_calls": func.get("tool_calls"),
+                    "tool_calls_known": func.get("tool_calls_known"),
                 }
             )
         func_list.sort(key=lambda x: x["score"])
         all_func_total = len(func_list)
+        # Cap the inlined SSR list to keep initial dashboard HTML manageable.
+        # Without this, /-route emits ~70 MB of <tr> rows for a 60k-function
+        # state.json — initial page load takes 5+s. The full list is still
+        # available via paginated APIs (/api/queue/*, /api/cross_binary_progress)
+        # so the JS layer can render the rest on demand. Sorted ascending by
+        # score above, so the cap keeps the lowest-score (highest-value-to-fix)
+        # functions visible — the rows users actually want to see first.
+        SSR_FUNC_ROW_CAP = 500
+        func_list_capped = func_list[:SSR_FUNC_ROW_CAP]
         return {
             "total": total,
             "done": done,
@@ -1063,8 +1642,9 @@ def create_app(state_file, event_bus=None):
             "roi_queue": compute_roi_queue(funcs, queue, active_binary=active_binary)[
                 :50
             ],
-            "all_functions": func_list,
+            "all_functions": func_list_capped,
             "all_functions_total": all_func_total,
+            "all_functions_capped_to": SSR_FUNC_ROW_CAP,
             "deduction_breakdown": compute_deduction_breakdown(funcs),
             "run_stats": compute_run_stats(load_run_logs(), *count_run_totals()),
             "project_folder": state.get("project_folder", "unknown"),
@@ -1113,7 +1693,204 @@ def create_app(state_file, event_bus=None):
         sio_emit("scan_acknowledged", {"refresh": refresh, "program": program_filter})
 
     # --- Worker management ---
-    worker_mgr = WorkerManager(app.config["STATE_FILE"], bus, socketio)
+    worker_mgr = WorkerManager(
+        app.config["STATE_FILE"],
+        bus,
+        socketio,
+        load_queue,
+        save_queue,
+    )
+
+    # --- Background inventory scorer (Q1-Q12 design, opt-in via config) ---
+    from inventory_scorer import (
+        InventoryScorer,
+        load_inventory,
+        save_inventory,
+        compute_per_binary_inventory,
+        status_for,
+    )
+
+    def _project_folder():
+        try:
+            return load_state().get("project_folder")
+        except Exception:
+            return None
+
+    def _current_binary_name():
+        """Returns the dashboard's currently-focused binary name (e.g.
+        'D2Common.dll'), or None. Used by the inventory + global scorers
+        to backfill the user's active binary first before walking the
+        rest of the project tree."""
+        try:
+            return load_state().get("active_binary")
+        except Exception:
+            return None
+
+    def _emit_inventory_status(status: dict):
+        """Bridge scorer status changes -> WebSocket so the dashboard widget
+        and Inventory panel update without polling."""
+        try:
+            socketio.emit("inventory_status", status or {})
+        except Exception:
+            pass
+
+    def _make_scorer():
+        from fun_doc import (
+            _fetch_programs,
+            _fetch_function_list,
+            _batch_score,
+            load_state as fd_load_state,
+            save_state as fd_save_state,
+        )
+
+        return InventoryScorer(
+            worker_manager=worker_mgr,
+            project_folder_getter=_project_folder,
+            state_dir=Path(__file__).parent,
+            load_state=fd_load_state,
+            save_state=fd_save_state,
+            fetch_programs=_fetch_programs,
+            fetch_function_list=_fetch_function_list,
+            batch_score=_batch_score,
+            on_status_change=_emit_inventory_status,
+            current_binary_name_getter=_current_binary_name,
+        )
+
+    inventory_scorer = _make_scorer()
+
+    # Honor the persisted opt-in flag at startup.
+    try:
+        if (load_queue().get("config") or {}).get("inventory_enabled"):
+            inventory_scorer.set_enabled(True)
+    except Exception as _exc:
+        print(f"  Inventory scorer auto-start skipped: {_exc}")
+
+    # --- Background global-variable scorer (v5.7.0) ---
+    from global_scorer import (
+        GlobalScorer,
+        load_inventory as load_global_inventory,
+    )
+
+    def _emit_global_inventory_status(status: dict):
+        try:
+            socketio.emit("global_inventory_status", status or {})
+        except Exception:
+            pass
+
+    def _list_globals_for_program(prog_path):
+        """Adapter — fetch every global symbol's address from a program
+        via the existing /list_globals MCP endpoint. Returns a list of
+        dicts with at least an 'address' key.
+
+        /list_globals is paginated (default limit=100). Walks pages of
+        500 entries until a short page is returned, accumulating only
+        entries with parseable hex addresses (Library entries report
+        "NO ADDRESS" and are correctly skipped). A safety cap of 200
+        pages (100,000 entries) stops runaway loops if the endpoint
+        ever stops paginating correctly."""
+        from fun_doc import ghidra_get
+        import re
+        page_size = 500
+        max_pages = 200
+        line_re = re.compile(r"@\s+([0-9a-fA-F]{4,})\b")
+        out = []
+        seen = set()
+        for page_idx in range(max_pages):
+            offset = page_idx * page_size
+            resp = ghidra_get(
+                "/list_globals",
+                params={
+                    "program": prog_path,
+                    "offset": offset,
+                    "limit": page_size,
+                },
+                timeout=30,
+            )
+            if not resp:
+                break
+            page_entries = []
+            if isinstance(resp, str):
+                try:
+                    parsed = json.loads(resp)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, (dict, list)):
+                    resp = parsed
+                else:
+                    for line in resp.splitlines():
+                        m = line_re.search(line)
+                        if m:
+                            page_entries.append({"address": f"0x{m.group(1)}"})
+            if isinstance(resp, dict):
+                items = (
+                    resp.get("items")
+                    or resp.get("globals")
+                    or resp.get("results")
+                    or []
+                )
+                for item in items:
+                    if isinstance(item, dict):
+                        addr = item.get("address") or item.get("addr")
+                        if addr:
+                            page_entries.append({
+                                "address": addr if str(addr).startswith("0x") else f"0x{addr}",
+                            })
+            elif isinstance(resp, list):
+                for item in resp:
+                    if isinstance(item, dict):
+                        addr = item.get("address") or item.get("addr")
+                        if addr:
+                            page_entries.append({
+                                "address": addr if str(addr).startswith("0x") else f"0x{addr}",
+                            })
+            # Append, dedup by address (defensive — some pagination
+            # implementations re-emit overlap rows on partial pages).
+            new_entries = 0
+            for e in page_entries:
+                a = e["address"]
+                if a not in seen:
+                    seen.add(a)
+                    out.append(e)
+                    new_entries += 1
+            # Page exhausted: short page (fewer rows than requested) OR
+            # no new entries (every row was a duplicate / unparseable).
+            if new_entries == 0 or len(page_entries) < page_size:
+                break
+        return out
+
+    def _audit_global_via_mcp(prog_path, addr):
+        """Adapter — fetch one global's audit via /audit_global."""
+        from fun_doc import ghidra_get
+        resp = ghidra_get("/audit_global", params={"program": prog_path, "address": addr}, timeout=10)
+        if not resp:
+            return None
+        if isinstance(resp, str):
+            try:
+                resp = json.loads(resp)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        return resp
+
+    def _make_global_scorer():
+        from fun_doc import _fetch_programs
+        return GlobalScorer(
+            worker_manager=worker_mgr,
+            project_folder_getter=_project_folder,
+            state_dir=Path(__file__).parent,
+            fetch_programs=_fetch_programs,
+            list_globals_for_program=_list_globals_for_program,
+            audit_global=_audit_global_via_mcp,
+            on_status_change=_emit_global_inventory_status,
+            current_binary_name_getter=_current_binary_name,
+        )
+
+    global_scorer = _make_global_scorer()
+
+    try:
+        if (load_queue().get("config") or {}).get("global_inventory_enabled"):
+            global_scorer.set_enabled(True)
+    except Exception as _exc:
+        print(f"  Global scorer auto-start skipped: {_exc}")
 
     @socketio.on("request_start_worker")
     def handle_start_worker(data):
@@ -1131,6 +1908,30 @@ def create_app(state_file, event_bus=None):
                 continuous=continuous,
             )
             sio_emit("worker_started_ack", {"worker_id": worker_id})
+        except ValueError as e:
+            sio_emit("worker_error", {"error": str(e)})
+
+    @socketio.on("request_start_globals_worker")
+    def handle_start_globals_worker(data):
+        """Launch a globals worker on the selected binary. Per Q1/Q9 the
+        binary is required (selected in the header dropdown by the user
+        before clicking the button); the WorkerManager rejects launches
+        with no binary or a binary already held by another globals worker."""
+        try:
+            provider = (data or {}).get("provider", "minimax")
+            continuous = bool((data or {}).get("continuous", False))
+            count = max(1, min(500, int((data or {}).get("count", 5))))
+            model = (data or {}).get("model") or None
+            binary = (data or {}).get("binary") or None
+            worker_id = worker_mgr.start_worker(
+                provider=provider,
+                count=count,
+                model=model,
+                binary=binary,
+                continuous=continuous,
+                mode="globals",
+            )
+            sio_emit("worker_started_ack", {"worker_id": worker_id, "mode": "globals"})
         except ValueError as e:
             sio_emit("worker_error", {"error": str(e)})
 
@@ -1306,6 +2107,8 @@ def create_app(state_file, event_bus=None):
     def queue_config():
         from fun_doc import DEFAULT_QUEUE_CONFIG
 
+        supported_providers = ("claude", "codex", "minimax", "gemini")
+
         queue = load_queue()
         if request.method == "POST":
             data = request.json or {}
@@ -1374,11 +2177,402 @@ def create_app(state_file, event_bus=None):
                         jsonify({"error": "audit_min_delta must be int 0-100"}),
                         400,
                     )
+            if "provider_max_turns" in data:
+                provider_max_turns = data["provider_max_turns"]
+                if not isinstance(provider_max_turns, dict):
+                    return (
+                        jsonify({"error": "provider_max_turns must be an object"}),
+                        400,
+                    )
+
+                normalized_turns = {}
+                for provider, turn_value in provider_max_turns.items():
+                    if provider not in supported_providers:
+                        return (
+                            jsonify(
+                                {
+                                    "error": f"unsupported provider in provider_max_turns: {provider}"
+                                }
+                            ),
+                            400,
+                        )
+                    try:
+                        normalized_turns[provider] = max(1, int(turn_value))
+                    except (TypeError, ValueError):
+                        return (
+                            jsonify(
+                                {
+                                    "error": f"provider_max_turns.{provider} must be int >= 1"
+                                }
+                            ),
+                            400,
+                        )
+
+                cfg["provider_max_turns"] = normalized_turns
+            if "provider_models" in data:
+                provider_models = data["provider_models"]
+                if not isinstance(provider_models, dict):
+                    return jsonify({"error": "provider_models must be an object"}), 400
+
+                normalized_models = {}
+                for provider, mode_map in provider_models.items():
+                    if provider not in supported_providers:
+                        return (
+                            jsonify(
+                                {
+                                    "error": f"unsupported provider in provider_models: {provider}"
+                                }
+                            ),
+                            400,
+                        )
+                    if not isinstance(mode_map, dict):
+                        return (
+                            jsonify(
+                                {
+                                    "error": f"provider_models.{provider} must be an object"
+                                }
+                            ),
+                            400,
+                        )
+                    for mode, model_name in mode_map.items():
+                        normalized_mode = str(mode).upper()
+                        if normalized_mode not in ("FULL", "FIX", "VERIFY"):
+                            return (
+                                jsonify(
+                                    {
+                                        "error": f"unsupported mode in provider_models.{provider}: {mode}"
+                                    }
+                                ),
+                                400,
+                            )
+                        normalized_name = str(model_name or "").strip()
+                        if normalized_name:
+                            normalized_models.setdefault(provider, {})[
+                                normalized_mode
+                            ] = normalized_name
+
+                cfg["provider_models"] = normalized_models
+            if "inventory_enabled" in data:
+                cfg["inventory_enabled"] = bool(data["inventory_enabled"])
+                # Reflect immediately on the running scorer instance — the
+                # opt-in toggle is the only knob that can flip the daemon
+                # on/off without a dashboard restart.
+                try:
+                    inventory_scorer.set_enabled(cfg["inventory_enabled"])
+                except Exception as _exc:
+                    print(f"  Inventory scorer toggle failed: {_exc}")
+            if "global_inventory_enabled" in data:
+                cfg["global_inventory_enabled"] = bool(data["global_inventory_enabled"])
+                try:
+                    global_scorer.set_enabled(cfg["global_inventory_enabled"])
+                except Exception as _exc:
+                    print(f"  Global scorer toggle failed: {_exc}")
             queue["config"] = cfg
             save_queue(queue)
             socketio.emit("queue_changed", {"action": "config", "config": cfg})
             return jsonify({"ok": True, "config": cfg})
         return jsonify({"config": queue.get("config", dict(DEFAULT_QUEUE_CONFIG))})
+
+    @app.route("/api/inventory/status", methods=["GET"])
+    def inventory_status():
+        """Combined snapshot: scorer runtime state + per-binary inventory
+        records. The dashboard widget reads the scorer state for the live
+        line; the Inventory panel reads `binaries` for the table.
+
+        Per-binary records overlay state.json's documentable+scored counts
+        on top of inventory.json's persisted (totals + last_scan)."""
+        try:
+            state = load_state()
+            funcs = state.get("functions") or {}
+            persisted = load_inventory(Path(__file__).parent).get("binaries", {})
+            totals_by_path = {
+                path: rec.get("total_documentable", 0)
+                for path, rec in persisted.items()
+                if rec.get("total_documentable")
+            }
+            inventory = compute_per_binary_inventory(
+                funcs, totals_by_path=totals_by_path
+            )
+            for path, persisted_rec in persisted.items():
+                rec = inventory.setdefault(
+                    path,
+                    {
+                        "name": persisted_rec.get("name") or Path(path).name,
+                        "total_documentable": persisted_rec.get(
+                            "total_documentable", 0
+                        ),
+                        "scored": 0,
+                        "last_scan": persisted_rec.get("last_scan"),
+                    },
+                )
+                rec["last_scan"] = persisted_rec.get("last_scan")
+                rec["name"] = persisted_rec.get("name") or rec.get("name")
+
+            scorer_status = inventory_scorer.get_status()
+            blacklist = set(scorer_status.get("blacklisted") or [])
+
+            binaries = []
+            for path, rec in inventory.items():
+                total = rec.get("total_documentable", 0) or 0
+                scored = rec.get("scored", 0) or 0
+                missing = max(0, total - scored)
+                pct = round(100.0 * scored / total, 1) if total else 0.0
+                row_status = status_for(rec)
+                if path in blacklist:
+                    row_status = "blacklisted"
+                binaries.append(
+                    {
+                        "path": path,
+                        "name": rec.get("name") or Path(path).name,
+                        "total_documentable": total,
+                        "scored": scored,
+                        "missing": missing,
+                        "percent": pct,
+                        "last_scan": rec.get("last_scan"),
+                        "status": row_status,
+                    }
+                )
+            # Most-missing first, reverse-alpha tiebreak (Q4). Two stable
+            # sorts: secondary key first, primary key last.
+            binaries.sort(key=lambda r: r["name"], reverse=True)  # reverse-alpha
+            binaries.sort(key=lambda r: r["missing"], reverse=True)  # missing desc
+            totals = {
+                "total_documentable": sum(r["total_documentable"] for r in binaries),
+                "scored": sum(r["scored"] for r in binaries),
+                "missing": sum(r["missing"] for r in binaries),
+                "binaries_total": len(binaries),
+                "binaries_complete": sum(
+                    1 for r in binaries if r["status"] == "complete"
+                ),
+            }
+            return jsonify(
+                {
+                    "scorer": scorer_status,
+                    "totals": totals,
+                    "binaries": binaries,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    @app.route("/api/inventory/toggle", methods=["POST"])
+    def inventory_toggle():
+        """Enable/disable the scorer. Persists to priority_queue.json so
+        the choice survives dashboard restarts (Q9 opt-in toggle)."""
+        data = request.json or {}
+        enabled = bool(data.get("enabled"))
+        queue = load_queue()
+        cfg = dict(queue.get("config") or {})
+        cfg["inventory_enabled"] = enabled
+        queue["config"] = cfg
+        save_queue(queue)
+        inventory_scorer.set_enabled(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+
+    @app.route("/api/inventory/clear_blacklist", methods=["POST"])
+    def inventory_clear_blacklist():
+        """Clear the session blacklist for one path or all paths."""
+        data = request.json or {}
+        path = data.get("path")
+        inventory_scorer.clear_blacklist(path)
+        return jsonify({"ok": True})
+
+    @app.route("/api/inventory/force_on", methods=["POST"])
+    def inventory_force_on():
+        """Toggle force-on mode (Q3=C). Overrides every loop-level pause:
+        the scorer ignores doc-worker activity and re-walks the least-
+        recently-scanned binary when nothing is otherwise pending. Not
+        persisted — opt-in per session, since the trade-off (HTTP slot
+        contention with workers) shouldn't survive a restart."""
+        data = request.json or {}
+        force_on = bool(data.get("force_on"))
+        inventory_scorer.set_force_on(force_on)
+        return jsonify({"ok": True, "force_on": force_on})
+
+    @app.route("/api/inventory/reset", methods=["POST"])
+    def inventory_reset():
+        """Per-binary reset: drop the named binary's record from
+        `inventory.json` and clear its blacklist entry, so the scorer
+        re-walks just that binary on the next loop. Surfaced in the UI
+        only when `total_documentable < 100` — a heuristic for "this row
+        looks wedged" that catches the empty-fetch bug signature without
+        forcing a wider wipe than the user asked for. The `path` field
+        is required."""
+        data = request.json or {}
+        path = data.get("path")
+        if not path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            from inventory_scorer import (
+                load_inventory as _load_inv,
+                save_inventory as _save_inv,
+            )
+            inv_dir = Path(__file__).parent
+            data_inv = _load_inv(inv_dir)
+            bins = data_inv.get("binaries") or {}
+            removed = bins.pop(path, None) is not None
+            if removed:
+                data_inv["binaries"] = bins
+                _save_inv(inv_dir, data_inv)
+            inventory_scorer.clear_blacklist(path)
+            socketio.emit("inventory_reset", {"ok": True, "path": path})
+            return jsonify({"ok": True, "removed": removed, "path": path})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    # --- Global-variable inventory (v5.7.0) ---
+
+    @app.route("/api/global_inventory/status", methods=["GET"])
+    def global_inventory_status():
+        """Combined snapshot: global-scorer runtime state + per-binary
+        global-coverage records. The dashboard panel reads `binaries`
+        for the table; the scorer state is the live status line."""
+        try:
+            persisted = load_global_inventory(Path(__file__).parent).get("binaries", {})
+            scorer_status = global_scorer.get_status()
+            blacklist = set(scorer_status.get("blacklisted") or [])
+
+            from global_scorer import status_for as _global_status_for
+            binaries = []
+            for path, rec in persisted.items():
+                total = rec.get("total_documentable", 0) or 0
+                fully = rec.get("fully_documented", 0) or 0
+                with_issues = max(0, total - fully)
+                pct = round(100.0 * fully / total, 1) if total else 0.0
+                row_status = _global_status_for(rec)
+                if path in blacklist:
+                    row_status = "blacklisted"
+                binaries.append({
+                    "path": path,
+                    "name": rec.get("name") or Path(path).name,
+                    "total_documentable": total,
+                    "fully_documented": fully,
+                    "with_issues": with_issues,
+                    "percent": pct,
+                    "last_scan": rec.get("last_scan"),
+                    "status": row_status,
+                })
+            binaries.sort(key=lambda r: r["name"], reverse=True)
+            binaries.sort(key=lambda r: r["with_issues"], reverse=True)
+            totals = {
+                "total_documentable": sum(r["total_documentable"] for r in binaries),
+                "fully_documented": sum(r["fully_documented"] for r in binaries),
+                "with_issues": sum(r["with_issues"] for r in binaries),
+                "binaries_total": len(binaries),
+                "binaries_complete": sum(
+                    1 for r in binaries if r["status"] == "complete"
+                ),
+            }
+            return jsonify({
+                "scorer": scorer_status,
+                "totals": totals,
+                "binaries": binaries,
+            })
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    @app.route("/api/global_inventory/toggle", methods=["POST"])
+    def global_inventory_toggle():
+        """Enable/disable the global scorer. Persists to priority_queue.json."""
+        data = request.json or {}
+        enabled = bool(data.get("enabled"))
+        queue = load_queue()
+        cfg = dict(queue.get("config") or {})
+        cfg["global_inventory_enabled"] = enabled
+        queue["config"] = cfg
+        save_queue(queue)
+        global_scorer.set_enabled(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+
+    @app.route("/api/global_inventory/clear_blacklist", methods=["POST"])
+    def global_inventory_clear_blacklist():
+        data = request.json or {}
+        path = data.get("path")
+        global_scorer.clear_blacklist(path)
+        return jsonify({"ok": True})
+
+    @app.route("/api/global_inventory/force_on", methods=["POST"])
+    def global_inventory_force_on():
+        """Toggle force-on for the global scorer. Mirrors inventory_force_on."""
+        data = request.json or {}
+        force_on = bool(data.get("force_on"))
+        global_scorer.set_force_on(force_on)
+        return jsonify({"ok": True, "force_on": force_on})
+
+    @app.route("/api/global_inventory/reset", methods=["POST"])
+    def global_inventory_reset():
+        """Per-binary reset for globals. Same shape as inventory_reset —
+        drops just the named binary so the global scorer re-walks it.
+        Surfaced in the UI only when `total_documentable < 100`."""
+        data = request.json or {}
+        path = data.get("path")
+        if not path:
+            return jsonify({"error": "path is required"}), 400
+        try:
+            inv_dir = Path(__file__).parent
+            data_inv = load_global_inventory(inv_dir)
+            bins = data_inv.get("binaries") or {}
+            removed = bins.pop(path, None) is not None
+            if removed:
+                data_inv["binaries"] = bins
+                from global_scorer import save_inventory as _save_g_inv
+                _save_g_inv(inv_dir, data_inv)
+            global_scorer.clear_blacklist(path)
+            socketio.emit("global_inventory_reset", {"ok": True, "path": path})
+            return jsonify({"ok": True, "removed": removed, "path": path})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    # --- Provider quota pauses (Q1-Q11) ---
+    from provider_pause import get_default_manager as _get_pause_mgr
+
+    def _emit_provider_pauses(active=None):
+        try:
+            socketio.emit(
+                "provider_pauses",
+                {"active": active if active is not None else _get_pause_mgr().all_active()},
+            )
+        except Exception:
+            pass
+
+    _get_pause_mgr().set_on_change(_emit_provider_pauses)
+
+    @app.route("/api/provider_pauses", methods=["GET"])
+    def provider_pauses_list():
+        """Active per-(provider, model) pauses with paused_until + reason."""
+        active = _get_pause_mgr().all_active()
+        return jsonify(
+            {
+                "active": [
+                    {
+                        "provider": p,
+                        "model": m,
+                        "paused_until": until,
+                        "reason": reason,
+                    }
+                    for p, m, until, reason in active
+                ]
+            }
+        )
+
+    @app.route("/api/provider_pauses/clear", methods=["POST"])
+    def provider_pauses_clear():
+        """Manually clear a pause. POST {provider, model} clears one;
+        empty body clears all. Use this if the API recovered before the
+        parsed reset window (rare but possible)."""
+        data = request.json or {}
+        provider = data.get("provider")
+        model = data.get("model")
+        mgr = _get_pause_mgr()
+        if provider and model:
+            mgr.clear(provider, model)
+        else:
+            mgr.clear_all()
+        return jsonify({"ok": True})
+
+    restored_workers = worker_mgr.restore_workers()
+    if restored_workers:
+        print(f"  Restored {len(restored_workers)} dashboard worker(s) after restart")
 
     @app.route("/api/functions/search", methods=["GET"])
     def search_functions():
@@ -1499,6 +2693,8 @@ def create_app(state_file, event_bus=None):
                     "last_result": func.get("last_result"),
                     "pinned": key in pinned,
                     "unscored": not func.get("last_processed"),
+                    "tool_calls": func.get("tool_calls"),
+                    "tool_calls_known": func.get("tool_calls_known"),
                 }
             )
         if sort == "name":
@@ -1556,6 +2752,23 @@ def create_app(state_file, event_bus=None):
                     r["score"],
                 )
             )
+        elif sort == "tools":
+            # Most tool calls first; unmeasured (-1 / None) sort to bottom.
+            def _tools_key(r):
+                tc = r.get("tool_calls")
+                if tc is None or tc < 0:
+                    return (1, 0)
+                return (0, -tc)
+
+            results.sort(key=_tools_key)
+        elif sort == "tools_desc":
+            def _tools_key_desc(r):
+                tc = r.get("tool_calls")
+                if tc is None or tc < 0:
+                    return (1, 0)
+                return (0, tc)
+
+            results.sort(key=_tools_key_desc)
         elif sort == "layer_desc":
             results.sort(
                 key=lambda r: (
@@ -1576,8 +2789,33 @@ def create_app(state_file, event_bus=None):
 
     # --- Folder / binary selection ---
 
+    # TTL cache for Ghidra HTTP fetchers. Both _fetch_project_binaries and
+    # _fetch_project_folders are called from compute_stats* on every dashboard
+    # render; folders is the worst offender because it recursively walks the
+    # project tree (many serial HTTP round-trips). Project structure rarely
+    # changes during a session, so 60-second cache is safe and removes the
+    # bursty latency spikes from /api/stats and /.
+    _ghidra_fetch_cache = {}  # key: (kind, arg) -> (expires_at, value)
+    _GHIDRA_FETCH_TTL_S = 60.0
+
+    def _ghidra_cache_get(key):
+        rec = _ghidra_fetch_cache.get(key)
+        if rec is None:
+            return None
+        expires_at, value = rec
+        if time.time() >= expires_at:
+            return None
+        return value
+
+    def _ghidra_cache_set(key, value):
+        _ghidra_fetch_cache[key] = (time.time() + _GHIDRA_FETCH_TTL_S, value)
+
     def _fetch_project_binaries(folder):
-        """Fetch all binaries from Ghidra project via HTTP endpoint."""
+        """Fetch all binaries from Ghidra project via HTTP endpoint.
+        TTL-cached (60s) to avoid the per-render Ghidra round-trip."""
+        cached = _ghidra_cache_get(("binaries", folder))
+        if cached is not None:
+            return cached
         import requests
 
         try:
@@ -1589,11 +2827,13 @@ def create_app(state_file, event_bus=None):
             r.raise_for_status()
             data = r.json()
             files = data.get("files", [])
-            return sorted(
+            result = sorted(
                 f["name"]
                 for f in files
                 if isinstance(f, dict) and f.get("content_type") == "Program"
             )
+            _ghidra_cache_set(("binaries", folder), result)
+            return result
         except Exception:
             return []
 
@@ -1656,7 +2896,12 @@ def create_app(state_file, event_bus=None):
         return jsonify({"ok": True, "project_folder": folder})
 
     def _fetch_project_folders():
-        """Recursively discover all folders with binaries in the Ghidra project."""
+        """Recursively discover all folders with binaries in the Ghidra project.
+        TTL-cached (60s) — recursive walk does many serial Ghidra HTTP calls.
+        Project folder structure rarely changes during a session."""
+        cached = _ghidra_cache_get(("folders", None))
+        if cached is not None:
+            return cached
         import requests
 
         folders = []
@@ -1685,7 +2930,9 @@ def create_app(state_file, event_bus=None):
                 pass
 
         _walk("/")
-        return sorted(folders)
+        result = sorted(folders)
+        _ghidra_cache_set(("folders", None), result)
+        return result
 
     @app.route("/api/context/folders", methods=["GET"])
     def get_available_folders():
@@ -1880,5 +3127,27 @@ def create_app(state_file, event_bus=None):
             info["name"] = prog
             result.append(info)
         return jsonify({"binaries": result})
+
+    # Pre-warm both caches at startup so the FIRST user request to / or
+    # /api/stats lands on warm cache instead of paying the recursive Ghidra
+    # walk + PG pool open + runs.jsonl scan all at once. Runs in a daemon
+    # thread so dashboard startup isn't blocked if Ghidra is slow.
+    def _prewarm():
+        try:
+            _fetch_project_folders()
+        except Exception:
+            pass
+        try:
+            state = load_state()
+            folder = state.get("project_folder") or "/"
+            _fetch_project_binaries(folder)
+        except Exception:
+            pass
+        try:
+            load_run_logs()
+            count_run_totals()
+        except Exception:
+            pass
+    threading.Thread(target=_prewarm, daemon=True, name="dash-prewarm").start()
 
     return app, socketio

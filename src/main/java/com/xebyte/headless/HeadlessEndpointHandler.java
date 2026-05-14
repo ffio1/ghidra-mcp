@@ -42,7 +42,7 @@ import ghidra.app.cmd.disassemble.DisassembleCommand;
  */
 public class HeadlessEndpointHandler {
 
-    private static final String VERSION = "5.3.2-headless";
+    private static final String VERSION = "5.9.0-headless";
     private final ProgramProvider programProvider;
     private final ThreadingStrategy threadingStrategy;
     private final TaskMonitor monitor;
@@ -571,7 +571,7 @@ public class HeadlessEndpointHandler {
      * Get all variables (parameters and locals) for a function.
      */
     public String getFunctionVariables(String functionName, String programName) {
-        return functionService.getFunctionVariables(functionName, programName, null, null).toJson();
+        return functionService.getFunctionVariables(functionName, null, programName, null, null).toJson();
     }
 
     /**
@@ -1182,9 +1182,10 @@ public class HeadlessEndpointHandler {
      * Enhanced function search with multiple filter options.
      */
     public String searchFunctionsEnhanced(String namePattern, Integer minXrefs, Integer maxXrefs,
-                                          Boolean hasCustomName, boolean regex, String sortBy,
+                                          Boolean hasCustomName, Boolean isThunk, Boolean isExternal,
+                                          boolean regex, String sortBy,
                                           int offset, int limit, String programName) {
-        return analysisService.searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, null, hasCustomName, regex, sortBy, offset, limit, programName).toJson();
+        return analysisService.searchFunctionsEnhanced(namePattern, minXrefs, maxXrefs, null, hasCustomName, isThunk, isExternal, regex, sortBy, offset, limit, programName).toJson();
     }
 
     /**

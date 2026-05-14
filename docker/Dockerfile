@@ -7,8 +7,14 @@
 FROM eclipse-temurin:21-jdk AS builder
 
 # Build arguments
-ARG GHIDRA_VERSION=12.0.3
-ARG GHIDRA_DATE=20260210
+# IMPORTANT: keep GHIDRA_VERSION in sync with pom.xml's <ghidra.version>.
+# The Maven build resolves ghidra:* artifacts at this exact version, and the
+# install-file step below stamps that version onto the JARs we extract from
+# the Ghidra release zip. A mismatch means Maven can't resolve dependencies
+# (see #183). GHIDRA_DATE must match the asset filename of the chosen
+# version on the upstream NSA/ghidra GitHub release.
+ARG GHIDRA_VERSION=12.0.4
+ARG GHIDRA_DATE=20260303
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -56,7 +62,15 @@ RUN mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Framework/Generic/lib/
     mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Features/Decompiler/lib/Decompiler.jar \
         -DgroupId=ghidra -DartifactId=Decompiler -Dversion=${GHIDRA_VERSION} -Dpackaging=jar && \
     mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Framework/DB/lib/DB.jar \
-        -DgroupId=ghidra -DartifactId=DB -Dversion=${GHIDRA_VERSION} -Dpackaging=jar
+        -DgroupId=ghidra -DartifactId=DB -Dversion=${GHIDRA_VERSION} -Dpackaging=jar && \
+    mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Framework/Emulation/lib/Emulation.jar \
+        -DgroupId=ghidra -DartifactId=Emulation -Dversion=${GHIDRA_VERSION} -Dpackaging=jar && \
+    mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Debug/Debugger-api/lib/Debugger-api.jar \
+        -DgroupId=ghidra -DartifactId=Debugger-api -Dversion=${GHIDRA_VERSION} -Dpackaging=jar && \
+    mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Debug/Framework-TraceModeling/lib/Framework-TraceModeling.jar \
+        -DgroupId=ghidra -DartifactId=Framework-TraceModeling -Dversion=${GHIDRA_VERSION} -Dpackaging=jar && \
+    mvn -q install:install-file -Dfile=/opt/ghidra/Ghidra/Debug/Debugger-rmi-trace/lib/Debugger-rmi-trace.jar \
+        -DgroupId=ghidra -DartifactId=Debugger-rmi-trace -Dversion=${GHIDRA_VERSION} -Dpackaging=jar
 
 # Copy source code
 WORKDIR /build
