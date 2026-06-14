@@ -227,6 +227,37 @@ def test_hard_callee_names_set_is_nonempty_and_canonical():
     assert "__chkstk" not in HARD_CALLEE_NAMES
 
 
+def test_v591_locale_atexit_patterns_added():
+    """v5.9.1 added _Atexit / _Setgloballocale / TLS-lazy-init helpers to
+    HARD_CALLEE_NAMES. Caught the SetGlobalLocale miss observed on release
+    day where the worker spent 92K tokens documenting an msvcp library
+    thunk. These symbols are MSVCP internals; user code uses `atexit()`
+    (no underscore) and never calls `_Setgloballocale` directly."""
+    for sym in ("_Atexit", "_Setgloballocale", "__dyn_tls_init", "__tlregdtor"):
+        assert sym in HARD_CALLEE_NAMES, f"v5.9.1 pattern missing: {sym}"
+
+
+def test_set_global_locale_pattern_classifies():
+    """End-to-end check using a synthetic version of the BH.dll
+    SetGlobalLocale body that escaped detection in v5.9.0. The decompile
+    body contains a call to `_Atexit` (the MSVCP atexit-registration
+    helper) and references `std::locale`, which together must classify
+    as library."""
+    body = '''
+    void SetGlobalLocale(void *pFacet) {
+        if (g_bGlobalLocaleFacetInitialized == 0) {
+            g_bGlobalLocaleFacetInitialized = 1;
+            _Atexit(_Cleanup_global_locale);
+        }
+        g_pGlobalLocaleFacet = pFacet;
+        // see std::locale internal init
+    }
+    '''
+    result = detect_library_code("SetGlobalLocale", body)
+    assert result.is_library, f"v5.9.0 miss should now classify: {result}"
+    assert any("_Atexit" in r for r in result.reasons), result.reasons
+
+
 def test_confidence_increases_with_more_hits():
     """Multiple hard hits should push confidence higher than single hits."""
     body_one = "void foo() { __SEH_prolog4(); }"
@@ -237,3 +268,102 @@ def test_confidence_increases_with_more_hits():
     assert one.is_library and two.is_library
     # At minimum, two's confidence is no worse than one's
     assert two.confidence >= one.confidence
+
+
+# ---------------------------------------------------------------------------
+# Copilot review false-positive guards (v5.11.5)
+#
+# The original HARD_NAME_PATTERNS list had two regexes that were too broad
+# and would misclassify legitimate user code:
+#
+#   1. `^\?[A-Za-z_].*@@` matched ANY MSVC-mangled name, including
+#      user-authored exported C++ APIs whose mangled form happens to
+#      share the same outer shape (e.g., `?MyApiFunc@MyApp@@YA...`).
+#      Restricted to known STL/MSVCP namespace markers.
+#
+#   2. `^(Parse|Read|Write|Get|Put|Skip)?(Signed|Unsigned)?(Char|Short|
+#      Int|Long|Float|Double|Hex|...)(Value|Field|Token)?$` matched
+#      legitimate user functions like `GetInt`, `ReadLong`, `WriteFloat`,
+#      and even just `Char` alone. Removed; the narrower
+#      SOFT_NAME_PATTERNS entry already catches the real library cases
+#      when corroborated by body evidence.
+#
+# These tests pin the false-positive prevention.
+# ---------------------------------------------------------------------------
+
+
+def test_user_mangled_cxx_export_not_misclassified():
+    """A user-authored C++ class method with a non-std namespace and a
+    clean body (no library callees) should NOT be classified as library
+    code. The pre-v5.11.5 regex would catch this purely on the mangled
+    name shape — losing real user code to the auto-skip."""
+    # Mangled form: ?DoWork@MyApp@@QAEHXZ
+    # = MyApp::DoWork (instance method, returns int, no params)
+    result = detect_library_code("?DoWork@MyApp@@QAEHXZ", "iVar1 = this->field_4; return iVar1;")
+    assert not result.is_library, (
+        f"User-authored export was misclassified: reasons={result.reasons}"
+    )
+
+
+def test_std_mangled_name_still_classifies():
+    """The restriction must not regress the actual library cases —
+    `?_Xinvalid_argument@std@@YAXPBD@Z` (std::_Xinvalid_argument) is
+    canonical STL and must still flag."""
+    result = detect_library_code("?_Xinvalid_argument@std@@YAXPBD@Z", "")
+    assert result.is_library
+
+
+def test_chrono_namespace_mangled_classifies():
+    """`?...@chrono@@` is std::chrono internals — must still classify."""
+    result = detect_library_code("?duration_cast@chrono@@YA?AV12@H@Z", "")
+    assert result.is_library
+
+
+def test_GetInt_alone_not_misclassified():
+    """`GetInt` is a common user-function name (config readers, deserializers,
+    etc.). The pre-v5.11.5 broad HARD regex matched it directly. After the
+    fix, with no body evidence, it must NOT classify as library."""
+    result = detect_library_code("GetInt", "iVar1 = this->m_value; return iVar1;")
+    assert not result.is_library, (
+        f"GetInt was misclassified: reasons={result.reasons}"
+    )
+
+
+def test_ReadLong_with_user_body_not_misclassified():
+    """`ReadLong` from a user binary deserializer. No library callees
+    in the body. Must NOT classify."""
+    body = """
+    lVar1 = *(longlong *)(this->buffer + this->offset);
+    this->offset = this->offset + 8;
+    return lVar1;
+    """
+    result = detect_library_code("ReadLong", body)
+    assert not result.is_library
+
+
+def test_WriteFloat_isolated_not_misclassified():
+    """Same as above but for `WriteFloat`. User-authored buffer writer."""
+    body = "*(float *)(this->buf + this->pos) = fVar1; this->pos = this->pos + 4;"
+    result = detect_library_code("WriteFloat", body)
+    assert not result.is_library
+
+
+def test_Char_function_alone_not_misclassified():
+    """The original broad regex even matched a function literally named
+    `Char`. Pin that this is no longer a HARD signal."""
+    result = detect_library_code("Char", "return this->m_char;")
+    assert not result.is_library
+
+
+def test_ParseSignedShort_with_iostream_body_still_classifies():
+    """The motivating original case (test_parse_signed_short_pattern_matches_with_body_signal
+    above already covers this with iostream callees). Re-pinning here as
+    part of the false-positive guard suite: when the name pattern IS
+    corroborated by body evidence, classification still works through
+    the SOFT pattern + body callee path."""
+    body = """
+    _Xinvalid_argument(s);
+    iVar1 = std::ios_base::flags(this);
+    """
+    result = detect_library_code("ParseSignedShort", body)
+    assert result.is_library

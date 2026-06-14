@@ -391,6 +391,11 @@ class WorkerManager:
                     "last_heartbeat_at": w.get("last_heartbeat_at"),
                     "stall_kill_fired": bool(w.get("stall_kill_fired", False)),
                     "is_stale": heartbeat_age > STALL_KILL_THRESHOLD_SEC,
+                    # exit_reason is set on clean exits where the operator
+                    # benefits from knowing *why* the worker stopped. Today
+                    # we set it for "no_eligible_candidates" (queue empty);
+                    # future reasons can be added without changing this shape.
+                    "exit_reason": w.get("exit_reason"),
                     }
                 )
             return rows
@@ -426,6 +431,7 @@ class WorkerManager:
                 _bump_handoff_counter,
                 get_auto_escalation_provider,
                 update_function_state,
+                check_ghidra_online,
             )
 
             worker["status"] = "running"
@@ -647,6 +653,15 @@ class WorkerManager:
                             break
 
                 if target is None:
+                    # No eligible candidates left in the priority queue for
+                    # this binary. Most common cause: every function on the
+                    # binary is either at/above good_enough_score, classified
+                    # as library code, or has exhausted retry budgets
+                    # (consecutive_fails / stagnation_runs). Without an exit
+                    # reason the dashboard renders this as a generic "stopped"
+                    # and the operator can't tell it apart from a real failure.
+                    if processed == 0:
+                        worker["exit_reason"] = "no_eligible_candidates"
                     break  # No more work available
 
                 key, func = target
@@ -766,11 +781,40 @@ class WorkerManager:
                     if worker["stop_flag"].is_set():
                         break
                     continue  # retry with next function
+                elif result == "ghidra_offline":
+                    # Ghidra is unreachable. Don't churn the queue (pre-fix this spun ~100
+                    # runs/hour for hours and parked functions). Back off with capped
+                    # exponential delay while polling /check_connection, then resume — the
+                    # function was left re-pickable, so it is retried once Ghidra is back.
+                    streak = worker.get("_ghidra_offline_streak", 0) + 1
+                    worker["_ghidra_offline_streak"] = streak
+                    backoff = min(15 * (2 ** (streak - 1)), 300)  # 15,30,60,120,240,cap 300
+                    print(
+                        f"  Ghidra offline — waiting up to {backoff}s for recovery "
+                        f"(streak {streak})...",
+                        flush=True,
+                    )
+                    waited = 0
+                    while waited < backoff and not worker["stop_flag"].is_set():
+                        chunk = min(10, backoff - waited)
+                        worker["stop_flag"].wait(chunk)
+                        waited += chunk
+                        try:
+                            if check_ghidra_online():
+                                print("  Ghidra is back online — resuming.", flush=True)
+                                worker["_ghidra_offline_streak"] = 0
+                                break
+                        except Exception:
+                            pass
+                    if worker["stop_flag"].is_set():
+                        break
+                    continue  # leave function re-pickable; pick next once healthy
                 elif result in ("completed", "partial"):
                     worker["progress"]["completed"] += 1
                     session["completed"] += 1
                     session["functions"].append(key)
                     worker["_rate_limit_streak"] = 0  # reset on success
+                    worker["_ghidra_offline_streak"] = 0  # reset on success
                 elif result in ("skipped", "decompile_timeout", "library_code"):
                     worker["progress"]["skipped"] += 1
                     session["skipped"] += 1
@@ -877,6 +921,7 @@ class WorkerManager:
                 {
                     "worker_id": worker_id,
                     "reason": worker["status"],
+                    "exit_reason": worker.get("exit_reason"),
                     "progress": dict(worker["progress"]),
                 },
             )
@@ -990,13 +1035,61 @@ class WorkerManager:
         self._socketio.emit("worker_status", self.get_status())
 
 
-def create_app(state_file, event_bus=None):
+def compute_skip_reason(func: dict, key: str, pinned_keys: set) -> str | None:
+    """Return the selector skip reason for ``func``, or ``None`` if eligible.
+
+    Mirrors the gates in ``fun_doc.select_candidates`` exactly. Surfaced via
+    the dashboard's function-list APIs so the UI can show "why isn't this
+    function getting picked?" without users reading source. Keep in sync
+    with the selector; if a new gate lands there, add a branch here.
+
+    Every gate respects pinning — in ``select_candidates`` the pattern is
+    ``if func.get("X") and not is_pinned: continue``, so a pinned row with
+    a library_code / propagation / stagnation / etc. flag still gets
+    admitted at high priority. The dashboard column must reflect that
+    same reality or it'll lie to the user about what the worker will do.
+    """
+    is_pinned = key in pinned_keys
+    if func.get("library_code") and not is_pinned:
+        return "library_code"
+    if (
+        not is_pinned
+        and func.get("name_source") == "propagation"
+        and (
+            func.get("name_confidence") is None
+            or func.get("name_confidence", 0) < 0.5
+        )
+    ):
+        return "propagation"
+    if func.get("decompile_timeout") and not is_pinned:
+        return "decompile_timeout"
+    if func.get("stagnation_runs", 0) >= 3 and not is_pinned:
+        return "stagnation"
+    if func.get("recovery_pass_done") and not is_pinned:
+        return "recovery_done"
+    return None
+
+
+def create_app(state_file, event_bus=None, dashboard_port=5000):
     app = Flask(__name__, template_folder=str(Path(__file__).parent / "templates"))
     app.config["STATE_FILE"] = Path(state_file)
     app.config["LOG_FILE"] = Path(__file__).parent / "logs" / "runs.jsonl"
     app.config["QUEUE_FILE"] = Path(__file__).parent / "priority_queue.json"
 
-    socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
+    # Scope WebSocket CORS to the localhost dashboard origin rather than "*". The dashboard
+    # binds 127.0.0.1 only, but cors_allowed_origins="*" still lets any website the operator
+    # visits open a socket to it (cross-site WebSocket hijack / DNS rebinding). Override via
+    # FUN_DOC_DASHBOARD_ORIGINS (comma-separated) for reverse-proxy / remote-access setups.
+    _origins_env = os.environ.get("FUN_DOC_DASHBOARD_ORIGINS", "").strip()
+    if _origins_env:
+        allowed_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
+    else:
+        allowed_origins = [
+            f"http://127.0.0.1:{dashboard_port}",
+            f"http://localhost:{dashboard_port}",
+        ]
+
+    socketio = SocketIO(app, async_mode="threading", cors_allowed_origins=allowed_origins)
 
     # Wire EventBus -> SocketIO bridge
     bus = event_bus or get_bus()
@@ -1031,6 +1124,35 @@ def create_app(state_file, event_bus=None):
         "provider_timeout",
     ]:
         bus.on(evt, bridge(evt))
+
+    # --- Bridge event counters for the audit watcher ---
+    # The audit rule `bridge_counter_stall` (fun-doc/audit/rules.yaml)
+    # checks that tool_call / tool_result / model_text counters are
+    # advancing while workers are active. Until v5.11.3 this rule fired
+    # daily as a false positive because the diag endpoint it polls
+    # (`/api/_diag_bridge`) didn't exist — the fetcher caught the 404,
+    # returned an empty dict, and every counter read as 0 indefinitely.
+    # See registry.json: 24 fires per signature between 2026-04-25 and
+    # 2026-05-21.
+    #
+    # The fix wires three subscribers onto the bus that maintain
+    # monotonically-increasing counters, then surfaces them at
+    # /api/_diag_bridge in the shape the audit fetcher expects.
+    bridge_counters: dict[str, int] = {
+        "tool_call": 0,
+        "tool_result": 0,
+        "model_text": 0,
+    }
+    _bridge_counter_lock = threading.Lock()
+
+    def _make_bridge_counter(name: str):
+        def _inc(_data):
+            with _bridge_counter_lock:
+                bridge_counters[name] = bridge_counters.get(name, 0) + 1
+        return _inc
+
+    for _name in ("tool_call", "tool_result", "model_text"):
+        bus.on(_name, _make_bridge_counter(_name))
 
     # --- Data loading helpers ---
 
@@ -1615,6 +1737,13 @@ def create_app(state_file, event_bus=None):
                     "unscored": not func.get("last_processed"),
                     "tool_calls": func.get("tool_calls"),
                     "tool_calls_known": func.get("tool_calls_known"),
+                    # Provenance (#204) — surface name_source, the source-binary
+                    # forensic pointer, the gate-confidence, and the selector
+                    # skip reason (None when eligible).
+                    "name_source": func.get("name_source") or "scan",
+                    "name_source_binary": func.get("name_source_binary"),
+                    "name_confidence": func.get("name_confidence"),
+                    "skip_reason": compute_skip_reason(func, key, pinned_keys),
                 }
             )
         func_list.sort(key=lambda x: x["score"])
@@ -1965,6 +2094,24 @@ def create_app(state_file, event_bus=None):
         stats = compute_stats(state)
         stats.pop("all_functions", None)
         return jsonify(stats)
+
+    @app.route("/api/_diag_bridge")
+    def api_diag_bridge():
+        """Audit watcher's data source for the bridge_counter_stall rule.
+
+        Returns monotonically-increasing counters for tool_call,
+        tool_result, and model_text bus events. The audit rule trips
+        when any of these stays at zero for 30+ minutes while workers
+        are active — that pattern was the original signature of the
+        v5.7.x NameError silent-delivery bug (fixed in 78ba6cd).
+
+        Before v5.11.3 this endpoint did not exist; the audit fetcher
+        caught the 404 and returned an empty dict, which made every
+        counter read as 0 and produced 24+ false-positive fires.
+        """
+        with _bridge_counter_lock:
+            snapshot = dict(bridge_counters)
+        return jsonify({"bridge_counters": snapshot})
 
     @app.route("/api/queue", methods=["GET"])
     def get_queue():
@@ -2695,6 +2842,13 @@ def create_app(state_file, event_bus=None):
                     "unscored": not func.get("last_processed"),
                     "tool_calls": func.get("tool_calls"),
                     "tool_calls_known": func.get("tool_calls_known"),
+                    # Provenance (#204) — see compute_skip_reason() for the
+                    # selector-mirror logic. `name_source_binary` is the
+                    # forensic "where did this name come from?" pointer.
+                    "name_source": func.get("name_source") or "scan",
+                    "name_source_binary": func.get("name_source_binary"),
+                    "name_confidence": func.get("name_confidence"),
+                    "skip_reason": compute_skip_reason(func, key, pinned),
                 }
             )
         if sort == "name":

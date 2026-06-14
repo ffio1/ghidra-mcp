@@ -7,25 +7,26 @@
 
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Java](https://img.shields.io/badge/Java-21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
-[![Ghidra](https://img.shields.io/badge/Ghidra-12.0.4-brightgreen?style=for-the-badge&logoColor=white)](https://ghidra-sre.org/)
+[![Ghidra](https://img.shields.io/badge/Ghidra-12.1-brightgreen?style=for-the-badge&logoColor=white)](https://ghidra-sre.org/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-6C5CE7?style=for-the-badge&logoColor=white)](https://modelcontextprotocol.io/)
 
 [![Stars](https://img.shields.io/github/stars/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white&color=yellow)](https://github.com/bethington/ghidra-mcp/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/bethington/ghidra-mcp?style=for-the-badge&logo=git&logoColor=white)](https://github.com/bethington/ghidra-mcp/commits/main)
-[![Discussions](https://img.shields.io/github/discussions/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white)](https://github.com/bethington/ghidra-mcp/discussions)
+[![Discussions](https://img.shields.io/badge/discussions-join-7B68EE?style=for-the-badge&logo=github&logoColor=white)](https://github.com/bethington/ghidra-mcp/discussions)
 [![Issues](https://img.shields.io/github/issues/bethington/ghidra-mcp?style=for-the-badge&logo=github&logoColor=white&color=orange)](https://github.com/bethington/ghidra-mcp/issues)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/bethington/ghidra-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/bethington/ghidra-mcp)
 
 > If you find this useful, please ⭐ star the repo — it helps others discover it!
 >
 > If Ghidra MCP saves you time, consider [sponsoring the project](https://github.com/sponsors/bethington). One-time and recurring support both help fund compatibility updates, production hardening, docs, and new tooling.
 
-A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **243 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
+A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **249 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
 
 ## Why Ghidra MCP?
 
 Most Ghidra MCP implementations give you a handful of read-only tools and call it a day. This project is different — it was built by a reverse engineer who uses it daily on real binaries, not as a demo.
 
-- **243 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
+- **249 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
 - **Battle-tested AI workflows** — Proven documentation workflows (V5) refined across hundreds of functions. Includes step-by-step prompts, Hungarian notation reference, batch processing guides, and orphaned code discovery.
 - **Production-grade reliability** — Atomic transactions, batch operations (93% API call reduction), configurable timeouts, and graceful error handling. No silent failures.
 - **Cross-binary documentation transfer** — SHA-256 function hash matching propagates documentation across binary versions automatically. Document once, apply everywhere.
@@ -55,7 +56,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 ### Core MCP Integration
 - **Full MCP Compatibility** — Complete implementation of Model Context Protocol
-- **243 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
+- **249 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
 - **Production-Ready Reliability** — Atomic transactions, batch operations, configurable timeouts
 - **Real-time Analysis** — Live integration with Ghidra's analysis engine
 
@@ -99,8 +100,17 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 - **Java 21 LTS** (OpenJDK recommended)
 - **Apache Maven 3.9+**
-- **Ghidra 12.0.4** (or compatible version)
+- **Ghidra 12.1** (or compatible version)
 - **Python 3.10+** with pip
+
+> Shared Ghidra Server users: Ghidra 12.1 clients require a Ghidra
+> Server at 12.1, 12.0.5, or a newer compatible version. Upgrade the
+> server before using this plugin from a 12.1 client.
+>
+> Ghidra 12.1 ships Jython as an optional extension. Java scripts work
+> by default, but `.py` scripts in `ghidra_scripts/` require installing
+> the Jython extension from **File > Install Extensions** and restarting
+> Ghidra.
 
 ### Installation
 
@@ -117,14 +127,14 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 2. **Recommended: run environment preflight first:**
    ```text
-   python -m tools.setup preflight --ghidra-path "F:\ghidra_12.0.4_PUBLIC"
+   python -m tools.setup preflight --ghidra-path "F:\ghidra_12.1_PUBLIC"
    ```
 
 3. **Build and deploy to Ghidra:**
    ```text
-   python -m tools.setup ensure-prereqs --ghidra-path "F:\ghidra_12.0.4_PUBLIC"
+   python -m tools.setup ensure-prereqs --ghidra-path "F:\ghidra_12.1_PUBLIC"
    python -m tools.setup build
-   python -m tools.setup deploy --ghidra-path "F:\ghidra_12.0.4_PUBLIC"
+   python -m tools.setup deploy --ghidra-path "F:\ghidra_12.1_PUBLIC"
    ```
 
    `deploy` saves/closes an already-running matching Ghidra instance when
@@ -135,7 +145,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
    ```text
    # Skip automatic prerequisite setup
    python -m tools.setup build
-   python -m tools.setup deploy --ghidra-path "F:\ghidra_12.0.4_PUBLIC"
+   python -m tools.setup deploy --ghidra-path "F:\ghidra_12.1_PUBLIC"
    ```
 
 5. **Show command help**:
@@ -175,14 +185,14 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 3. **Run environment preflight:**
    ```bash
-   python -m tools.setup preflight --ghidra-path ~/ghidra_12.0.4_PUBLIC
+   python -m tools.setup preflight --ghidra-path ~/ghidra_12.1_PUBLIC
    ```
 
 4. **Build and deploy to Ghidra (single command):**
    ```bash
-   python -m tools.setup ensure-prereqs --ghidra-path ~/ghidra_12.0.4_PUBLIC
+   python -m tools.setup ensure-prereqs --ghidra-path ~/ghidra_12.1_PUBLIC
    python -m tools.setup build
-   python -m tools.setup deploy --ghidra-path ~/ghidra_12.0.4_PUBLIC
+   python -m tools.setup deploy --ghidra-path ~/ghidra_12.1_PUBLIC
    ```
 
    This will:
@@ -194,7 +204,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 5. **Optional: setup only Maven dependencies:**
    ```bash
-   python -m tools.setup install-ghidra-deps --ghidra-path ~/ghidra_12.0.4_PUBLIC
+   python -m tools.setup install-ghidra-deps --ghidra-path ~/ghidra_12.1_PUBLIC
    ```
 
 6. **Show command help:**
@@ -232,7 +242,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
     python -m tools.setup deploy \
        --ghidra-path /opt/homebrew/opt/ghidra/libexec
    ```
-   The extension is installed to `~/Library/ghidra/ghidra_12.0.4_PUBLIC/Extensions/GhidraMCP/`.
+   The extension is installed to `~/Library/ghidra/ghidra_12.1_PUBLIC/Extensions/GhidraMCP/`.
 
    > **Note:** `--ghidra-version` is required when using the Homebrew path because the path contains no version string.
 
@@ -253,6 +263,19 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
      }
    }
    ```
+
+### Installation (Arch Linux — AUR)
+
+[@Pandoriaantje](https://github.com/Pandoriaantje) maintains community AUR packages:
+
+- [`ghidra-mcp-git`](https://aur.archlinux.org/packages/ghidra-mcp-git) — tracks `main`
+- [`ghidra-mcp`](https://aur.archlinux.org/packages/ghidra-mcp) — tracks tagged releases
+
+Install with your AUR helper of choice, e.g.:
+
+```bash
+yay -S ghidra-mcp        # or ghidra-mcp-git
+```
 
 ### Basic Usage
 
@@ -347,17 +370,20 @@ GhidraMCP is designed for **localhost-only development**. The default configurat
 | Env var | Effect |
 |---|---|
 | `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health`, `/health`, `/check_connection` are exempt. |
-| `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. |
-| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Prevents path-traversal. |
+| `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. In headless mode this also triggers OSGi `BundleHost` initialization at server startup (Felix framework, ~hundreds of ms); leave it off if you don't need script execution. |
+| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/load_program`, `/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Prevents path-traversal. |
 
 Name-quality enforcement is separate from security. By default,
 `rename_function_by_address` and global write endpoints reject names that fail
-the built-in quality gates. Disable the hard-reject layer with **Edit > Tool
-Options > GhidraMCP HTTP Server > Strict Naming Enforcement**. The same
-Tool Options checkbox covers `rename_data`, `rename_global_variable`,
-`set_global`, and the `apply_data_type` prefix/type guard. The setting is read
-when the MCP server starts or restarts. Convention warnings are still returned
-when enforcement is disabled.
+the built-in quality gates, and struct field writes apply the built-in field
+prefix convention. Disable the built-in convention layer with **Edit > Tool
+Options > GhidraMCP HTTP Server > Strict Naming Enforcement**. The same Tool
+Options checkbox covers `rename_data`, `rename_global_variable`,
+`set_global`, the `apply_data_type` prefix/type guard, and struct-field
+Hungarian prefix auto-fixes in `create_struct`, `add_struct_field`, and
+`modify_struct_field`. The setting is read when the MCP server starts or
+restarts. Function/global convention warnings are still returned when
+enforcement is disabled.
 
 ### Example: exposing to a private LAN with auth
 
@@ -372,6 +398,10 @@ java -jar GhidraMCPHeadless.jar --bind 0.0.0.0 --port 8089
 ### Ghidra Server authentication
 
 When connecting to a shared Ghidra Server, GhidraMCP can suppress the password dialog automatically. It resolves credentials in this order (first non-empty value wins):
+
+Compatibility note: Ghidra 12.1 clients require Ghidra Server 12.1,
+12.0.5, or a newer compatible server. Older shared servers are not safe
+targets for a 12.1 client upgrade.
 
 1. `GHIDRA_SERVER_PASSWORD` environment variable (or `.env` file in the Ghidra install directory or `~`)
 2. `~/.ghidra-cred` — single-line password file in your home directory
@@ -446,12 +476,23 @@ into and run from the same interpreter.
 2. Check for typos in endpoint name
 3. Ensure you're using correct HTTP method (GET vs POST)
 
+### Python Ghidra scripts fail with "No script provider found"
+
+**Cause:** In Ghidra 12.1, Jython support is no longer enabled by
+default. `.py` scripts need the bundled Jython extension; Python 3
+scripts should use PyGhidra instead of the Ghidra Script Manager.
+
+**Solution:**
+1. In the Ghidra Front End, open **File > Install Extensions**.
+2. Check **Jython**, restart Ghidra, then refresh Script Manager.
+3. For new automation, prefer Java Ghidra scripts or PyGhidra.
+
 ### Extension not appearing in Install Extensions
 
 **Cause:** JAR file in wrong location.
 
 **Solution:**
-1. Manual install location: `~/.ghidra/ghidra_12.0.4_PUBLIC/Extensions/GhidraMCP/lib/GhidraMCP.jar`
+1. Manual install location: `~/.ghidra/ghidra_12.1_PUBLIC/Extensions/GhidraMCP/lib/GhidraMCP.jar`
 2. Or use: **File > Install Extensions > Add** and select the ZIP file
 3. Ensure JAR/ZIP was built for your Ghidra version
 
@@ -462,12 +503,12 @@ into and run from the same interpreter.
 **Solution:**
 ```text
 # Windows (recommended)
-python -m tools.setup install-ghidra-deps --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup install-ghidra-deps --ghidra-path "C:\ghidra_12.1_PUBLIC"
 ```
 
 ## 📊 Production Performance
 
-- **MCP Tools**: 243 tools fully implemented
+- **MCP Tools**: 249 tools fully implemented
 - **Speed**: Sub-second response for most operations
 - **Efficiency**: 93% reduction in API calls via batch operations
 - **Reliability**: Atomic transactions with all-or-nothing semantics
@@ -718,9 +759,9 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 ### Building from Source
 ```bash
 # Recommended: direct Python-first workflow
-python -m tools.setup ensure-prereqs --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup ensure-prereqs --ghidra-path "C:\ghidra_12.1_PUBLIC"
 python -m tools.setup build
-python -m tools.setup deploy --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup deploy --ghidra-path "C:\ghidra_12.1_PUBLIC"
 
 # Version bump (updates all maintained version references atomically)
 python -m tools.setup bump-version --new X.Y.Z
@@ -766,12 +807,12 @@ on your machine to run the live benchmark regression. See
 
 ```text
 # Standard first-time setup and deploy
-python -m tools.setup ensure-prereqs --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup ensure-prereqs --ghidra-path "C:\ghidra_12.1_PUBLIC"
 python -m tools.setup build
-python -m tools.setup deploy --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup deploy --ghidra-path "C:\ghidra_12.1_PUBLIC"
 
 # Preflight check before deploying
-python -m tools.setup preflight --strict --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup preflight --strict --ghidra-path "C:\ghidra_12.1_PUBLIC"
 
 # Version bump and tag
 python -m tools.setup bump-version --new X.Y.Z --tag
@@ -789,7 +830,7 @@ ghidra-mcp/
 ├── bridge_mcp_ghidra.py     # MCP server (Python, 225 catalog entries)
 ├── src/main/java/           # Ghidra plugin + headless server (Java)
 │   └── com/xebyte/
-│       ├── GhidraMCPPlugin.java         # GUI plugin (177 endpoints)
+│       ├── GhidraMCPPlugin.java         # GUI plugin (196 endpoints)
 │       ├── headless/                    # Headless server (183 endpoints)
 │       └── core/                        # Shared service layer (12 services)
 ├── debugger/                # Optional standalone debugger server (port 8099)
@@ -816,7 +857,7 @@ This is a one-time setup per machine, and again when your Ghidra version changes
 
 The tool enforces version consistency between:
 - `pom.xml` (`ghidra.version`)
-- `--ghidra-path` version segment (e.g., `ghidra_12.0.4_PUBLIC`)
+- `--ghidra-path` version segment (e.g., `ghidra_12.1_PUBLIC`)
 
 If these do not match, deployment fails fast with a clear error.
 
@@ -829,12 +870,12 @@ If you see a version mismatch error, align both values:
 Then rerun:
 
 ```text
-python -m tools.setup preflight --ghidra-path "C:\ghidra_12.0.4_PUBLIC"
+python -m tools.setup preflight --ghidra-path "C:\ghidra_12.1_PUBLIC"
 ```
 
 ```text
 # Windows
-python -m tools.setup install-ghidra-deps --ghidra-path "C:\path\to\ghidra_12.0.4_PUBLIC"
+python -m tools.setup install-ghidra-deps --ghidra-path "C:\path\to\ghidra_12.1_PUBLIC"
 ```
 
 **Required Libraries (14 JARs, ~37MB):**
@@ -903,7 +944,7 @@ docker-compose up -d ghidra-mcp
 
 # Test connection
 curl http://localhost:8089/check_connection
-# Connection OK - GhidraMCP Headless Server v5.9.0
+# Connection OK - GhidraMCP Headless Server v5.13.1
 ```
 
 ### Headless API Workflow
@@ -969,9 +1010,9 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 | Metric | Value |
 |--------|-------|
-| **Version** | 5.9.0 |
-| **MCP Tools** | 243 fully implemented |
-| **GUI Endpoints** | 177 (GhidraMCPPlugin) |
+| **Version** | 5.13.1 |
+| **MCP Tools** | 249 fully implemented |
+| **GUI Endpoints** | 196 (GhidraMCPPlugin) |
 | **Headless Endpoints** | 195 (GhidraMCPHeadlessServer) |
 | **Compilation** | ✅ 100% success |
 | **Batch Efficiency** | 93% API call reduction |
@@ -983,6 +1024,9 @@ See [CHANGELOG.md](CHANGELOG.md) for version history and release notes.
 
 
 ## 🙏 Acknowledgments
+
+This project was originally derived from [LaurieWired/GhidraMCP](https://github.com/LaurieWired/GhidraMCP) in August 2025 and has since been substantially rewritten and extended. We acknowledge LaurieWired's original work as the starting point. See [NOTICE](NOTICE) for license attribution.
+
 ## 👥 Contributors
 
 This project has benefited from the work of dedicated contributors:
@@ -994,6 +1038,11 @@ This project has benefited from the work of dedicated contributors:
 - Script execution improvements and bug fixes (#12)
 - New API endpoints: `save_program`, `exit_ghidra`, `delete_function`, `create_memory_block`, `run_script_inline` (#11)
 - Architectural vision: annotation-driven design, UDS transport, Python bridge optimization proposals
+
+**[@huehuehuehueing](https://github.com/huehuehuehueing)** — Significant contributions including:
+- Address-space prefix support — added `<space>:<hex>` syntax (e.g., `mem:1000`, `code:ff00`) to address parsing across the entire endpoint surface, unlocking multi-space targets like embedded firmware (#84, closes #65)
+- Optional `program` parameter + required-param schema fixes — made `program` optional on every endpoint with a sane currentProgram fallback, and fixed several required-vs-optional schema bugs the catalog had inherited (#92)
+- Seeded #44 (data-type / enum tools) — the issue that motivated the v5.0 enum + struct enforcement layer
 
 
 - **Ghidra Team** - For the incredible reverse engineering platform

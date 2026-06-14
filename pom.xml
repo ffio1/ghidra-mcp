@@ -6,7 +6,7 @@
     <groupId>com.xebyte</groupId>
     <artifactId>GhidraMCP</artifactId>
     <packaging>jar</packaging>
-    <version>5.9.0</version>
+    <version>5.13.1</version>
     <name>Ghidra MCP Server</name>
     <description>Production-ready Model Context Protocol server for Ghidra reverse engineering platform. Provides MCP-based tooling and automation for reverse engineering workflows: convention-enforcing rename/type/comment endpoints, batch operations, P-code emulation, live debugger integration, headless server, and Ghidra Server multi-version support.</description>
     <url>https://github.com/bethington/ghidra-mcp</url>
@@ -117,7 +117,7 @@
         <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
-            <version>2.10.1</version>
+            <version>2.14.0</version>
             <scope>provided</scope>
         </dependency>
         <!-- JUnit (test only) -->
@@ -131,7 +131,7 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
-            <version>5.9.0</version>
+            <version>5.23.0</version>
             <scope>test</scope>
         </dependency>
         <!-- Ghidra DB (test only) — needed so Mockito can instrument Program's type hierarchy -->
@@ -168,7 +168,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.2.5</version>
+                <version>3.5.6</version>
                 <configuration>
                     <argLine>-Dnet.bytebuddy.experimental=true</argLine>
                 </configuration>
@@ -177,7 +177,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
+                <version>3.15.0</version>
                 <configuration>
                     <release>${maven.compiler.release}</release>
                     <encoding>UTF-8</encoding>
@@ -188,7 +188,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-resources-plugin</artifactId>
-                <version>3.3.1</version>
+                <version>3.5.0</version>
                 <configuration>
                     <encoding>${project.build.sourceEncoding}</encoding>
                     <propertiesEncoding>${project.build.sourceEncoding}</propertiesEncoding>
@@ -197,7 +197,7 @@
             <!-- Use custom MANIFEST.MF -->
             <plugin>
                 <artifactId>maven-jar-plugin</artifactId>
-                <version>3.2.2</version>
+                <version>3.5.0</version>
                 <configuration>
                     <archive>
                         <manifestFile>src/main/resources/META-INF/MANIFEST.MF</manifestFile>
@@ -214,7 +214,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-assembly-plugin</artifactId>
-                <version>3.3.0</version>
+                <version>3.8.0</version>
                 <configuration>
                     <!-- Using the custom assembly descriptor -->
                     <descriptors>
@@ -228,7 +228,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-dependency-plugin</artifactId>
-                <version>3.1.2</version>
+                <version>3.11.0</version>
                 <executions>
                     <execution>
                         <id>copy-dependencies</id>
@@ -256,7 +256,7 @@
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-jar-plugin</artifactId>
-                        <version>3.2.2</version>
+                        <version>3.5.0</version>
                         <configuration>
                             <archive>
                                 <manifest>
@@ -271,7 +271,7 @@
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-assembly-plugin</artifactId>
-                        <version>3.3.0</version>
+                        <version>3.8.0</version>
                         <configuration>
                             <descriptors>
                                 <descriptor>src/assembly/headless-jar.xml</descriptor>
@@ -300,7 +300,7 @@
                     <plugin>
                         <groupId>io.fabric8</groupId>
                         <artifactId>docker-maven-plugin</artifactId>
-                        <version>0.43.4</version>
+                        <version>0.48.1</version>
                         <configuration>
                             <images>
                                 <image>

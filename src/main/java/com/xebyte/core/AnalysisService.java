@@ -231,16 +231,12 @@ public class AnalysisService {
             int before = program.getFunctionManager().getFunctionCount();
 
             AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
-            int txId = program.startTransaction("Run Auto Analysis");
-            boolean success = false;
-            try {
+            threadingStrategy.executeWrite(program, "Run Auto Analysis", () -> {
                 mgr.initializeOptions();
                 mgr.reAnalyzeAll(program.getMemory().getLoadedAndInitializedAddressSet());
                 mgr.startAnalysis(TaskMonitor.DUMMY);
-                success = true;
-            } finally {
-                program.endTransaction(txId, success);
-            }
+                return null;
+            });
 
             long duration = System.currentTimeMillis() - start;
             int after = program.getFunctionManager().getFunctionCount();
@@ -849,6 +845,149 @@ public class AnalysisService {
             return Response.ok(matches);
         } catch (Exception e) {
             return Response.err(e.getMessage());
+        }
+    }
+
+    /**
+     * Operand-pattern instruction search. Complement to /search_byte_patterns:
+     * byte-pattern search finds instructions by their encoded opcode bytes,
+     * which works when the user knows the encoding; this endpoint finds
+     * instructions by mnemonic + operand-substring after Ghidra has parsed
+     * them, which is the right tool when the user is reasoning at the
+     * assembly level ("find every write to [ECX+0xD0]"). Walks the listing
+     * via InstructionIterator so it's O(program size) once.
+     *
+     * Closes the gap raised in #172.
+     */
+    @McpTool(path = "/search_instructions",
+        description = "Search for instructions by mnemonic and/or operand substring. "
+            + "Complement to /search_byte_patterns (byte-level); this matches after Ghidra "
+            + "has parsed instructions, so you can search for 'mov' + '[ecx+0xD0]' without "
+            + "knowing the encoding. Case-insensitive substring match on both fields. Returns "
+            + "{address, function, mnemonic, operands, bytes} per match.",
+        category = "analysis")
+    public Response searchInstructions(
+            @Param(value = "mnemonic", defaultValue = "",
+                description = "Case-insensitive mnemonic match (exact, not substring — 'mov' matches 'MOV' but not 'movsd'). Omit to match any mnemonic.") String mnemonic,
+            @Param(value = "operand_pattern", defaultValue = "",
+                description = "Case-insensitive substring matched against the joined operand string (e.g. '[ecx+0xd0]', 'eax', '0x10001000'). Omit to match any operand.") String operandPattern,
+            @Param(value = "function", defaultValue = "",
+                description = "Restrict search to this function (by name or entry-point address). Omit to search the whole program.") String functionScope,
+            @Param(value = "limit", defaultValue = "500",
+                description = "Maximum matches returned. Walking stops as soon as the cap is hit.") int limit,
+            @Param(value = "program", defaultValue = "",
+                description = "Target program name (omit to use the active program — always specify when multiple programs are open).") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        String wantMnemonic = mnemonic == null ? "" : mnemonic.trim();
+        String wantOperand = operandPattern == null ? "" : operandPattern.trim().toLowerCase();
+        if (wantMnemonic.isEmpty() && wantOperand.isEmpty()) {
+            return Response.err("At least one of 'mnemonic' or 'operand_pattern' must be non-empty");
+        }
+        if (limit <= 0 || limit > 50000) {
+            return Response.err("limit must be between 1 and 50000");
+        }
+
+        try {
+            Listing listing = program.getListing();
+            FunctionManager funcManager = program.getFunctionManager();
+
+            // Build the address set we'll iterate.
+            AddressSetView searchSet;
+            if (functionScope != null && !functionScope.trim().isEmpty()) {
+                FunctionRef.Result resolved =
+                    FunctionRef.ofNameOrAddress(functionScope, "").tryResolve(program);
+                if (!resolved.isSuccess()) {
+                    return Response.err("Function not found: " + functionScope);
+                }
+                Function f = resolved.function();
+                searchSet = f.getBody();
+            } else {
+                searchSet = program.getMemory();
+            }
+
+            List<Map<String, Object>> matches = new ArrayList<>();
+            InstructionIterator instIter = listing.getInstructions(searchSet, true);
+            boolean truncated = false;
+            long scanned = 0;
+
+            while (instIter.hasNext()) {
+                Instruction inst = instIter.next();
+                scanned++;
+
+                // Mnemonic gate (exact, case-insensitive).
+                if (!wantMnemonic.isEmpty()
+                        && !inst.getMnemonicString().equalsIgnoreCase(wantMnemonic)) {
+                    continue;
+                }
+
+                // Operand gate (substring, case-insensitive). Build the
+                // joined operand string the same way the GUI listing does
+                // so the user's "what they see is what they search" model
+                // holds: comma-separated.
+                String operandStr;
+                if (!wantOperand.isEmpty() || matches.size() < limit) {
+                    StringBuilder sb = new StringBuilder();
+                    int nOps = inst.getNumOperands();
+                    for (int i = 0; i < nOps; i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(inst.getDefaultOperandRepresentation(i));
+                    }
+                    operandStr = sb.toString();
+                } else {
+                    operandStr = "";
+                }
+                if (!wantOperand.isEmpty()
+                        && !operandStr.toLowerCase().contains(wantOperand)) {
+                    continue;
+                }
+
+                // Build the match record.
+                byte[] raw;
+                try {
+                    raw = inst.getBytes();
+                } catch (Exception e) {
+                    raw = new byte[0];
+                }
+                StringBuilder hex = new StringBuilder(raw.length * 2);
+                for (byte b : raw) hex.append(String.format("%02x", b & 0xFF));
+
+                Function containing = funcManager.getFunctionContaining(inst.getAddress());
+
+                Map<String, Object> rec = new LinkedHashMap<>();
+                rec.put("address", ServiceUtils.addressToJson(inst.getAddress(), program));
+                rec.put("function", containing == null ? null : containing.getName());
+                rec.put("mnemonic", inst.getMnemonicString());
+                rec.put("operands", operandStr);
+                rec.put("length", inst.getLength());
+                rec.put("bytes", hex.toString());
+                matches.add(rec);
+
+                if (matches.size() >= limit) {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("matches", matches);
+            result.put("match_count", matches.size());
+            result.put("instructions_scanned", scanned);
+            result.put("truncated", truncated);
+            result.put("scope", functionScope == null || functionScope.trim().isEmpty()
+                    ? "program"
+                    : "function:" + functionScope);
+            // Echo the filters back as plain strings (empty == "no filter") so
+            // both keys are always present in the JSON. Gson drops null fields
+            // by default, which left clients unable to tell "field absent
+            // because no filter" from "field absent because old build".
+            result.put("mnemonic_filter", wantMnemonic);
+            result.put("operand_filter", wantOperand);
+            return Response.ok(result);
+        } catch (Exception e) {
+            return Response.err("search_instructions failed: " + e.getMessage());
         }
     }
 

@@ -19,6 +19,7 @@ import com.xebyte.core.ProgramProvider;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.util.importer.AutoImporter;
 import ghidra.app.util.importer.MessageLog;
+import ghidra.app.util.opinion.Loaded;
 import ghidra.app.util.opinion.LoadResults;
 import ghidra.base.project.GhidraProject;
 import ghidra.framework.model.DomainFile;
@@ -26,7 +27,13 @@ import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.Project;
 import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.lang.CompilerSpec;
+import ghidra.program.model.lang.CompilerSpecID;
+import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.LanguageID;
+import ghidra.program.model.lang.LanguageService;
 import ghidra.program.model.listing.Program;
+import ghidra.program.util.DefaultLanguageService;
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
@@ -168,40 +175,303 @@ public class HeadlessProgramProvider implements ProgramProvider {
     }
 
     /**
-     * Load a program from a Ghidra project.
+     * Load a raw binary with an explicit language / compiler spec.
      *
-     * @param projectPath Path to the program within the project (e.g., "/D2Client.dll")
+     * Used for firmware blobs and other raw images where AutoImporter's best-guess
+     * format detection has no header to latch onto (e.g. ARM Cortex-M .mem dumps).
+     * Mirrors {@link #loadProgramFromFile(File)} for openPrograms / currentProgram
+     * bookkeeping so subsequent /list_functions, /decompile_function, etc. resolve
+     * the result transparently.
+     *
+     * @param file         The raw binary file
+     * @param languageId   Ghidra language ID, e.g. "ARM:LE:32:Cortex"
+     * @param compilerSpecId Optional compiler-spec ID; empty/null falls back to the language default
      * @return The loaded Program, or null on failure
      */
-    public Program loadProgramFromProject(String projectPath) {
-        if (project == null) {
-            Msg.error(this, "No project available. Use loadProject() first or provide a project in constructor.");
+    public Program loadProgramFromFileWithLanguage(File file, String languageId, String compilerSpecId) {
+        if (!file.exists()) {
+            Msg.error(this, "File not found: " + file.getAbsolutePath());
             return null;
         }
+        if (languageId == null || languageId.trim().isEmpty()) {
+            Msg.error(this, "loadProgramFromFileWithLanguage requires a non-empty languageId");
+            return null;
+        }
+        // Normalize before constructing IDs: a doc-copied " ARM:LE:32:Cortex "
+        // passes the non-empty check above but fails the LanguageID lookup.
+        languageId = languageId.trim();
+        String normalizedCompilerSpecId =
+            (compilerSpecId == null) ? "" : compilerSpecId.trim();
 
         try {
-            ProjectData projectData = project.getProjectData();
-            DomainFile domainFile = projectData.getFile(projectPath);
+            LanguageService langService = DefaultLanguageService.getLanguageService();
+            Language language = langService.getLanguage(new LanguageID(languageId));
 
-            if (domainFile == null) {
-                Msg.error(this, "Program not found in project: " + projectPath);
-                return null;
+            CompilerSpec compilerSpec;
+            if (!normalizedCompilerSpecId.isEmpty()) {
+                compilerSpec = language.getCompilerSpecByID(new CompilerSpecID(normalizedCompilerSpecId));
+            } else {
+                compilerSpec = language.getDefaultCompilerSpec();
             }
 
-            Program program = (Program) domainFile.getDomainObject(this, true, false, monitor);
+            MessageLog log = new MessageLog();
+            Loaded<Program> loaded = AutoImporter.importAsBinary(
+                file,
+                null,   // project (null = in-memory, same model as loadProgramFromFile)
+                "/",    // folder path (ignored when project is null)
+                language,
+                compilerSpec,
+                this,   // consumer
+                log,
+                monitor
+            );
+
+            Program program = null;
+            if (loaded != null) {
+                program = loaded.getDomainObject(this);
+            }
 
             if (program != null) {
                 openPrograms.put(program.getName(), program);
                 if (currentProgram == null) {
                     currentProgram = program;
                 }
-                Msg.info(this, "Loaded program from project: " + program.getName());
+                Msg.info(this, "Loaded raw binary: " + program.getName()
+                    + " (" + file.getAbsolutePath() + ") as " + languageId);
+            } else {
+                Msg.error(this, "Failed to load raw binary from: " + file.getAbsolutePath());
+                if (!log.toString().isEmpty()) {
+                    Msg.error(this, "Import log: " + log.toString());
+                }
             }
 
             return program;
         } catch (Exception e) {
-            Msg.error(this, "Error loading program from project: " + projectPath, e);
+            Msg.error(this, "Error loading raw binary from file: " + file.getAbsolutePath()
+                + " (language=" + languageId + ")", e);
             return null;
+        }
+    }
+
+    /**
+     * Load a program from a Ghidra project.
+     *
+     * Back-compat wrapper: returns just the Program (null on failure).
+     * Callers that want diagnostics on failure should use
+     * {@link #loadProgramFromProjectDetailed(String)} which returns a
+     * {@link ProgramLoadResult} with structured failure information.
+     *
+     * @param projectPath Path to the program within the project (e.g., "/D2Client.dll")
+     * @return The loaded Program, or null on failure
+     */
+    public Program loadProgramFromProject(String projectPath) {
+        return loadProgramFromProjectDetailed(projectPath).program;
+    }
+
+    /**
+     * Load a program from a Ghidra project with structured diagnostics.
+     *
+     * Discussion #119 surfaced the recurring "checkout succeeded, can't open"
+     * pattern: users connect a headless Docker container to a remote Ghidra
+     * server, run /server/version_control/checkout (which acquires the
+     * server-side lock on the standalone {@link GhidraServerManager}
+     * connection), then call /load_program_from_project and get a flat
+     * "Program not found" error. The usual root cause is one of:
+     *
+     *   1. The locally-open project is a standalone project, not a shared
+     *      project bound to the server. /server/version_control/checkout
+     *      operates on the GhidraServerManager's standalone connection,
+     *      which doesn't sync content to a non-shared local project.
+     *
+     *   2. The path doesn't match the project's folder hierarchy (case,
+     *      leading slash, server folder layout vs container folder layout).
+     *
+     *   3. The project IS shared but the file hasn't been pulled to the
+     *      local cache yet — opening it triggers the server fetch but the
+     *      first call can fail if the server is unreachable.
+     *
+     * This method returns a structured result so the endpoint handler can
+     * surface what actually went wrong rather than the legacy bare null.
+     */
+    public ProgramLoadResult loadProgramFromProjectDetailed(String projectPath) {
+        if (project == null) {
+            return ProgramLoadResult.failure(
+                "No project open. Call /open_project first, pointing at the .gpr "
+                + "or project directory you want to work against.");
+        }
+
+        ProjectData projectData;
+        try {
+            projectData = project.getProjectData();
+        } catch (Exception e) {
+            return ProgramLoadResult.failure(
+                "Could not access project data: " + e.getMessage());
+        }
+
+        DomainFile domainFile;
+        try {
+            domainFile = projectData.getFile(projectPath);
+        } catch (Exception e) {
+            return ProgramLoadResult.failure(
+                "Path lookup failed: " + e.getMessage());
+        }
+
+        if (domainFile == null) {
+            // Build a diagnostic with the project's actual file layout so the
+            // user can see what's available instead of guessing.
+            List<String> available = new ArrayList<>();
+            try {
+                collectProgramPaths(projectData.getRootFolder(), "", available, 50);
+            } catch (Exception e) {
+                // Best-effort — diagnostic shouldn't itself fail.
+            }
+
+            String serverHint = describeServerBinding(projectData);
+            return ProgramLoadResult.notFound(projectPath, available, serverHint);
+        }
+
+        try {
+            Program program = (Program) domainFile.getDomainObject(this, true, false, monitor);
+            if (program == null) {
+                String serverHint = describeServerBinding(projectData);
+                return ProgramLoadResult.failure(
+                    "domainFile.getDomainObject returned null for: " + projectPath
+                    + (serverHint.isEmpty() ? "" : " (" + serverHint + ")"));
+            }
+            openPrograms.put(program.getName(), program);
+            if (currentProgram == null) {
+                currentProgram = program;
+            }
+            Msg.info(this, "Loaded program from project: " + program.getName());
+            return ProgramLoadResult.success(program);
+        } catch (Exception e) {
+            String serverHint = describeServerBinding(projectData);
+            Msg.error(this, "Error loading program from project: " + projectPath, e);
+            return ProgramLoadResult.failure(
+                "Open failed (" + e.getClass().getSimpleName() + "): " + e.getMessage()
+                + (serverHint.isEmpty() ? "" : ". " + serverHint));
+        }
+    }
+
+    /** Walk the project tree collecting *Program* paths, capped at maxResults. */
+    private void collectProgramPaths(DomainFolder folder, String pathPrefix, List<String> out, int maxResults) {
+        if (out.size() >= maxResults) return;
+        try {
+            for (DomainFile file : folder.getFiles()) {
+                if (out.size() >= maxResults) return;
+                if ("Program".equals(file.getContentType())) {
+                    out.add(pathPrefix + "/" + file.getName());
+                }
+            }
+            for (DomainFolder subfolder : folder.getFolders()) {
+                if (out.size() >= maxResults) return;
+                collectProgramPaths(subfolder, pathPrefix + "/" + subfolder.getName(), out, maxResults);
+            }
+        } catch (Exception ignore) {
+            // best-effort
+        }
+    }
+
+    /**
+     * Describe whether the open project is server-bound, for inclusion in
+     * error diagnostics. Empty string when not server-bound (the standalone
+     * case). Used by both {@link #loadProgramFromProjectDetailed} and
+     * {@link #getProjectServerInfo} so the description is consistent.
+     */
+    private String describeServerBinding(ProjectData projectData) {
+        try {
+            ghidra.framework.client.RepositoryAdapter repo = projectData.getRepository();
+            if (repo == null) {
+                return "Project is local-only (not bound to a Ghidra Server). "
+                    + "If you intended a server-checked-out file, the local project "
+                    + "must be a shared project — create one via Ghidra GUI or "
+                    + "`analyzeHeadless -connect ghidra://host:port/repo` and "
+                    + "mount it into this container, then reopen it via "
+                    + "/open_project.";
+            }
+            // Only RepositoryAdapter.getName() is touched here — the
+            // server host:port lives behind getServer().getServerInfo(),
+            // whose return type differs across Ghidra 12.0.x point builds
+            // (String on some, ServerInfo on others) and broke the CI
+            // build. The repo name + "bound to a server" is the
+            // diagnostic the operator actually needs; they configured the
+            // host:port themselves.
+            return "Project is bound to a Ghidra Server (repo '" + repo.getName() + "')";
+        } catch (Exception e) {
+            return "Server binding probe failed: " + e.getClass().getSimpleName();
+        }
+    }
+
+    /**
+     * Server-binding info for the open project, or {@code null} when no
+     * project is open. Exposed to the management service so /get_project_info
+     * can surface "is this project shared?" without re-implementing the
+     * probe.
+     */
+    public ServerBindingInfo getProjectServerInfo() {
+        if (project == null) return null;
+        try {
+            ghidra.framework.client.RepositoryAdapter repo = project.getProjectData().getRepository();
+            if (repo == null) {
+                return new ServerBindingInfo(false, null, null);
+            }
+            // serverInfo (host:port) is intentionally left null — see
+            // describeServerBinding: getServer().getServerInfo()'s return
+            // type isn't stable across Ghidra 12.0.x point builds. The
+            // serverBound flag + repo name are the load-bearing fields.
+            return new ServerBindingInfo(true, null, repo.getName());
+        } catch (Exception e) {
+            return new ServerBindingInfo(false, null, null);
+        }
+    }
+
+    /** Structured result from {@link #loadProgramFromProjectDetailed}. */
+    public static class ProgramLoadResult {
+        public final boolean success;
+        public final Program program;          // null on failure
+        public final String error;             // null on success
+        public final List<String> availablePaths; // null unless notFound
+        public final String serverHint;        // null unless server-relevant
+
+        private ProgramLoadResult(boolean success, Program program, String error,
+                                  List<String> availablePaths, String serverHint) {
+            this.success = success;
+            this.program = program;
+            this.error = error;
+            this.availablePaths = availablePaths;
+            this.serverHint = serverHint;
+        }
+
+        public static ProgramLoadResult success(Program program) {
+            return new ProgramLoadResult(true, program, null, null, null);
+        }
+
+        public static ProgramLoadResult failure(String error) {
+            return new ProgramLoadResult(false, null, error, null, null);
+        }
+
+        public static ProgramLoadResult notFound(String requestedPath, List<String> available, String serverHint) {
+            String msg = "Program not found in project: " + requestedPath;
+            if (available != null && !available.isEmpty()) {
+                msg += " (project contains " + available.size() + " program file(s); first few: "
+                    + String.join(", ", available.subList(0, Math.min(5, available.size()))) + ")";
+            } else if (available != null) {
+                msg += " (project has no program files)";
+            }
+            return new ProgramLoadResult(false, null, msg, available, serverHint);
+        }
+    }
+
+    /** Shared-project / server binding state for {@link #getProjectServerInfo}. */
+    public static class ServerBindingInfo {
+        public final boolean serverBound;
+        public final String serverInfo;  // host:port string, or null when not bound
+        public final String repoName;    // repo name on the server, or null
+
+        public ServerBindingInfo(boolean serverBound, String serverInfo, String repoName) {
+            this.serverBound = serverBound;
+            this.serverInfo = serverInfo;
+            this.repoName = repoName;
         }
     }
 

@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# OSSF Scorecard Token-Permissions: default to read-only so any job
+# without an explicit permissions block can only read repo contents.
+# Codecov upload (java-build job) and any future job needing write
+# scopes must add their own job-level permissions block.
+permissions:
+  contents: read
+
 jobs:
   java-build:
     name: Java Build (Maven)
@@ -15,10 +22,10 @@ jobs:
         java-version: [ '21' ]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Set up Java
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
       with:
         java-version: ${{ matrix.java-version }}
         distribution: 'temurin'
@@ -26,17 +33,17 @@ jobs:
 
     - name: Cache Ghidra installation
       id: cache-ghidra
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
       with:
         path: /tmp/ghidra
-        key: ghidra-12.0.4-PUBLIC-20260303
+        key: ghidra-12.1-PUBLIC-20260513
 
     - name: Download Ghidra
       if: steps.cache-ghidra.outputs.cache-hit != 'true'
       run: |
-        echo "Downloading Ghidra 12.0.4..."
+        echo "Downloading Ghidra 12.1..."
         curl -sL -o /tmp/ghidra.zip \
-          "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0.4_build/ghidra_12.0.4_PUBLIC_20260303.zip"
+          "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip"
         mkdir -p /tmp/ghidra
         unzip -q /tmp/ghidra.zip -d /tmp/ghidra
         rm /tmp/ghidra.zip
@@ -44,7 +51,7 @@ jobs:
     - name: Install Ghidra JARs to Maven local repository
       run: |
         GHIDRA_DIR=$(find /tmp/ghidra -maxdepth 1 -type d -name 'ghidra_*' | head -1)
-        GHIDRA_VERSION="12.0.4"
+        GHIDRA_VERSION="12.1"
         echo "Using Ghidra directory: $GHIDRA_DIR"
 
         # Install Framework JARs
@@ -96,11 +103,11 @@ jobs:
 
     - name: Run offline Java tests
       run: |
-        # Annotation-scanner and endpoints.json parity tests.
-        # No Ghidra server needed — pure reflection + static catalog checks.
-        # Integration tests (GhidraMCPPluginTest, EndpointRegistrationTest,
-        # AppTest, ServiceUtilsAddressTest) require a running Ghidra instance
-        # and are deliberately excluded from this run.
+        # Annotation-scanner, endpoints.json parity, and mock-based unit tests
+        # (e.g. ServiceUtilsAddressTest) — pure reflection / static checks, no Ghidra
+        # server. The true integration tests (GhidraMCPPluginTest,
+        # EndpointRegistrationTest, AppTest) require a running Ghidra instance and are
+        # excluded from this run.
         mvn -q test -Dtest='com.xebyte.offline.*Test'
 
     - name: Verify build artifacts
@@ -111,10 +118,20 @@ jobs:
 
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
         name: java-test-results
         path: target/surefire-reports/
+
+    # Absorbs the former build.yml: publish the packaged extension zip so the build
+    # artifact stays available without a second workflow re-downloading Ghidra + rebuilding.
+    - name: Upload build artifact
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: GhidraMCP-artifact
+        path: target/GhidraMCP-*.zip
+        if-no-files-found: warn
 
   python-tests:
     name: Python Tests (pytest)
@@ -124,10 +141,10 @@ jobs:
         python-version: [ '3.10', '3.11', '3.12', '3.13' ]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
       with:
         python-version: ${{ matrix.python-version }}
         cache: 'pip'
@@ -146,21 +163,70 @@ jobs:
 
     - name: Upload coverage
       if: ${{ always() && hashFiles('coverage.xml', 'tests/coverage.xml') != '' }}
-      uses: codecov/codecov-action@v5
+      uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe  # v5
       with:
         files: ./coverage.xml,./tests/coverage.xml
         flags: unittests
         fail_ci_if_error: false
 
-  code-quality:
-    name: Code Quality Checks
+  python-offline-regression:
+    name: Python Offline Regression (fun-doc)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -q -r requirements-test.txt
+        pip install -q -r requirements.txt
+        pip install -q -r fun-doc/requirements.txt
+
+    - name: Run offline performance/regression tests
+      run: |
+        # These suites guard fun-doc (fun_doc.py, storage/, audit/, library detector,
+        # selector, etc.) and run without a live Ghidra server. The autouse fixture in
+        # tests/performance/conftest.py isolates every test from the real fun-doc DB
+        # (forces FUN_DOC_DB_URL to a per-test SQLite + resets the repo singleton), so the
+        # whole suite is collectible in a single process — no per-file isolation needed.
+        #
+        # Excluded from this CI tier:
+        #   * the four live-Ghidra files (need http://127.0.0.1:8089) — integration tier
+        #     (batch_scoring_consistency, health_endpoint, http_concurrency, listing_consistency)
+        #   * the benchmark tests — "manual only" by design (CLAUDE.md); they depend on local
+        #     benchmark assets not tracked in the repo (e.g. fun-doc/benchmark/extract_truth.py),
+        #     a live Ghidra (Benchmark.dll), or an LLM judge, none of which exist in CI.
+        python -m pytest tests/performance/ --no-cov -q \
+          --ignore=tests/performance/test_batch_scoring_consistency.py \
+          --ignore=tests/performance/test_health_endpoint.py \
+          --ignore=tests/performance/test_http_concurrency.py \
+          --ignore=tests/performance/test_listing_consistency.py \
+          --ignore=tests/performance/test_benchmark_extract_truth.py \
+          --ignore=tests/performance/test_benchmark_ghidra_bridge.py \
+          --ignore=tests/performance/test_benchmark_haiku_judge.py \
+          --ignore=tests/performance/test_benchmark_scorer.py
+        echo "✅ Offline regression suite passed"
+
+  code-quality:
+    # ADVISORY / non-blocking: every step below ends in `|| true` (or an echo
+    # fallback), so this job surfaces lint/format drift without ever failing CI.
+    # It is intentionally NOT a gate — `build-status` does not depend on it. To make
+    # it gating, drop the `|| true` once the tree is verified flake8/black-clean.
+    name: Code Quality (advisory, non-blocking)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
       with:
         python-version: '3.10'
 
@@ -175,14 +241,16 @@ jobs:
       run: black --check bridge_mcp_ghidra.py 2>/dev/null || echo "black check skipped"
 
   markdown-lint:
-    name: Documentation Quality
+    # ADVISORY / non-blocking: continue-on-error means findings never fail CI, and
+    # build-status does not depend on this job. Informational doc-lint only.
+    name: Documentation Quality (advisory, non-blocking)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Lint markdown
-      uses: DavidAnson/markdownlint-cli2-action@v19
+      uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265  # v19
       with:
         globs: '**/*.md'
         config: '.markdownlintrc'
@@ -193,7 +261,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Run Pester suite
       shell: powershell
@@ -201,7 +269,7 @@ jobs:
 
     - name: Upload Pester results
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
         name: pester-results
         path: tests/pester/pester-results.xml
@@ -209,13 +277,13 @@ jobs:
   build-status:
     name: Build Status
     runs-on: ubuntu-latest
-    needs: [ java-build, python-tests, pester-tests ]
+    needs: [ java-build, python-tests, python-offline-regression, pester-tests ]
     if: always()
 
     steps:
     - name: Report Status
       run: |
-        if [ "${{ needs.java-build.result }}" = "success" ] && [ "${{ needs.python-tests.result }}" = "success" ] && [ "${{ needs.pester-tests.result }}" = "success" ]; then
+        if [ "${{ needs.java-build.result }}" = "success" ] && [ "${{ needs.python-tests.result }}" = "success" ] && [ "${{ needs.python-offline-regression.result }}" = "success" ] && [ "${{ needs.pester-tests.result }}" = "success" ]; then
           echo "✅ All tests passed"
           exit 0
         else

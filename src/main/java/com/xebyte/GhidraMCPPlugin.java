@@ -75,8 +75,11 @@ import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.Project;
 import ghidra.framework.model.ProjectData;
+import ghidra.framework.model.ProjectLocator;
+import ghidra.framework.model.ProjectManager;
 import ghidra.framework.store.ItemCheckoutStatus;
 import ghidra.framework.client.RepositoryAdapter;
+import ghidra.framework.main.AppInfo;
 
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.util.task.TaskMonitor;
@@ -103,12 +106,16 @@ import java.util.regex.Pattern;
 
 // Load version from properties file (populated by Maven during build)
 class VersionInfo {
-    private static String VERSION = "5.9.0"; // Default fallback
+    private static String VERSION = "5.13.1"; // Default fallback
     private static String APP_NAME = "GhidraMCP";
     private static String GHIDRA_VERSION = "unknown"; // Loaded from version.properties (Maven-filtered)
     private static String BUILD_TIMESTAMP = "dev"; // Will be replaced by Maven
     private static String BUILD_NUMBER = "0"; // Will be replaced by Maven
-    private static final int ENDPOINT_COUNT = 177;
+    // Default fallback when the plugin has not yet finished registering its
+    // scanner-driven endpoints (e.g., headless usage that imports this class
+    // without running the GUI activation path). The live value is set via
+    // setEndpointCount() once the scanner has enumerated everything.
+    private static volatile int ENDPOINT_COUNT = 177;
 
     static {
         // v5.4.2: loading "/version.properties" from the classpath root was
@@ -154,6 +161,16 @@ class VersionInfo {
 
     public static int getEndpointCount() {
         return ENDPOINT_COUNT;
+    }
+
+    /**
+     * Update the live endpoint count after the AnnotationScanner has
+     * enumerated everything. Keeps {@code /get_version.endpoint_count}
+     * in sync with {@code /mcp/schema} so version-banner output and
+     * release smoke tests don't drift from reality.
+     */
+    public static void setEndpointCount(int count) {
+        ENDPOINT_COUNT = count;
     }
 
     public static String getFullVersion() {
@@ -313,8 +330,9 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
             NamingPolicy.defaultStrictNamingEnforcement(), null,
             "Reject function/global names that fail the built-in name-quality checks " +
             "on rename_function_by_address, rename_data, rename_global_variable, " +
-            "set_global, and related write guards. Disable when your naming convention " +
-            "does not match the built-in heuristic; convention warnings are still returned. " +
+            "set_global, and related write guards. Also controls struct-field " +
+            "Hungarian prefix auto-fixes. Disable when your naming convention " +
+            "does not match the built-in heuristic; function/global convention warnings are still returned. " +
             "Takes effect when the MCP server starts or restarts.");
         migrateLegacyNamingOption(options);
         refreshNamingPolicyFromOptions();
@@ -380,8 +398,48 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
         boolean strict = options.getBoolean(STRICT_NAMING_ENFORCEMENT_OPTION,
             NamingPolicy.defaultStrictNamingEnforcement());
+
+        // v5.11.2: load .ghidra-mcp/conventions.json from the active
+        // project root before applying the Tool Option boolean override.
+        // Order matters: the JSON sets all sections (including mode), then
+        // the GUI toggle overrides JUST the mode bit. That keeps the GUI
+        // checkbox as the user's most-recent intent without forcing them
+        // to also delete the JSON file.
+        java.nio.file.Path projectDir = resolveProjectRootDir();
+        com.xebyte.core.ConventionConfigLoader.LoadResult loadResult =
+                NamingPolicy.getInstance().refreshFromProjectRoot(projectDir);
+        if (loadResult.loaded()) {
+            Msg.info(this, "Loaded convention config from " + loadResult.resolvedFrom());
+        } else if (loadResult.error() != null) {
+            Msg.warn(this, "Convention config not loaded: " + loadResult.error()
+                    + " — using built-in defaults");
+        }
+        for (String warning : loadResult.warnings()) {
+            Msg.warn(this, "Convention config: " + warning);
+        }
+
+        // Apply the Tool Option toggle on top. setStrictNamingEnforcement()
+        // preserves all other config sections — only the mode flips.
         NamingPolicy.getInstance().setStrictNamingEnforcement(strict, "tool_options");
         Msg.info(this, "GhidraMCP strict naming enforcement: " + strict);
+    }
+
+    /** Best-effort resolution of the active Ghidra project directory.
+     * Returns null if no project is currently open. */
+    private java.nio.file.Path resolveProjectRootDir() {
+        try {
+            Project project = tool.getProject();
+            if (project == null) return null;
+            ghidra.framework.model.ProjectLocator locator = project.getProjectLocator();
+            if (locator == null) return null;
+            java.io.File dir = locator.getProjectDir();
+            return dir != null ? dir.toPath() : null;
+        } catch (Exception e) {
+            // Any reflection / API surprise here is non-fatal — fall back
+            // to defaults. The active config is still usable, just without
+            // the per-project overrides.
+            return null;
+        }
     }
 
     private void migrateLegacyNamingOption(Options options) {
@@ -594,6 +652,10 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 }
             }));
         }
+        // Reflect the live count so /get_version.endpoint_count matches
+        // what /mcp/schema actually serves. Previously a hardcoded constant
+        // that drifted as services added new @McpTool methods.
+        VersionInfo.setEndpointCount(scanner.getEndpoints().size());
 
         // ==========================================================================
         // SCHEMA ENDPOINT — Serves machine-readable API metadata
@@ -690,6 +752,37 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
 
         server.createContext("/get_current_function", safeHandler(exchange -> {
             sendResponse(exchange, getCurrentFunction());
+        }));
+
+        // /get_current_selection — filed by @I-Knight-I on issue #153 as
+        // the third "where am I?" tool an AI client expects, alongside
+        // /get_current_address and /get_current_function. Returns the
+        // address ranges the user has highlighted in the CodeBrowser
+        // listing, or an empty-selection payload when nothing is
+        // highlighted. GUI-only (no equivalent on the headless server
+        // — selection is a UI concept that has no meaning there).
+        server.createContext("/get_current_selection", safeHandler(exchange -> {
+            sendResponse(exchange, getCurrentSelection());
+        }));
+
+        // /open_project — open (or switch to) a Ghidra project from the
+        // FrontEnd plugin programmatically. Mirrors the headless server's
+        // /open_project route but additionally supports an optional
+        // `headless` boolean (default true) that controls whether a
+        // CodeBrowser window is auto-launched for `program` after the
+        // project opens. Without the flag, the project is loaded into the
+        // FrontEnd tool only — useful for automation that wants to access
+        // programs via the `program` query parameter without spawning UI.
+        //
+        // Body: { "path": <.gpr or project dir>, "headless": true|false,
+        //         "program": "<DomainFile path to launch in CodeBrowser>" }
+        server.createContext("/open_project", safeHandler(exchange -> {
+            Map<String, Object> params = parseJsonParams(exchange);
+            String projectPath = params.get("path") != null ? params.get("path").toString() : null;
+            boolean headless = params.get("headless") == null
+                || Boolean.parseBoolean(String.valueOf(params.get("headless")));
+            String programToLaunch = params.get("program") != null ? params.get("program").toString() : null;
+            sendResponse(exchange, openProject(projectPath, headless, programToLaunch));
         }));
 
         // GET_DATA_TYPE_SIZE - Get the size in bytes of a data type (not yet in service layer)
@@ -1164,6 +1257,60 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 "address", func.getEntryPoint().toString(),
                 "program", programPath,
                 "signature", func.getSignature().getPrototypeString()));
+    }
+
+    /**
+     * Get the current selection (highlighted address ranges) from the
+     * CodeBrowser listing. Returns a payload shape that matches the
+     * other GUI-only ``/get_current_*`` tools and that AI clients can
+     * consume directly without scraping prose.
+     *
+     * <p>Shapes:
+     * <ul>
+     *   <li>No CodeBrowser available → ``"Code viewer service not available"``
+     *       (same prose the other current_* tools use, so clients can
+     *       fall through with one error path).</li>
+     *   <li>CodeBrowser running but selection is empty → JSON
+     *       ``{"program": "...", "is_empty": true, "ranges": []}``.</li>
+     *   <li>Selection present → JSON with the program path, an
+     *       ``is_empty: false`` marker, every contiguous range with its
+     *       start/end/length, plus the overall bounds + total address
+     *       count for convenience.</li>
+     * </ul>
+     */
+    private String getCurrentSelection() {
+        CodeViewerService service = findCodeViewerService();
+        if (service == null) return "Code viewer service not available";
+
+        ghidra.program.util.ProgramSelection selection = service.getCurrentSelection();
+        ghidra.program.util.ProgramLocation location = service.getCurrentLocation();
+        Program program = location != null ? location.getProgram() : getCurrentProgram();
+        String programPath = (program != null && program.getDomainFile() != null)
+                ? program.getDomainFile().getPathname()
+                : (program != null ? program.getName() : null);
+
+        if (selection == null || selection.isEmpty()) {
+            return JsonHelper.toJson(JsonHelper.mapOf(
+                    "program", programPath,
+                    "is_empty", true,
+                    "ranges", new java.util.ArrayList<>()));
+        }
+
+        java.util.List<Map<String, Object>> ranges = new java.util.ArrayList<>();
+        for (ghidra.program.model.address.AddressRange range : selection.getAddressRanges()) {
+            ranges.add(JsonHelper.mapOf(
+                    "start", range.getMinAddress().toString(),
+                    "end", range.getMaxAddress().toString(),
+                    "length", range.getLength()));
+        }
+
+        return JsonHelper.toJson(JsonHelper.mapOf(
+                "program", programPath,
+                "is_empty", false,
+                "ranges", ranges,
+                "min_address", selection.getMinAddress().toString(),
+                "max_address", selection.getMaxAddress().toString(),
+                "num_addresses", selection.getNumAddresses()));
     }
 
     /**
@@ -3856,6 +4003,127 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         } catch (Exception e) {
             return "{\"error\": \"Failed to list tools: " + escapeJson(e.getMessage()) + "\"}";
         }
+    }
+
+    /**
+     * Open (or switch to) a Ghidra project from the FrontEnd plugin.
+     *
+     * <p>When the requested project is already active this is a no-op
+     * success. When a different project is active it is saved and closed
+     * before opening the new one — destructive to any unsaved CodeBrowser
+     * state, but matches the manual File &gt; Open Project flow.
+     *
+     * @param projectPath {@code .gpr} file, {@code <name>.rep} project
+     *                    directory, or a directory whose name is the
+     *                    project name (sibling .gpr/.rep expected).
+     * @param headless    {@code true} (default) opens the project without
+     *                    launching a CodeBrowser; {@code false} ALSO
+     *                    launches CodeBrowser for {@code programToLaunch}.
+     * @param programToLaunch project-internal DomainFile path to open in
+     *                        CodeBrowser when {@code headless == false};
+     *                        ignored otherwise.
+     */
+    private String openProject(String projectPath, boolean headless, String programToLaunch) {
+        if (projectPath == null || projectPath.trim().isEmpty()) {
+            return "{\"error\": \"path parameter is required\"}";
+        }
+
+        // Parse the path into a (location, name) pair for ProjectLocator.
+        // Accept three shapes the user is likely to type:
+        //   F:/proj/MyProj.gpr   — marker file
+        //   F:/proj/MyProj.rep   — project data directory
+        //   F:/proj/MyProj       — bare name, sibling .gpr/.rep expected
+        File pathFile = new File(projectPath);
+        String location;
+        String name;
+        String projExt = ProjectLocator.getProjectExtension();   // ".gpr"
+        String dirExt = ProjectLocator.getProjectDirExtension(); // ".rep"
+        String fname = pathFile.getName();
+        if (fname.endsWith(projExt)) {
+            location = pathFile.getParent();
+            name = fname.substring(0, fname.length() - projExt.length());
+        } else if (fname.endsWith(dirExt)) {
+            location = pathFile.getParent();
+            name = fname.substring(0, fname.length() - dirExt.length());
+        } else {
+            location = pathFile.getParent();
+            name = fname;
+        }
+        if (location == null || location.isEmpty()) {
+            return "{\"error\": \"path must include a parent directory: " + escapeJson(projectPath) + "\"}";
+        }
+
+        ProjectLocator locator;
+        try {
+            locator = new ProjectLocator(location, name);
+        } catch (IllegalArgumentException e) {
+            return "{\"error\": \"Invalid project path: " + escapeJson(e.getMessage()) + "\"}";
+        }
+        if (!locator.exists()) {
+            return "{\"error\": \"Project does not exist: " + escapeJson(projectPath) + "\"}";
+        }
+
+        Project currentProject = tool.getProject();
+        if (currentProject != null && locator.equals(currentProject.getProjectLocator())) {
+            // Already open — honor headless flag for CodeBrowser side-effect anyway.
+            String maybeLaunch = null;
+            if (!headless && programToLaunch != null && !programToLaunch.isEmpty()) {
+                maybeLaunch = launchCodeBrowser(programToLaunch);
+            }
+            return "{\"success\": true, \"project\": \"" + escapeJson(name) + "\", "
+                + "\"already_open\": true, \"headless\": " + headless
+                + (maybeLaunch != null ? ", \"program_launch_result\": " + maybeLaunch : "")
+                + "}";
+        }
+
+        ProjectManager pm = tool.getProjectManager();
+        if (pm == null) {
+            return "{\"error\": \"ProjectManager not available on this tool\"}";
+        }
+
+        // Must run on the EDT — FrontEndTool state updates expect Swing.
+        final String[] errMsg = {null};
+        final Project[] opened = {null};
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                try {
+                    if (currentProject != null) {
+                        try { currentProject.save(); } catch (Exception ignored) { /* best-effort */ }
+                        currentProject.close();
+                    }
+                    Project p = pm.openProject(locator, true, false);
+                    if (p == null) {
+                        errMsg[0] = "ProjectManager.openProject returned null";
+                        return;
+                    }
+                    AppInfo.setActiveProject(p);
+                    opened[0] = p;
+                } catch (Exception e) {
+                    errMsg[0] = e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
+            });
+        } catch (Exception e) {
+            return "{\"error\": \"EDT invocation failed: " + escapeJson(e.getMessage()) + "\"}";
+        }
+        if (errMsg[0] != null) {
+            return "{\"error\": \"Failed to open project: " + escapeJson(errMsg[0]) + "\"}";
+        }
+        if (opened[0] == null) {
+            return "{\"error\": \"openProject returned null without an error\"}";
+        }
+
+        String launchResult = null;
+        if (!headless && programToLaunch != null && !programToLaunch.isEmpty()) {
+            launchResult = launchCodeBrowser(programToLaunch);
+        }
+        StringBuilder json = new StringBuilder(256);
+        json.append("{\"success\": true, \"project\": \"").append(escapeJson(opened[0].getName()))
+            .append("\", \"headless\": ").append(headless);
+        if (launchResult != null) {
+            json.append(", \"program_launch_result\": ").append(launchResult);
+        }
+        json.append("}");
+        return json.toString();
     }
 
     private String launchCodeBrowser(String filePath) {

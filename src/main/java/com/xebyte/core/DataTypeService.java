@@ -467,7 +467,7 @@ public class DataTypeService {
     /**
      * Create a new structure data type with specified fields
      */
-    @McpTool(path = "/create_struct", method = "POST", description = "Create a structure data type. Body fields must be a JSON array of objects; each object needs name and type, with optional offset. Example fields: [{\"name\":\"dwId\",\"type\":\"uint\",\"offset\":0},{\"name\":\"pNext\",\"type\":\"void *\",\"offset\":4}]. Type may be any resolvable Ghidra data type or existing struct name.", category = "datatype")
+    @McpTool(path = "/create_struct", method = "POST", description = "Create a structure data type. Body fields must be a JSON array of objects; each object needs name and type, with optional offset. Example fields: [{\"name\":\"dwId\",\"type\":\"uint\",\"offset\":0},{\"name\":\"pNext\",\"type\":\"void *\",\"offset\":4}]. Type may be any resolvable Ghidra data type or existing struct name. Set replace_placeholder=true to delete a 1-byte demangler/placeholder type with the same name before creating. To change size of an existing struct in place, use resize_struct; for atomic delete+recreate, use recreate_struct (see docs/STRUCT_RESIZE_WORKFLOW.md).", category = "datatype")
     public Response createStruct(
             @Param(value = "name", source = ParamSource.BODY,
                    description = "New structure type name, for example UnitAny or SkillTableEntry") String name,
@@ -477,11 +477,9 @@ public class DataTypeService {
                    description = "Data type category path (e.g. /RS2014)") String categoryPath,
             @Param(value = "size", source = ParamSource.BODY, defaultValue = "0",
                    description = "Explicit struct size in bytes. 0 = auto from fields.") int explicitSize,
+            @Param(value = "replace_placeholder", source = ParamSource.BODY, defaultValue = "false",
+                   description = "If true and a same-named type exists with size <= 1 byte (typical /Demangler stub), delete it first then create the struct.") boolean replacePlaceholder,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
-        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
-        if (pe.hasError()) return pe.error();
-        Program program = pe.program();
-
         if (name == null || name.isEmpty()) {
             return Response.text("Structure name is required");
         }
@@ -501,6 +499,10 @@ public class DataTypeService {
                             + fieldsTrimmed.substring(0, Math.min(60, fieldsTrimmed.length()))
                             + "...)"));
         }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
 
         final StringBuilder resultMsg = new StringBuilder();
         final AtomicBoolean successFlag = new AtomicBoolean(false);
@@ -522,7 +524,16 @@ public class DataTypeService {
             ghidra.program.model.data.CategoryPath catPath = new ghidra.program.model.data.CategoryPath(catStr);
             DataType existingType = dtm.getDataType(catPath, name);
             if (existingType != null) {
-                return Response.text("Structure with name '" + name + "' already exists in " + catStr);
+                if (replacePlaceholder && existingType.getLength() <= 1) {
+                    if (!deletePlaceholderType(program, existingType, name, new StringBuilder())) {
+                        return Response.text("Failed to remove 1-byte placeholder '"
+                                + existingType.getPathName() + "' before create_struct");
+                    }
+                } else {
+                    return Response.text("Structure with name '" + name + "' already exists in " + catStr
+                            + " (" + existingType.getPathName() + ", " + existingType.getLength()
+                            + " bytes). Use replace_placeholder=true for 1-byte stubs, or resolve_duplicate_type.");
+                }
             }
 
             // Pre-resolve all field types before entering the transaction
@@ -550,12 +561,14 @@ public class DataTypeService {
                 }
             }
             final int structInitSize = explicitSize > 0 ? explicitSize : requiredSize;
+            final boolean hasOffsetsFinal = hasOffsets;
 
-            // Create the structure on Swing EDT thread (required for transactions)
+            // Create the structure under the injected threading strategy so the
+            // mutation runs on the EDT (GUI) or under the global write lock
+            // (headless) with transaction commit/rollback handled centrally.
             final ghidra.program.model.data.CategoryPath finalCatPath = catPath;
-            SwingUtilities.invokeAndWait(() -> {
-                int txId = program.startTransaction("Create Structure: " + name);
-                try {
+            try {
+                threadingStrategy.executeWrite(program, "Create Structure: " + name, () -> {
                     ghidra.program.model.data.StructureDataType struct =
                         new ghidra.program.model.data.StructureDataType(finalCatPath, name, structInitSize, dtm);
 
@@ -563,7 +576,7 @@ public class DataTypeService {
                         FieldDefinition field = entry.getKey();
                         DataType fieldType = entry.getValue();
 
-                        if (field.offset >= 0 && hasOffsets) {
+                        if (field.offset >= 0 && hasOffsetsFinal) {
                             // Place field at explicit offset
                             struct.replaceAtOffset(field.offset, fieldType,
                                 fieldType.getLength(), field.name, "");
@@ -580,20 +593,16 @@ public class DataTypeService {
                     resultMsg.append("Successfully created structure '").append(name).append("' with ")
                             .append(fields.size()).append(" fields, total size: ")
                             .append(createdStruct.getLength()).append(" bytes");
+                    return null;
+                });
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                Msg.error(this, "Error creating structure", e);
+                return Response.err("Error creating structure: " + msg);
+            }
 
-                } catch (Throwable e) {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-                    resultMsg.append("Error creating structure: ").append(msg);
-                    Msg.error(this, "Error creating structure", e);
-                }
-                finally {
-                    program.endTransaction(txId, successFlag.get());
-                }
-            });
-
-            // Force event processing to ensure changes propagate
+            // executeWrite already flushed events; keep the post-create settle.
             if (successFlag.get()) {
-                program.flushEvents();
                 try {
                     Thread.sleep(50);
                 } catch (InterruptedException e) {
@@ -610,12 +619,16 @@ public class DataTypeService {
     }
 
     // Backward compatibility overloads
+    public Response createStruct(String name, String fieldsJson, boolean replacePlaceholder, String programName) {
+        return createStruct(name, fieldsJson, "/", 0, replacePlaceholder, programName);
+    }
+
     public Response createStruct(String name, String fieldsJson, String programName) {
-        return createStruct(name, fieldsJson, "/", 0, programName);
+        return createStruct(name, fieldsJson, "/", 0, false, programName);
     }
 
     public Response createStruct(String name, String fieldsJson) {
-        return createStruct(name, fieldsJson, "/", 0, null);
+        return createStruct(name, fieldsJson, "/", 0, false, null);
     }
 
     /**
@@ -662,41 +675,38 @@ public class DataTypeService {
                 return Response.text("Enumeration with name '" + name + "' already exists");
             }
 
-            // Create the enumeration
-            int txId = program.startTransaction("Create Enumeration: " + name);
-            boolean txSuccess = false;
+            // Create the enumeration under the injected threading strategy so the
+            // mutation runs on the EDT (GUI) or under the global write lock (headless)
+            // with transaction commit/rollback handled centrally.
             try {
-                ghidra.program.model.data.EnumDataType enumDt =
-                    new ghidra.program.model.data.EnumDataType(name, size);
+                return threadingStrategy.executeWrite(program, "Create Enumeration: " + name, () -> {
+                    ghidra.program.model.data.EnumDataType enumDt =
+                        new ghidra.program.model.data.EnumDataType(name, size);
 
-                for (Map.Entry<String, Long> entry : values.entrySet()) {
-                    enumDt.add(entry.getKey(), entry.getValue());
-                }
+                    for (Map.Entry<String, Long> entry : values.entrySet()) {
+                        enumDt.add(entry.getKey(), entry.getValue());
+                    }
 
-                // Add the enumeration to the data type manager
-                dtm.addDataType(enumDt, null);
+                    // Add the enumeration to the data type manager
+                    dtm.addDataType(enumDt, null);
 
-                txSuccess = true;
+                    // Validate enum member naming (UPPERCASE_SNAKE_CASE)
+                    List<String> enumWarnings = new ArrayList<>();
+                    for (String memberName : values.keySet()) {
+                        enumWarnings.addAll(NamingConventions.validateEnumMemberName(memberName));
+                    }
 
-                // Validate enum member naming (UPPERCASE_SNAKE_CASE)
-                List<String> enumWarnings = new ArrayList<>();
-                for (String memberName : values.keySet()) {
-                    enumWarnings.addAll(NamingConventions.validateEnumMemberName(memberName));
-                }
-
-                Map<String, Object> resultMap = new LinkedHashMap<>();
-                resultMap.put("status", "success");
-                resultMap.put("message", "Successfully created enumeration '" + name + "' with " + values.size() +
-                               " values, size: " + size + " bytes");
-                if (!enumWarnings.isEmpty()) {
-                    resultMap.put("warnings", enumWarnings);
-                }
-                return Response.ok(resultMap);
-
+                    Map<String, Object> resultMap = new LinkedHashMap<>();
+                    resultMap.put("status", "success");
+                    resultMap.put("message", "Successfully created enumeration '" + name + "' with " + values.size() +
+                                   " values, size: " + size + " bytes");
+                    if (!enumWarnings.isEmpty()) {
+                        resultMap.put("warnings", enumWarnings);
+                    }
+                    return Response.ok(resultMap);
+                });
             } catch (Exception e) {
                 return Response.err("Error creating enumeration: " + e.getMessage());
-            } finally {
-                program.endTransaction(txId, txSuccess);
             }
 
         } catch (Exception e) {
@@ -735,50 +745,44 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create union");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    UnionDataType union = new UnionDataType(name);
+            threadingStrategy.executeWrite(program, "Create union", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                UnionDataType union = new UnionDataType(name);
 
-                    // Handle fields object directly (should be a List of Maps)
-                    if (fieldsObj instanceof java.util.List) {
-                        java.util.List<Object> fieldsList = (java.util.List<Object>) fieldsObj;
+                // Handle fields object directly (should be a List of Maps)
+                if (fieldsObj instanceof java.util.List) {
+                    java.util.List<Object> fieldsList = (java.util.List<Object>) fieldsObj;
 
-                        for (Object fieldObj : fieldsList) {
-                            if (fieldObj instanceof java.util.Map) {
-                                java.util.Map<String, Object> fieldMap = (java.util.Map<String, Object>) fieldObj;
+                    for (Object fieldObj : fieldsList) {
+                        if (fieldObj instanceof java.util.Map) {
+                            java.util.Map<String, Object> fieldMap = (java.util.Map<String, Object>) fieldObj;
 
-                                String fieldName = (String) fieldMap.get("name");
-                                String fieldType = (String) fieldMap.get("type");
+                            String fieldName = (String) fieldMap.get("name");
+                            String fieldType = (String) fieldMap.get("type");
 
-                                if (fieldName != null && fieldType != null) {
-                                    DataType dt = ServiceUtils.findDataTypeByNameInAllCategories(dtm, fieldType);
-                                    if (dt != null) {
-                                        union.add(dt, fieldName, null);
-                                        result.append("Added field: ").append(fieldName).append(" (").append(fieldType).append(")\n");
-                                    } else {
-                                        result.append("Warning: Data type not found for field ").append(fieldName).append(": ").append(fieldType).append("\n");
-                                    }
+                            if (fieldName != null && fieldType != null) {
+                                DataType dt = ServiceUtils.findDataTypeByNameInAllCategories(dtm, fieldType);
+                                if (dt != null) {
+                                    union.add(dt, fieldName, null);
+                                    result.append("Added field: ").append(fieldName).append(" (").append(fieldType).append(")\n");
+                                } else {
+                                    result.append("Warning: Data type not found for field ").append(fieldName).append(": ").append(fieldType).append("\n");
                                 }
                             }
                         }
-                    } else {
-                        result.append("Invalid fields format - expected list of field objects");
-                        return;
                     }
-
-                    dtm.addDataType(union, DataTypeConflictHandler.REPLACE_HANDLER);
-                    result.append("Union '").append(name).append("' created successfully with ").append(union.getNumComponents()).append(" fields");
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error creating union: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                } else {
+                    result.append("Invalid fields format - expected list of field objects");
+                    return null;
                 }
+
+                dtm.addDataType(union, DataTypeConflictHandler.REPLACE_HANDLER);
+                result.append("Union '").append(name).append("' created successfully with ").append(union.getNumComponents()).append(" fields");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute union creation on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error creating union: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -807,43 +811,37 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create union");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    UnionDataType union = new UnionDataType(name);
+            threadingStrategy.executeWrite(program, "Create union", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                UnionDataType union = new UnionDataType(name);
 
-                    // Parse fields from JSON using the same method as structs
-                    List<FieldDefinition> fields = parseFieldsJson(fieldsJson);
+                // Parse fields from JSON using the same method as structs
+                List<FieldDefinition> fields = parseFieldsJson(fieldsJson);
 
-                    if (fields.isEmpty()) {
-                        result.append(badFieldsFormatHint(
-                                "No valid fields parsed — every field must have name and type"));
-                        return;
-                    }
-
-                    // Process each field for the union (use resolveDataType like structs do)
-                    for (FieldDefinition field : fields) {
-                        DataType dt = ServiceUtils.resolveDataType(dtm, field.type);
-                        if (dt != null) {
-                            union.add(dt, field.name, null);
-                            result.append("Added field: ").append(field.name).append(" (").append(field.type).append(")\n");
-                        } else {
-                            result.append("Warning: Data type not found for field ").append(field.name).append(": ").append(field.type).append("\n");
-                        }
-                    }
-
-                    dtm.addDataType(union, DataTypeConflictHandler.REPLACE_HANDLER);
-                    result.append("Union '").append(name).append("' created successfully with ").append(union.getNumComponents()).append(" fields");
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error creating union: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (fields.isEmpty()) {
+                    result.append(badFieldsFormatHint(
+                            "No valid fields parsed — every field must have name and type"));
+                    return null;
                 }
+
+                // Process each field for the union (use resolveDataType like structs do)
+                for (FieldDefinition field : fields) {
+                    DataType dt = ServiceUtils.resolveDataType(dtm, field.type);
+                    if (dt != null) {
+                        union.add(dt, field.name, null);
+                        result.append("Added field: ").append(field.name).append(" (").append(field.type).append(")\n");
+                    } else {
+                        result.append("Warning: Data type not found for field ").append(field.name).append(": ").append(field.type).append("\n");
+                    }
+                }
+
+                dtm.addDataType(union, DataTypeConflictHandler.REPLACE_HANDLER);
+                result.append("Union '").append(name).append("' created successfully with ").append(union.getNumComponents()).append(" fields");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute union creation on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error creating union: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -872,45 +870,39 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create typedef");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType base = null;
+            threadingStrategy.executeWrite(program, "Create typedef", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType base = null;
 
-                    // Handle pointer syntax (e.g., "UnitAny *")
-                    if (baseType.endsWith(" *") || baseType.endsWith("*")) {
-                        String baseTypeName = baseType.replace(" *", "").replace("*", "").trim();
-                        DataType baseDataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, baseTypeName);
-                        if (baseDataType != null) {
-                            base = new PointerDataType(baseDataType);
-                        } else {
-                            result.append("Base type not found for pointer: ").append(baseTypeName);
-                            return;
-                        }
+                // Handle pointer syntax (e.g., "UnitAny *")
+                if (baseType.endsWith(" *") || baseType.endsWith("*")) {
+                    String baseTypeName = baseType.replace(" *", "").replace("*", "").trim();
+                    DataType baseDataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, baseTypeName);
+                    if (baseDataType != null) {
+                        base = new PointerDataType(baseDataType);
                     } else {
-                        // Regular type lookup
-                        base = ServiceUtils.findDataTypeByNameInAllCategories(dtm, baseType);
+                        result.append("Base type not found for pointer: ").append(baseTypeName);
+                        return null;
                     }
-
-                    if (base == null) {
-                        result.append("Base type not found: ").append(baseType);
-                        return;
-                    }
-
-                    TypedefDataType typedef = new TypedefDataType(name, base);
-                    dtm.addDataType(typedef, DataTypeConflictHandler.REPLACE_HANDLER);
-
-                    result.append("Typedef '").append(name).append("' created as alias for '").append(baseType).append("'");
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error creating typedef: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                } else {
+                    // Regular type lookup
+                    base = ServiceUtils.findDataTypeByNameInAllCategories(dtm, baseType);
                 }
+
+                if (base == null) {
+                    result.append("Base type not found: ").append(baseType);
+                    return null;
+                }
+
+                TypedefDataType typedef = new TypedefDataType(name, base);
+                dtm.addDataType(typedef, DataTypeConflictHandler.REPLACE_HANDLER);
+
+                result.append("Typedef '").append(name).append("' created as alias for '").append(baseType).append("'");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute typedef creation on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error creating typedef: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -939,31 +931,25 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Clone data type");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType source = ServiceUtils.findDataTypeByNameInAllCategories(dtm, sourceType);
+            threadingStrategy.executeWrite(program, "Clone data type", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType source = ServiceUtils.findDataTypeByNameInAllCategories(dtm, sourceType);
 
-                    if (source == null) {
-                        result.append("Source type not found: ").append(sourceType);
-                        return;
-                    }
-
-                    DataType cloned = source.clone(dtm);
-                    cloned.setName(newName);
-
-                    dtm.addDataType(cloned, DataTypeConflictHandler.REPLACE_HANDLER);
-                    result.append("Data type '").append(sourceType).append("' cloned as '").append(newName).append("'");
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error cloning data type: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (source == null) {
+                    result.append("Source type not found: ").append(sourceType);
+                    return null;
                 }
+
+                DataType cloned = source.clone(dtm);
+                cloned.setName(newName);
+
+                dtm.addDataType(cloned, DataTypeConflictHandler.REPLACE_HANDLER);
+                result.append("Data type '").append(sourceType).append("' cloned as '").append(newName).append("'");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute data type cloning on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error cloning data type: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -993,37 +979,30 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create array type");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType baseDataType = ServiceUtils.resolveDataType(dtm, baseType);
+            threadingStrategy.executeWrite(program, "Create array type", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType baseDataType = ServiceUtils.resolveDataType(dtm, baseType);
 
-                    if (baseDataType == null) {
-                        result.append("Base data type not found: ").append(baseType);
-                        return;
-                    }
-
-                    ArrayDataType arrayType = new ArrayDataType(baseDataType, length, baseDataType.getLength());
-
-                    if (name != null && !name.isEmpty()) {
-                        arrayType.setName(name);
-                    }
-
-                    DataType addedType = dtm.addDataType(arrayType, DataTypeConflictHandler.REPLACE_HANDLER);
-
-                    result.append("Successfully created array type: ").append(addedType.getName())
-                          .append(" (").append(baseType).append("[").append(length).append("])");
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error creating array type: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (baseDataType == null) {
+                    result.append("Base data type not found: ").append(baseType);
+                    return null;
                 }
+
+                ArrayDataType arrayType = new ArrayDataType(baseDataType, length, baseDataType.getLength());
+
+                if (name != null && !name.isEmpty()) {
+                    arrayType.setName(name);
+                }
+
+                DataType addedType = dtm.addDataType(arrayType, DataTypeConflictHandler.REPLACE_HANDLER);
+
+                result.append("Successfully created array type: ").append(addedType.getName())
+                      .append(" (").append(baseType).append("[").append(length).append("])");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute array type creation on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error creating array type: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -1051,46 +1030,39 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create pointer type");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType baseDataType = null;
+            threadingStrategy.executeWrite(program, "Create pointer type", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType baseDataType = null;
 
-                    if ("void".equals(baseType)) {
-                        baseDataType = dtm.getDataType("/void");
-                        if (baseDataType == null) {
-                            baseDataType = VoidDataType.dataType;
-                        }
-                    } else {
-                        baseDataType = ServiceUtils.resolveDataType(dtm, baseType);
-                    }
-
+                if ("void".equals(baseType)) {
+                    baseDataType = dtm.getDataType("/void");
                     if (baseDataType == null) {
-                        result.append("Base data type not found: ").append(baseType);
-                        return;
+                        baseDataType = VoidDataType.dataType;
                     }
-
-                    PointerDataType pointerType = new PointerDataType(baseDataType);
-
-                    if (name != null && !name.isEmpty()) {
-                        pointerType.setName(name);
-                    }
-
-                    DataType addedType = dtm.addDataType(pointerType, DataTypeConflictHandler.REPLACE_HANDLER);
-
-                    result.append("Successfully created pointer type: ").append(addedType.getName())
-                          .append(" (").append(baseType).append("*)");
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error creating pointer type: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                } else {
+                    baseDataType = ServiceUtils.resolveDataType(dtm, baseType);
                 }
+
+                if (baseDataType == null) {
+                    result.append("Base data type not found: ").append(baseType);
+                    return null;
+                }
+
+                PointerDataType pointerType = new PointerDataType(baseDataType);
+
+                if (name != null && !name.isEmpty()) {
+                    pointerType.setName(name);
+                }
+
+                DataType addedType = dtm.addDataType(pointerType, DataTypeConflictHandler.REPLACE_HANDLER);
+
+                result.append("Successfully created pointer type: ").append(addedType.getName())
+                      .append(" (").append(baseType).append("*)");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute pointer type creation on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error creating pointer type: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -1120,63 +1092,56 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create function signature");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
+            threadingStrategy.executeWrite(program, "Create function signature", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
 
-                    // Resolve return type
-                    DataType returnDataType = ServiceUtils.resolveDataType(dtm, returnType);
-                    if (returnDataType == null) {
-                        result.append("Return type not found: ").append(returnType);
-                        return;
-                    }
+                // Resolve return type
+                DataType returnDataType = ServiceUtils.resolveDataType(dtm, returnType);
+                if (returnDataType == null) {
+                    result.append("Return type not found: ").append(returnType);
+                    return null;
+                }
 
-                    // Create function definition
-                    FunctionDefinitionDataType funcDef = new FunctionDefinitionDataType(name);
-                    funcDef.setReturnType(returnDataType);
+                // Create function definition
+                FunctionDefinitionDataType funcDef = new FunctionDefinitionDataType(name);
+                funcDef.setReturnType(returnDataType);
 
-                    // Parse parameters if provided
-                    if (parametersJson != null && !parametersJson.isEmpty()) {
-                        try {
-                            // Simple JSON parsing for parameters
-                            String[] paramPairs = parametersJson.replace("[", "").replace("]", "")
-                                                               .replace("{", "").replace("}", "")
-                                                               .split(",");
+                // Parse parameters if provided
+                if (parametersJson != null && !parametersJson.isEmpty()) {
+                    try {
+                        // Simple JSON parsing for parameters
+                        String[] paramPairs = parametersJson.replace("[", "").replace("]", "")
+                                                           .replace("{", "").replace("}", "")
+                                                           .split(",");
 
-                            for (String paramPair : paramPairs) {
-                                if (paramPair.trim().isEmpty()) continue;
+                        for (String paramPair : paramPairs) {
+                            if (paramPair.trim().isEmpty()) continue;
 
-                                String[] parts = paramPair.split(":");
-                                if (parts.length >= 2) {
-                                    String paramType = parts[1].replace("\"", "").trim();
-                                    DataType paramDataType = ServiceUtils.resolveDataType(dtm, paramType);
-                                    if (paramDataType != null) {
-                                        funcDef.setArguments(new ParameterDefinition[] {
-                                            new ParameterDefinitionImpl(null, paramDataType, null)
-                                        });
-                                    }
+                            String[] parts = paramPair.split(":");
+                            if (parts.length >= 2) {
+                                String paramType = parts[1].replace("\"", "").trim();
+                                DataType paramDataType = ServiceUtils.resolveDataType(dtm, paramType);
+                                if (paramDataType != null) {
+                                    funcDef.setArguments(new ParameterDefinition[] {
+                                        new ParameterDefinitionImpl(null, paramDataType, null)
+                                    });
                                 }
                             }
-                        } catch (Exception e) {
-                            // If JSON parsing fails, continue without parameters
-                            result.append("Warning: Could not parse parameters, continuing without them. ");
                         }
+                    } catch (Exception e) {
+                        // If JSON parsing fails, continue without parameters
+                        result.append("Warning: Could not parse parameters, continuing without them. ");
                     }
-
-                    DataType addedFuncDef = dtm.addDataType(funcDef, DataTypeConflictHandler.REPLACE_HANDLER);
-
-                    result.append("Successfully created function signature: ").append(addedFuncDef.getName());
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error creating function signature: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
                 }
+
+                DataType addedFuncDef = dtm.addDataType(funcDef, DataTypeConflictHandler.REPLACE_HANDLER);
+
+                result.append("Successfully created function signature: ").append(addedFuncDef.getName());
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute function signature creation on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error creating function signature: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -1204,7 +1169,10 @@ public class DataTypeService {
                                + "address is unambiguous.") String addressStr,
             @Param(value = "type_name", source = ParamSource.BODY) String typeName,
             @Param(value = "clear_existing", source = ParamSource.BODY, defaultValue = "true") boolean clearExisting,
-            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName,
+            @Param(value = "strict_mode", source = ParamSource.BODY, defaultValue = "",
+                   description = "Optional per-call override for naming enforcement: 'enforce' / 'warn' / 'off'. Omit to use the project/global setting.")
+                    String strictModeArg) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
@@ -1217,7 +1185,7 @@ public class DataTypeService {
             return Response.text("Data type name is required");
         }
 
-        try {
+        try (AutoCloseable scopedMode = NamingPolicy.getInstance().scopedRequestMode(strictModeArg)) {
             Address address = ServiceUtils.parseAddress(program, addressStr);
             if (address == null) {
                 return Response.text(ServiceUtils.getLastParseError());
@@ -1278,49 +1246,47 @@ public class DataTypeService {
                 }
             }
 
-            int txId = program.startTransaction("Apply Data Type: " + typeName);
-            boolean txSuccess = false;
+            // Apply the data type under the injected threading strategy so the
+            // mutation runs on the EDT (GUI) or under the global write lock (headless)
+            // with transaction commit/rollback handled centrally.
             try {
-                // Clear existing code/data if requested
-                if (clearExisting) {
-                    CodeUnit existingCU = listing.getCodeUnitAt(address);
-                    if (existingCU != null) {
-                        listing.clearCodeUnits(address,
-                            address.add(Math.max(dataType.getLength() - 1, 0)), false);
+                return threadingStrategy.executeWrite(program, "Apply Data Type: " + typeName, () -> {
+                    // Clear existing code/data if requested
+                    if (clearExisting) {
+                        CodeUnit existingCU = listing.getCodeUnitAt(address);
+                        if (existingCU != null) {
+                            listing.clearCodeUnits(address,
+                                address.add(Math.max(dataType.getLength() - 1, 0)), false);
+                        }
                     }
-                }
 
-                // Apply the data type
-                Data data = listing.createData(address, dataType);
+                    // Apply the data type
+                    Data data = listing.createData(address, dataType);
 
-                txSuccess = true;
+                    // Validate size matches expectation
+                    int expectedSize = dataType.getLength();
+                    int actualSize = (data != null) ? data.getLength() : 0;
 
-                // Validate size matches expectation
-                int expectedSize = dataType.getLength();
-                int actualSize = (data != null) ? data.getLength() : 0;
+                    if (actualSize != expectedSize) {
+                        Msg.warn(this, String.format("Size mismatch: expected %d bytes but applied %d bytes at %s",
+                                                     expectedSize, actualSize, addressStr));
+                    }
 
-                if (actualSize != expectedSize) {
-                    Msg.warn(this, String.format("Size mismatch: expected %d bytes but applied %d bytes at %s",
-                                                 expectedSize, actualSize, addressStr));
-                }
+                    String resultText = "Successfully applied data type '" + typeName + "' at " +
+                                   addressStr + " (size: " + actualSize + " bytes)";
 
-                String resultText = "Successfully applied data type '" + typeName + "' at " +
-                               addressStr + " (size: " + actualSize + " bytes)";
+                    // Add value information if available
+                    if (data != null && data.getValue() != null) {
+                        resultText += "\nValue: " + data.getValue().toString();
+                    }
+                    for (String warning : enforcementWarnings) {
+                        resultText += "\nWarning: " + warning;
+                    }
 
-                // Add value information if available
-                if (data != null && data.getValue() != null) {
-                    resultText += "\nValue: " + data.getValue().toString();
-                }
-                for (String warning : enforcementWarnings) {
-                    resultText += "\nWarning: " + warning;
-                }
-
-                return Response.text(resultText);
-
+                    return Response.text(resultText);
+                });
             } catch (Exception e) {
                 return Response.err("Error applying data type: " + e.getMessage());
-            } finally {
-                program.endTransaction(txId, txSuccess);
             }
 
         } catch (Exception e) {
@@ -1328,57 +1294,67 @@ public class DataTypeService {
         }
     }
 
+    /** Four-arg overload preserving the pre-v5.11.2 signature. */
+    public Response applyDataType(String addressStr, String typeName, boolean clearExisting,
+                                   String programName) {
+        return applyDataType(addressStr, typeName, clearExisting, programName, null);
+    }
+
     // Backward compatibility overload
     public Response applyDataType(String addressStr, String typeName, boolean clearExisting) {
-        return applyDataType(addressStr, typeName, clearExisting, null);
+        return applyDataType(addressStr, typeName, clearExisting, null, null);
     }
 
     /**
      * Delete a data type from the program
      */
-    @McpTool(path = "/delete_data_type", method = "POST", description = "Delete a data type", category = "datatype")
+    @McpTool(path = "/delete_data_type", method = "POST",
+            description = "Delete a data type by name. Fails if the type is referenced; use resolve_duplicate_type first to remove unused /Demangler 1-byte stubs when a full type exists.",
+            category = "datatype")
     public Response deleteDataType(
             @Param(value = "type_name", source = ParamSource.BODY) String typeName,
+            @Param(value = "resolve_demangler_duplicate", source = ParamSource.BODY, defaultValue = "false",
+                   description = "If delete fails, attempt resolve_duplicate_type to remove a /Demangler size-1 stub when a larger same-named type exists.") boolean resolveDemanglerDuplicate,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        if (typeName == null || typeName.isEmpty()) return Response.text("Type name is required");
+
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (typeName == null || typeName.isEmpty()) return Response.text("Type name is required");
 
         AtomicBoolean success = new AtomicBoolean(false);
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Delete data type");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, typeName);
+            threadingStrategy.executeWrite(program, "Delete data type", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, typeName);
 
-                    if (dataType == null) {
-                        result.append("Data type not found: ").append(typeName);
-                        return;
-                    }
-
-                    // Check if type is in use (simplified check)
-                    // Note: Ghidra will prevent deletion if type is in use during remove operation
-
-                    boolean deleted = dtm.remove(dataType, null);
-                    if (deleted) {
-                        result.append("Data type '").append(typeName).append("' deleted successfully");
-                        success.set(true);
-                    } else {
-                        result.append("Failed to delete data type '").append(typeName).append("'");
-                    }
-
-                } catch (Exception e) {
-                    result.append("Error deleting data type: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (dataType == null) {
+                    result.append("Data type not found: ").append(typeName);
+                    return null;
                 }
+
+                // Check if type is in use (simplified check)
+                // Note: Ghidra will prevent deletion if type is in use during remove operation
+
+                boolean deleted = dtm.remove(dataType, null);
+                if (deleted) {
+                    result.append("Data type '").append(typeName).append("' deleted successfully");
+                    success.set(true);
+                } else {
+                    result.append("Failed to delete data type '").append(typeName)
+                            .append("' (may be in use). Try resolve_duplicate_type if a /Demangler 1-byte stub blocks a full struct.");
+                }
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute data type deletion on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error deleting data type: ").append(e.getMessage());
+        }
+
+        if (!success.get() && resolveDemanglerDuplicate) {
+            Response resolved = resolveDuplicateType(typeName, true, programName);
+            return Response.text(result.toString() + "\n" + resolved.toJson());
         }
 
         return Response.text(result.toString());
@@ -1386,13 +1362,17 @@ public class DataTypeService {
 
     // Backward compatibility overload
     public Response deleteDataType(String typeName) {
-        return deleteDataType(typeName, null);
+        return deleteDataType(typeName, false, null);
+    }
+
+    public Response deleteDataType(String typeName, String programName) {
+        return deleteDataType(typeName, false, programName);
     }
 
     /**
      * Modify a field in an existing structure
      */
-    @McpTool(path = "/modify_struct_field", method = "POST", description = "Modify a field in a structure. Fields can be identified by name or by offset (for unnamed fields).", category = "datatype")
+    @McpTool(path = "/modify_struct_field", method = "POST", description = "Modify a field in a structure. Fields can be identified by name or by offset (for unnamed fields). For layout size changes (grow/shrink padding), use resize_struct instead of manual delete+create.", category = "datatype")
     public Response modifyStructField(
             @Param(value = "struct_name", source = ParamSource.BODY) String structName,
             @Param(value = "field_name", source = ParamSource.BODY, defaultValue = "",
@@ -1412,87 +1392,80 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Modify struct field");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, structName);
+            threadingStrategy.executeWrite(program, "Modify struct field", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, structName);
 
-                    if (dataType == null) {
-                        result.append("Structure not found: ").append(structName);
-                        return;
-                    }
-
-                    if (!(dataType instanceof Structure)) {
-                        result.append("Data type '").append(structName).append("' is not a structure");
-                        return;
-                    }
-
-                    Structure struct = (Structure) dataType;
-                    DataTypeComponent targetComponent = null;
-
-                    // Support offset-based lookup: "offset:16" or "offset:0x10"
-                    if (fieldName != null && fieldName.startsWith("offset:")) {
-                        try {
-                            String offsetStr = fieldName.substring(7).trim();
-                            int targetOffset = offsetStr.startsWith("0x") || offsetStr.startsWith("0X")
-                                    ? Integer.parseInt(offsetStr.substring(2), 16)
-                                    : Integer.parseInt(offsetStr);
-                            targetComponent = struct.getComponentAt(targetOffset);
-                            if (targetComponent == null) {
-                                result.append("No field at offset ").append(targetOffset).append(" in structure '").append(structName).append("'");
-                                return;
-                            }
-                        } catch (NumberFormatException e) {
-                            result.append("Invalid offset format: ").append(fieldName).append(". Use 'offset:16' or 'offset:0x10'");
-                            return;
-                        }
-                    } else {
-                        // Find by field name
-                        DataTypeComponent[] components = struct.getDefinedComponents();
-                        for (DataTypeComponent component : components) {
-                            if (fieldName != null && fieldName.equals(component.getFieldName())) {
-                                targetComponent = component;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (targetComponent == null) {
-                        result.append("Field '").append(fieldName).append("' not found in structure '").append(structName)
-                                .append("'. For unnamed fields, use 'offset:N' (e.g., 'offset:16' or 'offset:0x10')");
-                        return;
-                    }
-
-                    // If new type is specified, change the field type
-                    if (newType != null && !newType.isEmpty()) {
-                        DataType newDataType = ServiceUtils.resolveDataType(dtm, newType);
-                        if (newDataType == null) {
-                            result.append("New data type not found: ").append(newType);
-                            return;
-                        }
-                        struct.replace(targetComponent.getOrdinal(), newDataType, newDataType.getLength());
-                    }
-
-                    // If new name is specified, auto-fix Hungarian prefix and change the field name
-                    if (newName != null && !newName.isEmpty()) {
-                        targetComponent = struct.getComponent(targetComponent.getOrdinal()); // Refresh component
-                        String fieldTypeName = targetComponent.getDataType().getName();
-                        String fixedName = NamingConventions.autoFixFieldPrefix(newName, fieldTypeName);
-                        targetComponent.setFieldName(fixedName);
-                    }
-
-                    result.append("Successfully modified field '").append(fieldName).append("' in structure '").append(structName).append("'");
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error modifying struct field: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (dataType == null) {
+                    result.append("Structure not found: ").append(structName);
+                    return null;
                 }
+
+                if (!(dataType instanceof Structure)) {
+                    result.append("Data type '").append(structName).append("' is not a structure");
+                    return null;
+                }
+
+                Structure struct = (Structure) dataType;
+                DataTypeComponent targetComponent = null;
+
+                // Support offset-based lookup: "offset:16" or "offset:0x10"
+                if (fieldName != null && fieldName.startsWith("offset:")) {
+                    try {
+                        String offsetStr = fieldName.substring(7).trim();
+                        int targetOffset = offsetStr.startsWith("0x") || offsetStr.startsWith("0X")
+                                ? Integer.parseInt(offsetStr.substring(2), 16)
+                                : Integer.parseInt(offsetStr);
+                        targetComponent = struct.getComponentAt(targetOffset);
+                        if (targetComponent == null) {
+                            result.append("No field at offset ").append(targetOffset).append(" in structure '").append(structName).append("'");
+                            return null;
+                        }
+                    } catch (NumberFormatException e) {
+                        result.append("Invalid offset format: ").append(fieldName).append(". Use 'offset:16' or 'offset:0x10'");
+                        return null;
+                    }
+                } else {
+                    // Find by field name
+                    DataTypeComponent[] components = struct.getDefinedComponents();
+                    for (DataTypeComponent component : components) {
+                        if (fieldName != null && fieldName.equals(component.getFieldName())) {
+                            targetComponent = component;
+                            break;
+                        }
+                    }
+                }
+
+                if (targetComponent == null) {
+                    result.append("Field '").append(fieldName).append("' not found in structure '").append(structName)
+                            .append("'. For unnamed fields, use 'offset:N' (e.g., 'offset:16' or 'offset:0x10')");
+                    return null;
+                }
+
+                // If new type is specified, change the field type
+                if (newType != null && !newType.isEmpty()) {
+                    DataType newDataType = ServiceUtils.resolveDataType(dtm, newType);
+                    if (newDataType == null) {
+                        result.append("New data type not found: ").append(newType);
+                        return null;
+                    }
+                    struct.replace(targetComponent.getOrdinal(), newDataType, newDataType.getLength());
+                }
+
+                // If new name is specified, apply the configured field naming policy.
+                if (newName != null && !newName.isEmpty()) {
+                    targetComponent = struct.getComponent(targetComponent.getOrdinal()); // Refresh component
+                    String fieldTypeName = targetComponent.getDataType().getName();
+                    String fixedName = NamingConventions.applyStructFieldNamingPolicy(newName, fieldTypeName);
+                    targetComponent.setFieldName(fixedName);
+                }
+
+                result.append("Successfully modified field '").append(fieldName).append("' in structure '").append(structName).append("'");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute struct field modification on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error modifying struct field: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -1501,6 +1474,410 @@ public class DataTypeService {
     // Backward compatibility overload
     public Response modifyStructField(String structName, String fieldName, String newType, String newName) {
         return modifyStructField(structName, fieldName, newType, newName, null);
+    }
+
+    /**
+     * Alias for {@link #modifyStructField} when only the field type changes.
+     */
+    @McpTool(path = "/modify_struct_field_type", method = "POST",
+            description = "Set a structure field's type by name or offset (offset:N). Same as modify_struct_field with new_type only.",
+            category = "datatype")
+    public Response modifyStructFieldType(
+            @Param(value = "struct_name", source = ParamSource.BODY) String structName,
+            @Param(value = "field_name", source = ParamSource.BODY,
+                   description = "Field name or offset:N (e.g. offset:0x88).") String fieldName,
+            @Param(value = "new_type", source = ParamSource.BODY) String newType,
+            @Param(value = "program", defaultValue = "") String programName) {
+        return modifyStructField(structName, fieldName, newType, "", programName);
+    }
+
+    /**
+     * Embed a structure by value at a field offset (not a pointer). Common for nested MSVC-style subobjects.
+     */
+    @McpTool(path = "/embed_struct_field", method = "POST",
+            description = "Replace a structure field with an embedded struct type by value (e.g. Rectangle inside LayoutNode). Uses modify_struct_field internally.",
+            category = "datatype")
+    public Response embedStructField(
+            @Param(value = "parent_struct", source = ParamSource.BODY) String parentStruct,
+            @Param(value = "field_name", source = ParamSource.BODY, defaultValue = "",
+                   description = "Field name or offset:N.") String fieldName,
+            @Param(value = "embedded_struct", source = ParamSource.BODY,
+                   description = "Existing structure type to embed by value.") String embeddedStruct,
+            @Param(value = "program", defaultValue = "") String programName) {
+        if (embeddedStruct == null || embeddedStruct.isEmpty()) {
+            return Response.text("embedded_struct is required");
+        }
+        return modifyStructField(parentStruct, fieldName, embeddedStruct, "", programName);
+    }
+
+    /**
+     * Grow or shrink an existing structure without delete+recreate.
+     */
+    @McpTool(path = "/resize_struct", method = "POST",
+            description = "Grow or shrink an existing structure by total byte size. Defined fields whose end offset fits within new_size are preserved; growth pads with undefined filler. Refuses shrink that would clip defined fields unless force=true. See docs/STRUCT_RESIZE_WORKFLOW.md.",
+            category = "datatype")
+    public Response resizeStruct(
+            @Param(value = "name", source = ParamSource.BODY) String name,
+            @Param(value = "new_size", source = ParamSource.BODY) int newSize,
+            @Param(value = "preserve_fields", source = ParamSource.BODY, defaultValue = "true",
+                   description = "When true (default), keep defined fields that still fit; when false with force, trailing layout may be cleared before resize.") boolean preserveFields,
+            @Param(value = "force", source = ParamSource.BODY, defaultValue = "false",
+                   description = "Allow shrink even when defined fields extend past new_size (clips trailing layout).") boolean force,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        if (name == null || name.isEmpty()) {
+            return Response.err("name is required");
+        }
+        if (newSize <= 0) {
+            return Response.err("new_size must be positive");
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        StringBuilder result = new StringBuilder();
+        final int[] oldLenOut = new int[1];
+
+        try {
+            threadingStrategy.executeWrite(program, "Resize structure: " + name, () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, name);
+                if (dataType == null) {
+                    result.append("Structure not found: ").append(name);
+                    return null;
+                }
+                if (!(dataType instanceof Structure)) {
+                    result.append("Data type '").append(name).append("' is not a structure");
+                    return null;
+                }
+
+                Structure struct = (Structure) dataType;
+                oldLenOut[0] = struct.getLength();
+                String clipError = validateStructResize(struct, newSize, force);
+                if (clipError != null) {
+                    result.append(clipError);
+                    return null;
+                }
+
+                if (!preserveFields && force && newSize < oldLenOut[0]) {
+                    clearStructComponentsFromOffset(struct, newSize);
+                }
+
+                struct.setLength(newSize);
+                success.set(true);
+                result.append("Resized '").append(name).append("' from ")
+                        .append(oldLenOut[0]).append(" to ").append(struct.getLength()).append(" bytes");
+                return null;
+            });
+        } catch (IllegalArgumentException e) {
+            result.append("Resize failed: ").append(e.getMessage())
+                    .append(". Use force=true or recreate_struct with an explicit fields array.");
+        } catch (Exception e) {
+            result.append("Error resizing structure: ").append(e.getMessage());
+        }
+
+        if (success.get()) {
+            return Response.ok(JsonHelper.mapOf(
+                    "status", "success",
+                    "name", name,
+                    "old_size", oldLenOut[0],
+                    "new_size", newSize,
+                    "message", result.toString()));
+        }
+        return result.length() > 0 ? Response.err(result.toString()) : Response.err("Failed to resize structure");
+    }
+
+    /**
+     * Replace a structure: remove placeholder or existing type (when allowed), then create with fields.
+     * Not a single transaction; the delete and create are committed separately.
+     */
+    @McpTool(path = "/recreate_struct", method = "POST",
+            description = "Replace a structure in one step: optionally remove an existing same-named type, then create with fields JSON (same shape as create_struct). Use when resize_struct cannot apply or you are rebuilding layout from get_struct_layout export. Set force=true to delete a non-stub type that is not referenced.",
+            category = "datatype")
+    public Response recreateStruct(
+            @Param(value = "name", source = ParamSource.BODY) String name,
+            @Param(value = "fields", source = ParamSource.BODY, fieldsJson = true) String fieldsJson,
+            @Param(value = "size", source = ParamSource.BODY, defaultValue = "0",
+                   description = "Optional minimum total size in bytes after create; grows with undefined padding when larger than implied field layout.") int size,
+            @Param(value = "replace_placeholder", source = ParamSource.BODY, defaultValue = "true",
+                   description = "Delete a 1-byte placeholder/Demangler stub before recreate (default true).") boolean replacePlaceholder,
+            @Param(value = "force", source = ParamSource.BODY, defaultValue = "false",
+                   description = "Delete an existing full-sized struct before recreate (fails if referenced).") boolean force,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        if (name == null || name.isEmpty()) {
+            return Response.err("name is required");
+        }
+        if (fieldsJson == null || fieldsJson.isEmpty()) {
+            return Response.err(badFieldsFormatHint("fields JSON is required"));
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        DataType existing = ServiceUtils.findDataTypeByNameInAllCategories(dtm, name);
+
+        // recreate_struct is inherently multi-step (delete -> create -> resize across
+        // separate transactions). To avoid permanently destroying the original type when
+        // a later step fails, capture a restorable deep copy BEFORE any destructive delete
+        // and re-add it if the create does not succeed.
+        DataType originalBackup = null;
+        boolean deletedOriginal = false;
+
+        if (existing != null) {
+            boolean stub = existing.getLength() <= 1;
+            boolean demangler = isDemanglerPlaceholder(existing);
+            if (stub && (replacePlaceholder || demangler)) {
+                originalBackup = existing.copy(dtm);
+                StringBuilder stubMsg = new StringBuilder();
+                if (!deletePlaceholderType(program, existing, name, stubMsg)) {
+                    return Response.err("Could not remove placeholder before recreate: " + stubMsg);
+                }
+                deletedOriginal = true;
+            } else if (force) {
+                originalBackup = existing.copy(dtm);
+                AtomicBoolean deleted = new AtomicBoolean(false);
+                StringBuilder delMsg = new StringBuilder();
+                try {
+                    threadingStrategy.executeWrite(program, "Recreate struct delete", () -> {
+                        deleted.set(dtm.remove(existing, null));
+                        if (deleted.get()) {
+                            delMsg.append("Removed existing type before recreate");
+                        } else {
+                            delMsg.append("Could not delete '").append(name)
+                                    .append("' (may be in use)");
+                        }
+                        return null;
+                    });
+                } catch (Exception e) {
+                    return Response.err("Delete before recreate failed: " + e.getMessage());
+                }
+                if (!deleted.get()) {
+                    return Response.err(delMsg.toString());
+                }
+                deletedOriginal = true;
+            } else {
+                return Response.err("Structure '" + name + "' already exists ("
+                        + existing.getLength() + " bytes at " + existing.getPathName()
+                        + "). Use resize_struct, replace_placeholder for 1-byte stubs, or force=true.");
+            }
+        }
+
+        Response created = createStruct(name, fieldsJson, false, programName);
+
+        // Verify the create actually landed; if not, restore the original we deleted so the
+        // operation is net-zero rather than destructive.
+        boolean structPresent =
+                ServiceUtils.findDataTypeByNameInAllCategories(dtm, name) instanceof Structure;
+        if (!structPresent) {
+            String createErr = (created instanceof Response.Err)
+                    ? ((Response.Err) created).message()
+                    : "create_struct did not produce a structure";
+            if (deletedOriginal && originalBackup != null) {
+                final DataType restore = originalBackup;
+                try {
+                    threadingStrategy.executeWrite(program,
+                            "Restore struct after failed recreate", () -> {
+                        dtm.addDataType(restore, null);
+                        return null;
+                    });
+                    return Response.err("recreate_struct failed to create '" + name
+                            + "'; the original type was restored unchanged. Cause: " + createErr);
+                } catch (Exception e) {
+                    return Response.err("recreate_struct failed to create '" + name
+                            + "' AND could not restore the original ("
+                            + restore.getPathName() + "): " + e.getMessage()
+                            + ". Original create error: " + createErr);
+                }
+            }
+            return created;
+        }
+
+        if (size <= 0) {
+            return created;
+        }
+
+        Response resized = resizeStruct(name, size, true, true, programName);
+
+        if (resized instanceof Response.Err) {
+            return Response.err("Created struct but post-create resize failed: "
+                    + ((Response.Err) resized).message());
+        }
+        return resized;
+    }
+
+    /**
+     * Remove a 1-byte /Demangler placeholder when a full same-named type exists.
+     */
+    @McpTool(path = "/resolve_duplicate_type", method = "POST",
+            description = "Find duplicate data types by simple name; delete unused /Demangler size-1 stubs when a larger canonical type exists. Helps fix 'Can't resolve datatype' and create_struct already exists on placeholders.",
+            category = "datatype")
+    public Response resolveDuplicateType(
+            @Param(value = "type_name", source = ParamSource.BODY) String typeName,
+            @Param(value = "delete_demangler_stub", source = ParamSource.BODY, defaultValue = "true",
+                   description = "Delete /Demangler/* stubs (size <= 1) when a larger type with the same name exists.") boolean deleteDemanglerStub,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        if (typeName == null || typeName.isEmpty()) {
+            return Response.text("type_name is required");
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        List<DataType> matches = findAllTypesBySimpleName(dtm, typeName);
+        if (matches.isEmpty()) {
+            return Response.text("No data type named '" + typeName + "'");
+        }
+
+        List<DataType> demanglerStubs = new ArrayList<>();
+        List<DataType> canonical = new ArrayList<>();
+        for (DataType dt : matches) {
+            if (isDemanglerPlaceholder(dt)) {
+                demanglerStubs.add(dt);
+            } else {
+                canonical.add(dt);
+            }
+        }
+
+        StringBuilder report = new StringBuilder();
+        report.append("Found ").append(matches.size()).append(" type(s) named '").append(typeName).append("': ");
+        for (DataType dt : matches) {
+            report.append(dt.getPathName()).append(" (").append(dt.getLength()).append(" B); ");
+        }
+
+        if (demanglerStubs.isEmpty()) {
+            if (canonical.size() <= 1) {
+                return Response.text(report + "No /Demangler 1-byte stub to resolve.");
+            }
+            return Response.text(report + "Multiple canonical types — pick one manually or delete orphans with delete_data_type.");
+        }
+
+        if (canonical.isEmpty()) {
+            return Response.text(report + "Only demangler stub(s) present — use delete_data_type or create_struct with replace_placeholder=true.");
+        }
+
+        if (!deleteDemanglerStub) {
+            return Response.text(report + "Demangler stub(s) present; set delete_demangler_stub=true to remove.");
+        }
+
+        int removed = 0;
+        for (DataType stub : demanglerStubs) {
+            StringBuilder stubMsg = new StringBuilder();
+            if (deletePlaceholderType(program, stub, typeName, stubMsg)) {
+                removed++;
+                report.append("Deleted ").append(stub.getPathName()).append(". ");
+            } else {
+                report.append("Could not delete ").append(stub.getPathName()).append(": ")
+                        .append(stubMsg).append(" ");
+            }
+        }
+
+        DataType best = canonical.stream().max(Comparator.comparingInt(DataType::getLength)).orElse(canonical.get(0));
+        report.append("Prefer canonical type ").append(best.getPathName())
+                .append(" (").append(best.getLength()).append(" B).");
+
+        if (removed > 0) {
+            return Response.ok(JsonHelper.mapOf(
+                    "status", "success",
+                    "removed", removed,
+                    "message", report.toString(),
+                    "canonical_path", best.getPathName()));
+        }
+        return Response.text(report.toString());
+    }
+
+    static List<DataType> findAllTypesBySimpleName(DataTypeManager dtm, String typeName) {
+        List<DataType> matches = new ArrayList<>();
+        Iterator<DataType> all = dtm.getAllDataTypes();
+        while (all.hasNext()) {
+            DataType dt = all.next();
+            if (typeName.equals(dt.getName())) {
+                matches.add(dt);
+            }
+        }
+        return matches;
+    }
+
+    static boolean isDemanglerPlaceholder(DataType dt) {
+        if (dt == null) {
+            return false;
+        }
+        String path = dt.getCategoryPath() != null ? dt.getCategoryPath().getPath() : null;
+        return isDemanglerPlaceholder(dt.getLength(), path);
+    }
+
+    static boolean isDemanglerPlaceholder(int length, String categoryPath) {
+        if (length > 1) {
+            return false;
+        }
+        return categoryPath != null && categoryPath.contains("/Demangler");
+    }
+
+    /** Highest byte offset covered by any defined component (0 if empty). */
+    static int structDefinedByteExtent(Structure struct) {
+        int max = 0;
+        for (DataTypeComponent component : struct.getDefinedComponents()) {
+            max = Math.max(max, component.getEndOffset());
+        }
+        return max;
+    }
+
+    /**
+     * @return error message when shrink would clip defined fields and force is false; null if OK
+     */
+    static String validateStructResize(Structure struct, int newSize, boolean force) {
+        return validateStructResize(structDefinedByteExtent(struct), struct.getName(), newSize, force);
+    }
+
+    static String validateStructResize(int definedByteExtent, String structName, int newSize, boolean force) {
+        if (newSize <= 0) {
+            return "new_size must be positive";
+        }
+        if (newSize < definedByteExtent && !force) {
+            return "Cannot shrink '" + structName + "' to " + newSize
+                    + " bytes: defined fields extend to " + definedByteExtent
+                    + " bytes. Set force=true to clip, or use recreate_struct with a new fields array.";
+        }
+        return null;
+    }
+
+    /** Delete components starting at {@code fromOffset} (highest ordinal first). */
+    static void clearStructComponentsFromOffset(Structure struct, int fromOffset) {
+        for (int i = struct.getNumComponents() - 1; i >= 0; i--) {
+            DataTypeComponent component = struct.getComponent(i);
+            if (component != null && component.getOffset() >= fromOffset) {
+                struct.delete(i);
+            }
+        }
+    }
+
+    boolean deletePlaceholderType(Program program, DataType dataType, String logicalName,
+                                         StringBuilder result) {
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            threadingStrategy.executeWrite(program, "Delete placeholder type " + logicalName, () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                boolean deleted = dtm.remove(dataType, null);
+                if (deleted) {
+                    result.append("Removed placeholder '").append(dataType.getPathName()).append("'");
+                    success.set(true);
+                } else {
+                    result.append("Could not remove '").append(dataType.getPathName())
+                            .append("' (in use or locked)");
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            result.append("Error: ").append(e.getMessage());
+        }
+        return success.get();
     }
 
     /**
@@ -1520,65 +1897,58 @@ public class DataTypeService {
         if (fieldName == null || fieldName.isEmpty()) return Response.text("Field name is required");
         if (fieldType == null || fieldType.isEmpty()) return Response.text("Field type is required");
 
-        // Auto-fix Hungarian prefix
-        fieldName = NamingConventions.autoFixFieldPrefix(fieldName, fieldType);
+        // Apply configured struct-field naming policy.
+        fieldName = NamingConventions.applyStructFieldNamingPolicy(fieldName, fieldType);
 
         AtomicBoolean success = new AtomicBoolean(false);
         StringBuilder result = new StringBuilder();
         final String finalFieldName = fieldName;
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Add struct field");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, structName);
+            threadingStrategy.executeWrite(program, "Add struct field", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, structName);
 
-                    if (dataType == null) {
-                        result.append("Structure not found: ").append(structName);
-                        return;
-                    }
-
-                    if (!(dataType instanceof Structure)) {
-                        result.append("Data type '").append(structName).append("' is not a structure");
-                        return;
-                    }
-
-                    Structure struct = (Structure) dataType;
-                    DataType newFieldType = ServiceUtils.resolveDataType(dtm, fieldType);
-                    if (newFieldType == null) {
-                        result.append("Field data type not found: ").append(fieldType);
-                        return;
-                    }
-
-                    if (offset >= 0) {
-                        // Overlay at specific offset (replace undefined padding, do NOT shift fields)
-                        if (offset < struct.getLength()) {
-                            struct.replaceAtOffset(offset, newFieldType, newFieldType.getLength(), finalFieldName, null);
-                        } else {
-                            // At or beyond current struct size — grow to fit, then place
-                            int needed = offset + newFieldType.getLength() - struct.getLength();
-                            if (needed > 0) {
-                                struct.growStructure(needed);
-                            }
-                            struct.replaceAtOffset(offset, newFieldType, newFieldType.getLength(), finalFieldName, null);
-                        }
-                    } else {
-                        // Add at end
-                        struct.add(newFieldType, finalFieldName, null);
-                    }
-
-                    result.append("Successfully added field '").append(finalFieldName).append("' to structure '").append(structName).append("'");
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error adding struct field: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (dataType == null) {
+                    result.append("Structure not found: ").append(structName);
+                    return null;
                 }
+
+                if (!(dataType instanceof Structure)) {
+                    result.append("Data type '").append(structName).append("' is not a structure");
+                    return null;
+                }
+
+                Structure struct = (Structure) dataType;
+                DataType newFieldType = ServiceUtils.resolveDataType(dtm, fieldType);
+                if (newFieldType == null) {
+                    result.append("Field data type not found: ").append(fieldType);
+                    return null;
+                }
+
+                if (offset >= 0) {
+                    // Overlay at specific offset (replace undefined padding, do NOT shift fields)
+                    if (offset < struct.getLength()) {
+                        struct.replaceAtOffset(offset, newFieldType, newFieldType.getLength(), finalFieldName, null);
+                    } else {
+                        // At or beyond current struct size — grow to fit, then place
+                        int needed = offset + newFieldType.getLength() - struct.getLength();
+                        if (needed > 0) {
+                            struct.growStructure(needed);
+                        }
+                        struct.replaceAtOffset(offset, newFieldType, newFieldType.getLength(), finalFieldName, null);
+                    }
+                } else {
+                    // Add at end
+                    struct.add(newFieldType, finalFieldName, null);
+                }
+
+                result.append("Successfully added field '").append(finalFieldName).append("' to structure '").append(structName).append("'");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute struct field addition on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error adding struct field: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -1607,51 +1977,44 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Remove struct field");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, structName);
+            threadingStrategy.executeWrite(program, "Remove struct field", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, structName);
 
-                    if (dataType == null) {
-                        result.append("Structure not found: ").append(structName);
-                        return;
-                    }
-
-                    if (!(dataType instanceof Structure)) {
-                        result.append("Data type '").append(structName).append("' is not a structure");
-                        return;
-                    }
-
-                    Structure struct = (Structure) dataType;
-                    DataTypeComponent[] components = struct.getDefinedComponents();
-                    int targetOrdinal = -1;
-
-                    // Find the field to remove
-                    for (DataTypeComponent component : components) {
-                        if (fieldName.equals(component.getFieldName())) {
-                            targetOrdinal = component.getOrdinal();
-                            break;
-                        }
-                    }
-
-                    if (targetOrdinal == -1) {
-                        result.append("Field '").append(fieldName).append("' not found in structure '").append(structName).append("'");
-                        return;
-                    }
-
-                    struct.delete(targetOrdinal);
-                    result.append("Successfully removed field '").append(fieldName).append("' from structure '").append(structName).append("'");
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error removing struct field: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (dataType == null) {
+                    result.append("Structure not found: ").append(structName);
+                    return null;
                 }
+
+                if (!(dataType instanceof Structure)) {
+                    result.append("Data type '").append(structName).append("' is not a structure");
+                    return null;
+                }
+
+                Structure struct = (Structure) dataType;
+                DataTypeComponent[] components = struct.getDefinedComponents();
+                int targetOrdinal = -1;
+
+                // Find the field to remove
+                for (DataTypeComponent component : components) {
+                    if (fieldName.equals(component.getFieldName())) {
+                        targetOrdinal = component.getOrdinal();
+                        break;
+                    }
+                }
+
+                if (targetOrdinal == -1) {
+                    result.append("Field '").append(fieldName).append("' not found in structure '").append(structName).append("'");
+                    return null;
+                }
+
+                struct.delete(targetOrdinal);
+                result.append("Successfully removed field '").append(fieldName).append("' from structure '").append(structName).append("'");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute struct field removal on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error removing struct field: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -1680,35 +2043,28 @@ public class DataTypeService {
         StringBuilder result = new StringBuilder();
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Move data type to category");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, typeName);
+            threadingStrategy.executeWrite(program, "Move data type to category", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dataType = ServiceUtils.findDataTypeByNameInAllCategories(dtm, typeName);
 
-                    if (dataType == null) {
-                        result.append("Data type not found: ").append(typeName);
-                        return;
-                    }
-
-                    CategoryPath catPath = new CategoryPath(categoryPath);
-                    Category category = dtm.createCategory(catPath);
-
-                    // Move the data type
-                    dataType.setCategoryPath(catPath);
-
-                    result.append("Successfully moved data type '").append(typeName)
-                          .append("' to category '").append(categoryPath).append("'");
-                    success.set(true);
-
-                } catch (Exception e) {
-                    result.append("Error moving data type: ").append(e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success.get());
+                if (dataType == null) {
+                    result.append("Data type not found: ").append(typeName);
+                    return null;
                 }
+
+                CategoryPath catPath = new CategoryPath(categoryPath);
+                Category category = dtm.createCategory(catPath);
+
+                // Move the data type
+                dataType.setCategoryPath(catPath);
+
+                result.append("Successfully moved data type '").append(typeName)
+                      .append("' to category '").append(categoryPath).append("'");
+                success.set(true);
+                return null;
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            result.append("Failed to execute data type move on Swing thread: ").append(e.getMessage());
+        } catch (Exception e) {
+            result.append("Error moving data type: ").append(e.getMessage());
         }
 
         return Response.text(result.toString());
@@ -2539,11 +2895,8 @@ public class DataTypeService {
             final String finalComment = comment;
 
             // Atomic transaction for all operations
-            SwingUtilities.invokeAndWait(() -> {
-                int txId = program.startTransaction("Apply Data Classification");
-                boolean success = false;
-
-                try {
+            try {
+                threadingStrategy.executeWrite(program, "Apply Data Classification", () -> {
                     DataTypeManager dtm = program.getDataTypeManager();
                     Listing listing = program.getListing();
                     DataType dataTypeToApply = null;
@@ -2710,14 +3063,11 @@ public class DataTypeService {
                         operations.add("commented");
                     }
 
-                    success = true;
-
-                } catch (Exception e) {
-                    responseRef.set(Response.err(e.getMessage()));
-                } finally {
-                    program.endTransaction(txId, success);
-                }
-            });
+                    return null;
+                });
+            } catch (Exception e) {
+                responseRef.set(Response.err(e.getMessage()));
+            }
 
             // Build result if no error
             if (responseRef.get() == null) {
@@ -2917,9 +3267,9 @@ public class DataTypeService {
             Msg.error(this, "Error parsing JSON object: " + e.getMessage());
         }
 
-        // Auto-fix Hungarian prefix on field name
+        // Apply configured struct-field naming policy.
         if (name != null && type != null) {
-            name = NamingConventions.autoFixFieldPrefix(name, type);
+            name = NamingConventions.applyStructFieldNamingPolicy(name, type);
         }
 
         return new FieldDefinition(name, type, offset);
@@ -3567,7 +3917,10 @@ public class DataTypeService {
                    description = "If >0, applied as an array of array_length elements of type_name. Required when documenting an array of fixed length (e.g., a 100-entry data table).") int arrayLength,
             @Param(value = "plate_comment", source = ParamSource.BODY,
                    description = "Plate comment for the address. First line must be a meaningful one-line summary (≥4 words). Optional sectioned details (Used by:, Layout:, Source:, Bitfield:) follow when applicable. Pass empty to leave plate comment unchanged.") String plateComment,
-            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName,
+            @Param(value = "strict_mode", source = ParamSource.BODY, defaultValue = "",
+                   description = "Optional per-call override for naming enforcement: 'enforce' / 'warn' / 'off'. Omit to use the project/global setting.")
+                    String strictModeArg) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
@@ -3576,6 +3929,7 @@ public class DataTypeService {
         Address addr = ServiceUtils.parseAddress(program, addressStr);
         if (addr == null) return Response.err(ServiceUtils.getLastParseError());
 
+        try (AutoCloseable scopedMode = NamingPolicy.getInstance().scopedRequestMode(strictModeArg)) {
         // Pre-flight validation. Strict naming enforcement preserves the
         // no-partial-write behavior for name-quality failures; when disabled,
         // the write proceeds and reports the same issue as a warning.
@@ -3736,70 +4090,64 @@ public class DataTypeService {
         final DataType finalType = resolvedType;
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("set_global at " + addressStr);
-                try {
-                    Listing listing = program.getListing();
+            threadingStrategy.executeWrite(program, "set_global at " + addressStr, () -> {
+                Listing listing = program.getListing();
 
-                    if (finalType != null) {
-                        // Clear existing data at the address before re-applying.
-                        int totalLen = arrayLength > 0
-                                ? finalType.getLength() * arrayLength
-                                : finalType.getLength();
-                        if (totalLen > 0) {
-                            try {
-                                listing.clearCodeUnits(addr, addr.add(totalLen - 1), false);
-                            } catch (Exception ignored) {
-                                // best-effort clear; createData below will surface a real error
-                            }
+                if (finalType != null) {
+                    // Clear existing data at the address before re-applying.
+                    int totalLen = arrayLength > 0
+                            ? finalType.getLength() * arrayLength
+                            : finalType.getLength();
+                    if (totalLen > 0) {
+                        try {
+                            listing.clearCodeUnits(addr, addr.add(totalLen - 1), false);
+                        } catch (Exception ignored) {
+                            // best-effort clear; createData below will surface a real error
                         }
-                        if (arrayLength > 0) {
-                            ArrayDataType arrayType = new ArrayDataType(finalType, arrayLength, finalType.getLength());
-                            listing.createData(addr, arrayType);
-                        } else {
-                            listing.createData(addr, finalType);
-                        }
-                        applied.add("type");
-                        if (arrayLength > 0) applied.add("array_length=" + arrayLength);
                     }
+                    if (arrayLength > 0) {
+                        ArrayDataType arrayType = new ArrayDataType(finalType, arrayLength, finalType.getLength());
+                        listing.createData(addr, arrayType);
+                    } else {
+                        listing.createData(addr, finalType);
+                    }
+                    applied.add("type");
+                    if (arrayLength > 0) applied.add("array_length=" + arrayLength);
+                }
 
-                    if (newName != null && !newName.isEmpty()) {
-                        SymbolTable symTable = program.getSymbolTable();
-                        Symbol existing = symTable.getPrimarySymbol(addr);
-                        if (existing != null) {
-                            // Idempotent on name: if the address already has the
-                            // requested name, skip setName (Ghidra throws
-                            // DuplicateNameException for same-name reassignment).
-                            // Workers re-running set_global on a partially-applied
-                            // global hit this when the name landed in a previous
-                            // attempt but the type or plate comment didn't.
-                            if (newName.equals(existing.getName())) {
-                                applied.add("name=already_set");
-                            } else {
-                                existing.setName(newName, SourceType.USER_DEFINED);
-                                applied.add("name");
-                            }
+                if (newName != null && !newName.isEmpty()) {
+                    SymbolTable symTable = program.getSymbolTable();
+                    Symbol existing = symTable.getPrimarySymbol(addr);
+                    if (existing != null) {
+                        // Idempotent on name: if the address already has the
+                        // requested name, skip setName (Ghidra throws
+                        // DuplicateNameException for same-name reassignment).
+                        // Workers re-running set_global on a partially-applied
+                        // global hit this when the name landed in a previous
+                        // attempt but the type or plate comment didn't.
+                        if (newName.equals(existing.getName())) {
+                            applied.add("name=already_set");
                         } else {
-                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
+                            existing.setName(newName, SourceType.USER_DEFINED);
                             applied.add("name");
                         }
+                    } else {
+                        symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
+                        applied.add("name");
                     }
-
-                    if (plateComment != null && !plateComment.trim().isEmpty()) {
-                        listing.setComment(addr, ghidra.program.model.listing.CodeUnit.PLATE_COMMENT, plateComment);
-                        applied.add("plate_comment");
-                    }
-
-                    success.set(true);
-                } catch (Exception e) {
-                    errorMsg.set(e.getMessage() != null ? e.getMessage() : e.getClass().getName());
-                    Msg.error(this, "set_global error", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
                 }
+
+                if (plateComment != null && !plateComment.trim().isEmpty()) {
+                    listing.setComment(addr, ghidra.program.model.listing.CodeUnit.PLATE_COMMENT, plateComment);
+                    applied.add("plate_comment");
+                }
+
+                success.set(true);
+                return null;
             });
         } catch (Exception e) {
-            return Response.err("Failed to execute set_global on Swing thread: " + e.getMessage());
+            errorMsg.set(e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+            Msg.error(this, "set_global error", e);
         }
 
         if (success.get()) {
@@ -3814,6 +4162,11 @@ public class DataTypeService {
             return Response.ok(result);
         }
         return Response.err(errorMsg.get() != null ? errorMsg.get() : "Unknown failure");
+        } catch (Exception e) {
+            // try-with-resources close() is declared as throws Exception;
+            // re-wrap since the body never raises a checked exception.
+            throw new RuntimeException(e);
+        }
     }
 
     private static String disabledGlobalEnforcementWarning(Map<String, Object> rejection) {

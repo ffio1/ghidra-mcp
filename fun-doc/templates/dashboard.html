@@ -758,6 +758,7 @@
                         <th class="sortable-header" onclick="toggleSort('fixable')">Fixable <span id="sort-ind-fixable"></span></th>
                         <th class="sortable-header" onclick="toggleSort('tools')" title="Tool calls used in the most recent primary run for this function. Audit pass not included.">Tools <span id="sort-ind-tools"></span></th>
                         <th class="sortable-header" onclick="toggleSort('layer')">Layer <span id="sort-ind-layer"></span></th>
+                        <th title="Name provenance: scan (default Ghidra label or first scan), manual (worker renamed), propagation (cross-version hash propagation -- skipped from selector unless pinned or high-confidence), pdb (symbol server import), archive (re-kb gate). See #204.">Src</th>
                         <th class="sortable-header" onclick="toggleSort('status')">Status <span id="sort-ind-status"></span></th>
                     </tr></thead>
                     <tbody id="allFuncsBody">
@@ -778,6 +779,15 @@
                         <td class="mono">{{ f.fixable }}</td>
                         <td class="mono" style="color: var(--text-secondary);">{% if f.tool_calls is none or f.tool_calls < 0 %}<span style="color: var(--text-muted);" title="Provider didn't expose a tool-call count">&mdash;</span>{% else %}{{ f.tool_calls }}{% endif %}</td>
                         <td class="mono" style="font-size: 0.6rem; color: var(--text-secondary);">{% if f.is_leaf %}Leaf{% else %}—{% endif %}</td>
+                        <td class="mono" style="font-size: 0.6rem;">
+                            {% set ns = f.name_source or 'scan' %}
+                            {% if f.skip_reason == 'propagation' %}<span style="color: var(--color-rare);" title="Skipped by selector: name came from cross-version hash propagation, no archive backing. Source binary: {{ f.name_source_binary or 'unknown' }}. Pin to override.">propagation</span>
+                            {% elif ns == 'propagation' %}<span style="color: var(--color-set);" title="Name from propagation; high-confidence ({{ f.name_confidence }}), admitted by selector. Source: {{ f.name_source_binary or 'unknown' }}">propagation</span>
+                            {% elif ns == 'manual' %}<span style="color: var(--color-set);" title="Renamed by worker">manual</span>
+                            {% elif ns == 'pdb' %}<span style="color: var(--color-set);" title="From PDB import">pdb</span>
+                            {% elif ns == 'archive' %}<span style="color: var(--color-set);" title="From re-kb archive">archive</span>
+                            {% else %}<span style="color: var(--text-muted);" title="Default Ghidra label or set during scan">scan</span>{% endif %}
+                        </td>
                         <td>
                         {% if f.unscored %}<span class="badge badge-new" title="Never scored — click Queue to score on demand">UNSCORED</span>
                         {% elif f.score >= (stats.queue_config.good_enough_score|default(80)) %}<span class="badge badge-done">DONE</span>
@@ -1572,12 +1582,28 @@
             }
         }
 
-        function markPaneFinished(workerId, reason) {
+        // Human-readable label for a structured exit_reason. Returns null
+        // when the worker exited normally with work done; the caller falls
+        // back to the raw status string in that case.
+        function exitReasonLabel(exitReason) {
+            if (!exitReason) return null;
+            if (exitReason === 'no_eligible_candidates') return 'no eligible candidates';
+            // Unknown reason: render as-is so we don't silently swallow a
+            // new exit code the backend may add later.
+            return exitReason;
+        }
+
+        function markPaneFinished(workerId, reason, exitReason) {
             const pane = workerPanes[workerId];
             if (!pane) return;
             pane.element.className = 'worker-pane finished';
             const status = document.getElementById(`wp-status-${workerId}`);
-            if (status) status.textContent = reason || 'finished';
+            const label = exitReasonLabel(exitReason);
+            if (status) {
+                status.textContent = label
+                    ? `${reason || 'finished'} — ${label}`
+                    : (reason || 'finished');
+            }
             const stopBtn = document.getElementById(`wp-stop-${workerId}`);
             const dismissBtn = document.getElementById(`wp-dismiss-${workerId}`);
             if (stopBtn) stopBtn.style.display = 'none';
@@ -1643,8 +1669,13 @@
             const pane = workerPanes[d.worker_id];
             // Close any block left open by mid-function abandonment (Q2 C).
             if (pane) _closeFnBlock(pane, null, null, true /* interrupted */);
-            appendToPane(d.worker_id, `Worker ${d.reason}: ${d.progress?.completed || 0} completed`, d.reason === 'finished' ? 'success' : 'neutral');
-            markPaneFinished(d.worker_id, d.reason);
+            const exitLabel = exitReasonLabel(d.exit_reason);
+            const completed = d.progress?.completed || 0;
+            const summary = exitLabel
+                ? `Worker ${d.reason}: ${completed} completed — ${exitLabel}`
+                : `Worker ${d.reason}: ${completed} completed`;
+            appendToPane(d.worker_id, summary, d.reason === 'finished' ? 'success' : 'neutral');
+            markPaneFinished(d.worker_id, d.reason, d.exit_reason);
             if (_focusedWorkerId === d.worker_id) unfocusWorker();
             refreshStats();
         });
@@ -2033,6 +2064,26 @@
                 const toolCallsCell = (f.tool_calls == null || f.tool_calls < 0)
                     ? `<td class="mono" style="color: var(--text-muted);" title="Provider didn't expose a tool-call count">&mdash;</td>`
                     : `<td class="mono" style="color: var(--text-secondary);">${f.tool_calls}</td>`;
+                // Source column (#204) — name-provenance. Highlights propagation
+                // rows that the selector will skip.
+                const ns = f.name_source || 'scan';
+                let sourceCell;
+                if (f.skip_reason === 'propagation') {
+                    const srcBin = escapeHtml(f.name_source_binary || 'unknown');
+                    sourceCell = `<td class="mono" style="font-size: 0.6rem;"><span style="color: var(--color-rare);" title="Skipped by selector: name came from cross-version hash propagation, no archive backing. Source binary: ${srcBin}. Pin to override.">propagation</span></td>`;
+                } else if (ns === 'propagation') {
+                    const srcBin = escapeHtml(f.name_source_binary || 'unknown');
+                    const conf = f.name_confidence != null ? f.name_confidence : '?';
+                    sourceCell = `<td class="mono" style="font-size: 0.6rem;"><span style="color: var(--color-set);" title="Name from propagation; high-confidence (${conf}), admitted by selector. Source: ${srcBin}">propagation</span></td>`;
+                } else if (ns === 'manual') {
+                    sourceCell = `<td class="mono" style="font-size: 0.6rem;"><span style="color: var(--color-set);" title="Renamed by worker">manual</span></td>`;
+                } else if (ns === 'pdb') {
+                    sourceCell = `<td class="mono" style="font-size: 0.6rem;"><span style="color: var(--color-set);" title="From PDB import">pdb</span></td>`;
+                } else if (ns === 'archive') {
+                    sourceCell = `<td class="mono" style="font-size: 0.6rem;"><span style="color: var(--color-set);" title="From re-kb archive">archive</span></td>`;
+                } else {
+                    sourceCell = `<td class="mono" style="font-size: 0.6rem;"><span style="color: var(--text-muted);" title="Default Ghidra label or set during scan">scan</span></td>`;
+                }
                 return `<tr class="func-row" data-score="${f.score}" data-name="${escapeHtml((f.name||'').toLowerCase())}" data-key="${escapeHtml(f.key)}">
                     <td>${queueBtn}</td>
                     <td>${queuedBadge}${escapeHtml(f.name)}</td>
@@ -2042,6 +2093,7 @@
                     <td class="mono">${f.fixable}</td>
                     ${toolCallsCell}
                     <td class="mono" style="font-size: 0.6rem; color: var(--text-secondary);">${layerLabel}</td>
+                    ${sourceCell}
                     <td>${statusBadge}</td>
                 </tr>`;
             }).join('');
@@ -2153,7 +2205,7 @@
                     // we reconnect, restore the finished-state styling so the
                     // user can dismiss it.
                     if (w.status === 'finished' || w.status === 'stopped') {
-                        markPaneFinished(w.id, w.status);
+                        markPaneFinished(w.id, w.status, w.exit_reason);
                     }
                 }
                 // Keep title in sync in case provider/model were still

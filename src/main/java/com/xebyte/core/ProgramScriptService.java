@@ -32,6 +32,28 @@ public class ProgramScriptService {
     private final ThreadingStrategy threadingStrategy;
     private static final String AUTO_ANALYSIS_COMPLETION_MESSAGE = "Auto-analysis completed";
 
+    /**
+     * Upper bound on the OSGi build/activate output echoed back in an error
+     * response. Verbose compiler failures can run to many KB of repeated
+     * diagnostics; beyond this we keep only the tail (where the actual error
+     * usually is) and prepend a truncation notice.
+     */
+    private static final int MAX_BUILD_OUTPUT_CHARS = 16 * 1024;
+
+    /**
+     * Return {@code text} unchanged when it fits within {@code maxChars};
+     * otherwise return its last {@code maxChars} characters prefixed with a
+     * notice naming how many characters were dropped.
+     */
+    private static String boundTail(String text, int maxChars) {
+        if (text.length() <= maxChars) {
+            return text;
+        }
+        int dropped = text.length() - maxChars;
+        return "[... truncated " + dropped + " characters; showing last "
+                + maxChars + " ...]\n" + text.substring(dropped);
+    }
+
     public ProgramScriptService(ProgramProvider programProvider, ThreadingStrategy threadingStrategy) {
         this.programProvider = programProvider;
         this.threadingStrategy = threadingStrategy;
@@ -59,14 +81,32 @@ public class ProgramScriptService {
             return false;
         }
         try {
-            ghidra.program.util.GhidraProgramUtilities.markProgramNotToAskToAnalyze(program);
             AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
-            if (force) {
-                mgr.reAnalyzeAll(null);
+            // Ghidra's analyzers mutate the program DB, which requires an
+            // open transaction. The GUI analysis-task framework opens one
+            // for you; a direct mgr.startAnalysis() from the bridge does
+            // NOT. Without this wrapper FunctionStartAnalyzer (and any
+            // other writing analyzer) throws db.NoTransactionException
+            // ("Transaction has not been started") on any program that
+            // isn't already fully analyzed — the program-open path then
+            // fails. Confirmed root cause of #209. The markProgram* option
+            // writes go inside the same transaction since they mutate the
+            // program too; persistProgram (save) runs AFTER the
+            // transaction is closed.
+            int txId = program.startTransaction("GhidraMCP auto-analysis");
+            boolean txOk = false;
+            try {
+                ghidra.program.util.GhidraProgramUtilities.markProgramNotToAskToAnalyze(program);
+                if (force) {
+                    mgr.reAnalyzeAll(null);
+                }
+                mgr.startAnalysis(ghidra.util.task.TaskMonitor.DUMMY);
+                mgr.waitForAnalysis(null, ghidra.util.task.TaskMonitor.DUMMY);
+                ghidra.program.util.GhidraProgramUtilities.markProgramAnalyzed(program);
+                txOk = true;
+            } finally {
+                program.endTransaction(txId, txOk);
             }
-            mgr.startAnalysis(ghidra.util.task.TaskMonitor.DUMMY);
-            mgr.waitForAnalysis(null, ghidra.util.task.TaskMonitor.DUMMY);
-            ghidra.program.util.GhidraProgramUtilities.markProgramAnalyzed(program);
             persistProgram(program, AUTO_ANALYSIS_COMPLETION_MESSAGE);
             return true;
         } catch (Exception e) {
@@ -785,7 +825,17 @@ public class ProgramScriptService {
             return Response.err("file_path is required");
         }
 
-        File file = new File(filePath);
+        // Enforce GHIDRA_MCP_FILE_ROOT (when configured) for this filesystem-path endpoint,
+        // matching the headless import path. No-op when the root is unset (paths accepted
+        // as-is), so default localhost behavior is unchanged.
+        SecurityConfig security = SecurityConfig.getInstance();
+        java.nio.file.Path resolved = security.resolveWithinFileRoot(filePath);
+        if (resolved == null) {
+            return Response.err("Path is outside the allowed file root ("
+                    + security.getFileRoot() + "): " + filePath);
+        }
+
+        File file = resolved.toFile();
         if (!file.exists()) {
             return Response.err("File not found: " + filePath);
         }
@@ -1129,6 +1179,13 @@ public class ProgramScriptService {
         // Track whether we copied the script (for cleanup)
         final File[] copiedScript = {null};
 
+        // Holders so the catch block can surface OSGi build/activate output
+        // captured into scriptWriter before a failure. The PrintWriter holder
+        // lets the failure path flush buffered output into the StringWriter
+        // before reading it, otherwise the captured text can be truncated.
+        final StringWriter[] scriptWriterHolder = {null};
+        final PrintWriter[] scriptPrintWriterHolder = {null};
+
         // Get the PluginTool for script state (GUI mode only)
         final PluginTool pluginTool = getToolFromProvider();
 
@@ -1205,6 +1262,11 @@ public class ProgramScriptService {
                     ghidra.app.script.GhidraScriptProvider provider = ghidra.app.script.GhidraScriptUtil.getProvider(scriptFile);
                     if (provider == null) {
                         resultMsg.append("ERROR: No script provider found for: ").append(scriptFile.getName()).append("\n");
+                        if (scriptFile.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".py")) {
+                            resultMsg.append("Ghidra 12.1 ships Jython as an optional extension. ")
+                                    .append("Install the Jython extension from File > Install Extensions, ")
+                                    .append("restart Ghidra, then refresh Script Manager before running .py scripts.\n");
+                        }
                         return;
                     }
 
@@ -1213,6 +1275,8 @@ public class ProgramScriptService {
                     // Create script instance
                     StringWriter scriptWriter = new StringWriter();
                     PrintWriter scriptPrintWriter = new PrintWriter(scriptWriter);
+                    scriptWriterHolder[0] = scriptWriter;
+                    scriptPrintWriterHolder[0] = scriptPrintWriter;
 
                     ghidra.app.script.GhidraScript script = provider.getScriptInstance(scriptFile, scriptPrintWriter);
                     if (script == null) {
@@ -1264,6 +1328,28 @@ public class ProgramScriptService {
                     PrintWriter pw = new PrintWriter(sw);
                     e.printStackTrace(pw);
                     resultMsg.append("Stack trace:\n").append(sw.toString()).append("\n");
+
+                    // Surface any build/activate output that was captured into the
+                    // script writer before the failure (e.g. OSGi/Felix compile
+                    // errors from JavaScriptProvider.activateAll()). Flush the
+                    // PrintWriter first so buffered text reaches the StringWriter,
+                    // and bound the result so a verbose compiler failure can't
+                    // blow up the response payload.
+                    try {
+                        PrintWriter pw2 = scriptPrintWriterHolder[0];
+                        if (pw2 != null) {
+                            pw2.flush();
+                        }
+                        StringWriter sw2 = scriptWriterHolder[0];
+                        if (sw2 != null) {
+                            String capturedBuild = sw2.toString();
+                            if (!capturedBuild.isEmpty()) {
+                                resultMsg.append("--- BUILD/ACTIVATE OUTPUT ---\n")
+                                        .append(boundTail(capturedBuild, MAX_BUILD_OUTPUT_CHARS))
+                                        .append("\n");
+                            }
+                        }
+                    } catch (Throwable ignore) { /* scriptWriter may be unavailable */ }
 
                     Msg.error(this, "Script execution failed: " + scriptPath, e);
                 } finally {
@@ -1865,9 +1951,13 @@ public class ProgramScriptService {
             return Response.err("Script name is required");
         }
 
+        // Fail fast with a clear "program not found" error before doing
+        // the script-file search. The Program object isn't used in this
+        // method directly — the 3-arg runGhidraScript call at the end
+        // re-resolves it from programName via the same helper, which is
+        // where currentProgram-via-GhidraState binding actually happens.
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
-        Program program = pe.program();
 
         try {
             // Locate the script file - search Ghidra's standard script directories
@@ -1911,9 +2001,21 @@ public class ProgramScriptService {
                 return Response.err("Script '" + filename + "' not found. Searched: " + searched);
             }
 
-            // Execute the script via the existing execution method
+            // Execute the script via the existing execution method.
+            //
+            // The 3-arg overload (line ~1133) threads programName through
+            // ServiceUtils.getProgramOrError -> GhidraState -> the script's
+            // currentProgram global. The 2-arg overload below drops the
+            // program info, so the script executes against whatever
+            // currentProgram happens to be in the session (typically the
+            // GUI's focused CodeBrowser). Prior to v5.11.5 this method
+            // called the 2-arg form even though it had just resolved the
+            // operator's requested program at line 1891 — a real bug
+            // surfaced by community report (Copilot review on #207):
+            // "It is fixed for run_script_inline but not fixed for
+            //  run_ghidra_script, which always runs for the current program."
             long startTime = System.currentTimeMillis();
-            Response scriptResponse = runGhidraScript(scriptFile.getAbsolutePath(), scriptArgs);
+            Response scriptResponse = runGhidraScript(scriptFile.getAbsolutePath(), scriptArgs, programName);
             double executionTime = (System.currentTimeMillis() - startTime) / 1000.0;
 
             // Extract output text from the Response

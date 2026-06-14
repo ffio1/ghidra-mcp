@@ -13,8 +13,8 @@ FROM eclipse-temurin:21-jdk AS builder
 # the Ghidra release zip. A mismatch means Maven can't resolve dependencies
 # (see #183). GHIDRA_DATE must match the asset filename of the chosen
 # version on the upstream NSA/ghidra GitHub release.
-ARG GHIDRA_VERSION=12.0.4
-ARG GHIDRA_DATE=20260303
+ARG GHIDRA_VERSION=12.1
+ARG GHIDRA_DATE=20260513
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -84,7 +84,11 @@ RUN mvn clean package -P headless -DskipTests -q
 # =============================================================================
 # Stage 2: Runtime - Minimal image with Ghidra and plugin
 # =============================================================================
-FROM eclipse-temurin:21-jre
+# NOTE: must be a JDK (not JRE) — Ghidra's GhidraScript OSGi loader uses
+# javax.tools.ToolProvider.getSystemJavaCompiler() to compile .java scripts on
+# the fly. That returns null on a JRE, causing
+# "AssertException: Can't find java compiler" when running any Java script.
+FROM eclipse-temurin:21-jdk
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

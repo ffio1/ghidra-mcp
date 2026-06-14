@@ -17,7 +17,11 @@ from pathlib import Path
 
 from .envfile import load_env_file
 from .maven import find_maven_command
-from .versioning import infer_ghidra_version_from_path, read_pom_versions
+from .versioning import (
+    infer_ghidra_install_meta,
+    infer_ghidra_version_from_path,
+    read_pom_versions,
+)
 
 
 REQUIRED_GHIDRA_JARS: tuple[tuple[str, str], ...] = (
@@ -117,27 +121,76 @@ def ghidra_user_base_dir() -> Path:
     return Path.home() / ".config" / "ghidra"
 
 
-def _version_sort_key(name: str) -> tuple[int, int, int]:
+def _version_sort_key(name: str) -> tuple[int, int, int, int]:
+    """Sort key for Ghidra user-config dir names.
+
+    Returns ``(major, minor, patch, explicit_patch)``. The trailing
+    flag is 1 when the dir name carried an explicit patch component
+    (e.g. ``ghidra_12.1.0_PUBLIC``) and 0 when it didn't
+    (``ghidra_12.1_PUBLIC``), so a dir with an explicit patch beats
+    an otherwise-equal shorter dir name. Without this tiebreaker the
+    sort was non-deterministic across filesystems: Windows' alpha
+    glob order put ``ghidra_12.1.0_PUBLIC`` before ``ghidra_12.1_PUBLIC``
+    and the test passed; Linux's creation-order glob produced the
+    opposite outcome and CI failed.
+    """
     match = re.search(r"ghidra_(\d+)\.(\d+)(?:\.(\d+))?", name)
     if not match:
-        return (0, 0, 0)
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+        return (0, 0, 0, 0)
+    explicit_patch = 1 if match.group(3) is not None else 0
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+        explicit_patch,
+    )
 
 
 def resolve_ghidra_user_dir(
     ghidra_path: Path, user_base_dir: Path | None = None
 ) -> Path:
+    """Resolve the user-config dir matching a Ghidra install.
+
+    Ghidra writes its per-user state under
+    ``%APPDATA%\\ghidra\\ghidra_<version>_<layout>\\``. The dir is
+    created lazily on first launch, so for a freshly-installed Ghidra
+    it may not exist yet. We therefore prefer to *construct* the
+    expected dir name from the install path rather than enumerating
+    existing siblings — see #217, where a v5.10→v5.11 deploy targeting
+    a freshly-installed ``F:\\ghidra_12.1_PUBLIC`` quietly resolved to
+    a leftover ``ghidra_12.1_DEV`` user dir and installed the
+    extension where the running Ghidra never looked for it.
+    """
     user_base_dir = user_base_dir or ghidra_user_base_dir()
-    target_version = infer_ghidra_version_from_path(ghidra_path)
+    target_version, target_layout = infer_ghidra_install_meta(ghidra_path)
 
-    if user_base_dir.is_dir() and target_version:
-        matching_dirs = sorted(user_base_dir.glob(f"ghidra_{target_version}*"))
-        if matching_dirs:
-            public_dir = next(
-                (path for path in matching_dirs if "PUBLIC" in path.name), None
+    # When both version and layout are recoverable from the install
+    # path, return the explicit dir unconditionally. The dir does not
+    # need to already exist — Ghidra will create it on first launch.
+    if target_version and target_layout:
+        return user_base_dir / f"ghidra_{target_version}_{target_layout}"
+
+    # Version known but layout couldn't be inferred (e.g. a custom
+    # install path with application.properties present). Prefer an
+    # existing matching dir, then PUBLIC, then a constructed PUBLIC
+    # default.
+    if target_version:
+        if user_base_dir.is_dir():
+            matching_dirs = sorted(
+                path
+                for path in user_base_dir.glob(f"ghidra_{target_version}*")
+                if path.is_dir() and "_location_" not in path.name
             )
-            return public_dir or matching_dirs[0]
+            if matching_dirs:
+                public_dir = next(
+                    (path for path in matching_dirs if "PUBLIC" in path.name), None
+                )
+                return public_dir or matching_dirs[0]
+        return user_base_dir / f"ghidra_{target_version}_PUBLIC"
 
+    # No version metadata at all — last-resort fallback to the
+    # newest-looking existing dir so a totally custom install still
+    # gets *some* answer instead of an exception.
     if user_base_dir.is_dir():
         version_dirs = sorted(
             (path for path in user_base_dir.glob("ghidra_*") if path.is_dir()),
@@ -147,8 +200,6 @@ def resolve_ghidra_user_dir(
         if version_dirs:
             return version_dirs[0]
 
-    if target_version:
-        return user_base_dir / f"ghidra_{target_version}_PUBLIC"
     return user_base_dir / "ghidra_unknown_PUBLIC"
 
 
@@ -260,11 +311,43 @@ def _write_text_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8", newline="")
 
 
-def patch_ghidra_user_configs(user_base_dir: Path, *, dry_run: bool = False) -> None:
+def patch_ghidra_user_configs(
+    user_base_dir: Path,
+    target_user_dir: Path | None = None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Patch FrontEndTool.xml + tool tcd files under the Ghidra user dir.
+
+    When ``target_user_dir`` is provided, only files inside that directory
+    are patched. This is the recommended call shape from
+    :func:`deploy_to_ghidra` — a Ghidra 12.1 deploy must NOT touch the
+    user-config dirs left over from older Ghidra installs (12.0.4,
+    11.4.2, …), because those dirs reference extensions from those older
+    Ghidras. Stamping the new plugin's INCLUDE into a sibling version's
+    FrontEndTool.xml is exactly the #217 bug: the deploy log this morning
+    showed ``Patched FrontEnd config …/ghidra_12.0.4_PUBLIC/…`` even
+    though we were targeting 12.1.
+
+    When ``target_user_dir`` is None, falls back to globbing every
+    version subdirectory under ``user_base_dir``. Kept for backward
+    compatibility (existing tests pass without changes); production
+    deploys should always supply ``target_user_dir``.
+    """
     if not user_base_dir.is_dir():
         return
 
-    for front_end_file in sorted(user_base_dir.glob("*/FrontEndTool.xml")):
+    if target_user_dir is not None:
+        # #217 fix: restrict the glob to a single subdirectory.
+        if not target_user_dir.is_dir():
+            return
+        front_end_files = sorted(target_user_dir.glob("FrontEndTool.xml"))
+        tcd_files = sorted(target_user_dir.glob("tools/*.tcd"))
+    else:
+        front_end_files = sorted(user_base_dir.glob("*/FrontEndTool.xml"))
+        tcd_files = sorted(user_base_dir.glob("*/tools/*.tcd"))
+
+    for front_end_file in front_end_files:
         updated, modified = patch_frontend_tool_config(
             front_end_file.read_text(encoding="utf-8")
         )
@@ -276,7 +359,7 @@ def patch_ghidra_user_configs(user_base_dir: Path, *, dry_run: bool = False) -> 
         _write_text_file(front_end_file, updated)
         print(f"Patched FrontEnd config {front_end_file}")
 
-    for tcd_file in sorted(user_base_dir.glob("*/tools/*.tcd")):
+    for tcd_file in tcd_files:
         updated, modified = patch_tool_tcd(tcd_file.read_text(encoding="utf-8"))
         if not modified:
             continue
@@ -493,8 +576,17 @@ def _expect_mcp_error(path: str, payload: object, required_terms: tuple[str, ...
         )
 
 
-def _find_matching_ghidra_processes(ghidra_path: Path) -> list[dict[str, object]]:
-    target = str(ghidra_path.resolve()).lower()
+def _enumerate_ghidra_processes() -> list[dict[str, object]]:
+    """Return every running Ghidra process on this machine, install-agnostic.
+
+    Each entry is {pid, name, command}. The earlier
+    _find_matching_ghidra_processes filtered by install path on the same
+    pass, which silently missed Ghidras running from a *different*
+    install during a version-changing deploy — see the v5.10→v5.11
+    Ghidra-12.1 deploy where an old 12.0.4 was still up but went
+    undetected. This helper does the cross-platform process scan once;
+    callers filter by path themselves.
+    """
     if os.name == "nt":
         command = [
             "powershell",
@@ -512,35 +604,67 @@ def _find_matching_ghidra_processes(ghidra_path: Path) -> list[dict[str, object]
             return []
         raw = json.loads(completed.stdout)
         rows = raw if isinstance(raw, list) else [raw]
-        matches = []
+        out: list[dict[str, object]] = []
         for row in rows:
             cmd = str(row.get("CommandLine") or "")
             name = str(row.get("Name") or "").lower()
             cmd_lower = cmd.lower()
-            is_ghidra_process = (
+            is_ghidra = (
                 name in {"java.exe", "javaw.exe", "ghidrarun.bat", "ghidrarun"}
                 and ("ghidra.ghidra" in cmd_lower or "ghidrarun" in cmd_lower)
             )
-            if target in cmd_lower and is_ghidra_process:
-                matches.append(
+            if is_ghidra:
+                out.append(
                     {
                         "pid": int(row["ProcessId"]),
                         "name": row.get("Name", ""),
                         "command": cmd,
                     }
                 )
-        return matches
+        return out
     ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, check=False)
-    matches = []
+    out = []
     for line in ps.stdout.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         pid_text, _, command = stripped.partition(" ")
         command_lower = command.lower()
-        if target in command_lower and ("ghidra.ghidra" in command_lower or "ghidrarun" in command_lower):
-            matches.append({"pid": int(pid_text), "name": "process", "command": command})
-    return matches
+        if "ghidra.ghidra" in command_lower or "ghidrarun" in command_lower:
+            out.append({"pid": int(pid_text), "name": "process", "command": command})
+    return out
+
+
+def _find_matching_ghidra_processes(ghidra_path: Path) -> list[dict[str, object]]:
+    """Ghidra processes whose command-line includes ``ghidra_path``.
+
+    Used by the deploy flow to identify the install we're targeting so
+    it can be gracefully shut down before extension replacement. For
+    processes that match *other* Ghidra installs, see
+    ``_find_mismatched_ghidra_processes`` — those would be warned about
+    rather than auto-shut-down, because they may belong to unrelated
+    work the operator hasn't agreed to close.
+    """
+    target = str(ghidra_path.resolve()).lower()
+    return [
+        proc for proc in _enumerate_ghidra_processes()
+        if target in str(proc["command"]).lower()
+    ]
+
+
+def _find_mismatched_ghidra_processes(ghidra_path: Path) -> list[dict[str, object]]:
+    """Ghidra processes from a DIFFERENT install than ``ghidra_path``.
+
+    Surfaced as a warning at deploy time so a version-mixing scenario
+    is visible: an old Ghidra still bound to MCP port 8089 will respond
+    to the deploy's post-start smoke checks instead of the just-deployed
+    new version, producing confusing "wrong version" failures.
+    """
+    target = str(ghidra_path.resolve()).lower()
+    return [
+        proc for proc in _enumerate_ghidra_processes()
+        if target not in str(proc["command"]).lower()
+    ]
 
 
 def _terminate_process(pid: int) -> None:
@@ -631,6 +755,29 @@ def close_running_ghidra_for_deploy(
     dry_run: bool = False,
     wait_seconds: int = DEFAULT_GHIDRA_EXIT_WAIT_SECONDS,
 ) -> bool:
+    # Warn about Ghidras running from a DIFFERENT install. We don't
+    # touch them (they may belong to unrelated work the operator hasn't
+    # agreed to close), but surfacing them keeps a version-mixing
+    # scenario from going undetected: an old Ghidra still bound to MCP
+    # port 8089 will respond to the deploy's post-start smoke checks
+    # instead of the just-deployed new version, producing confusing
+    # "wrong version" failures. This was the v5.10→v5.11 deploy gap
+    # the user flagged after the Ghidra 12.0.4 → 12.1 cutover.
+    mismatched = _find_mismatched_ghidra_processes(ghidra_path)
+    if mismatched:
+        print(
+            f"WARNING: {len(mismatched)} Ghidra process(es) running from a "
+            f"DIFFERENT install than deploy target {ghidra_path}:"
+        )
+        for proc in mismatched:
+            print(f"  PID {proc['pid']}: {proc['command']}")
+        print(
+            "  These may bind MCP port 8089 and intercept the post-deploy "
+            "smoke checks intended for the new install. If the deploy's "
+            "version probe reports the wrong version, close the other "
+            "Ghidra(s) (save work first) and re-run."
+        )
+
     matches = _find_matching_ghidra_processes(ghidra_path)
     if not matches:
         print("No matching running Ghidra process detected.")
@@ -1249,12 +1396,48 @@ def run_multi_program_targeting_test(repo_root: Path, mcp_url: str) -> None:
     print("Multi-program targeting test passed.")
 
 
+class DebuggerLiveTestSkipped(Exception):
+    """Raised by run_debugger_live_test when the test cannot run on this
+    machine because a prerequisite is missing (Windows-only,
+    BenchmarkDebug.exe absent, dbgeng backend unavailable, etc.).
+
+    Distinct from RuntimeError so the release regression tier can
+    distinguish "this test couldn't run" from "this test ran and
+    failed." The deploy script catches it and prints a SKIPPED line
+    rather than failing the whole release gate.
+    """
+
+
+# Substrings in a /debugger/launch error payload that indicate an
+# environmental setup gap (missing WDK, dbgeng wiring, etc.) rather
+# than a real regression. Each is observed in production logs:
+#
+#   * "dbgeng (.bat)': null"        — backend never came up
+#   * "ghidratrace"                 — Python TraceRmi package mismatch
+#   * "BenchmarkDebug.exe"          — taskkill stub couldn't find a
+#                                     prior instance; means dbgeng never
+#                                     launched anything in the first place
+#   * "Could not load dbgeng"       — WDK not installed
+_DEBUGGER_LAUNCH_SKIP_HINTS = (
+    "dbgeng (.bat)': null",
+    "ghidratrace",
+    "could not load dbgeng",
+    "dbgeng.dll",
+    "no debugger backend",
+)
+
+
 def run_debugger_live_test(repo_root: Path, mcp_url: str) -> None:
     if os.name != "nt":
-        raise RuntimeError("Debugger live regression is currently Windows-only.")
+        raise DebuggerLiveTestSkipped(
+            "Debugger live regression is currently Windows-only."
+        )
     benchmark_debug_exe = repo_root / DEFAULT_BENCHMARK_DEBUG_EXE
     if not benchmark_debug_exe.is_file():
-        raise RuntimeError(f"BenchmarkDebug.exe not found at {benchmark_debug_exe}")
+        raise DebuggerLiveTestSkipped(
+            f"BenchmarkDebug.exe not found at {benchmark_debug_exe}. "
+            "Build the benchmark fixture or set up the WDK toolchain."
+        )
 
     env_values = load_env_file(repo_root / ".env")
     python_executable = (
@@ -1281,7 +1464,23 @@ def run_debugger_live_test(repo_root: Path, mcp_url: str) -> None:
             method="POST",
             timeout=120,
         )
-        _ensure_mcp_ok("/debugger/launch", launch)
+        try:
+            _ensure_mcp_ok("/debugger/launch", launch)
+        except RuntimeError as launch_err:
+            # Classify the launch failure: a known-environmental cause
+            # (no WDK, ghidratrace version mismatch, dbgeng backend
+            # missing) becomes a skip; anything else is a real test
+            # failure that should bubble up.
+            msg = str(launch_err).lower()
+            if any(hint in msg for hint in _DEBUGGER_LAUNCH_SKIP_HINTS):
+                raise DebuggerLiveTestSkipped(
+                    f"Debugger backend unavailable on this machine: "
+                    f"{launch_err}. Install the Windows Debugger Toolkit "
+                    "(WDK) and ensure the matching ghidratrace wheel is "
+                    "installed against the active Python (see "
+                    "requirements-debugger.txt) to enable this test."
+                ) from launch_err
+            raise
 
         deadline = time.monotonic() + 45
         status_payload: object = {}
@@ -1709,7 +1908,13 @@ def run_release_regression_tests(repo_root: Path, mcp_url: str) -> None:
     run_benchmark_yaml_regression(repo_root, mcp_url)
     run_multi_program_targeting_test(repo_root, mcp_url)
     run_negative_contract_test(repo_root, mcp_url)
-    run_debugger_live_test(repo_root, mcp_url)
+    try:
+        run_debugger_live_test(repo_root, mcp_url)
+    except DebuggerLiveTestSkipped as skip:
+        # Environmental prerequisite missing — don't fail the release
+        # gate. Surface the reason so the operator can decide whether to
+        # set up the toolchain locally before the next release cut.
+        print(f"SKIPPED debugger live test: {skip}")
     print("Release regression tier passed.")
 
 
@@ -1743,9 +1948,98 @@ def run_deploy_tests(repo_root: Path, mcp_url: str, test_modes: list[str]) -> No
             run_selected_endpoint_contract_test(repo_root, mcp_url)
         elif mode == "debugger-live":
             reset_benchmark_fixture(repo_root, mcp_url)
-            run_debugger_live_test(repo_root, mcp_url)
+            try:
+                run_debugger_live_test(repo_root, mcp_url)
+            except DebuggerLiveTestSkipped as skip:
+                print(f"SKIPPED debugger live test: {skip}")
         elif mode == "release":
             run_release_regression_tests(repo_root, mcp_url)
+
+
+def _resolve_debugger_python(repo_root: Path) -> Path | None:
+    """Find the Python interpreter Ghidra's debugger launchers actually use.
+
+    The Ghidra dbgeng / gdb / lldb launcher .bat / .sh scripts run
+    ``"%OPT_PYTHON_EXE%" ...`` (defaulting to ``python``), and the
+    GhidraMCP plugin propagates ``GHIDRA_DEBUGGER_PYTHON`` from .env into
+    that variable when running the debugger live test. So the
+    interpreter to install ``ghidratrace`` into is:
+
+      1. ``GHIDRA_DEBUGGER_PYTHON`` from the environment, if set
+      2. ``GHIDRA_DEBUGGER_PYTHON`` from ``<repo>/.env``, if set
+      3. ``shutil.which("python")`` as the system default
+
+    Returns ``None`` only when no resolvable interpreter is found —
+    rare on Windows but possible in headless CI containers.
+    """
+    candidate = os.environ.get("GHIDRA_DEBUGGER_PYTHON", "").strip()
+    if not candidate:
+        env_values = load_env_file(repo_root / ".env")
+        candidate = env_values.get("GHIDRA_DEBUGGER_PYTHON", "").strip()
+    if candidate:
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    fallback = shutil.which("python")
+    return Path(fallback) if fallback else None
+
+
+def install_ghidratrace_for_debugger(
+    repo_root: Path,
+    ghidra_path: Path,
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Install the matching ``ghidratrace`` wheel into the launcher Python.
+
+    Why this exists: when Ghidra is upgraded (e.g., 12.0.4 → 12.1), the
+    wheel that ships at ``<ghidra>/Ghidra/Debug/Debugger-rmi-trace/pypkg/dist``
+    bumps version too. If a stale 12.0 ``ghidratrace`` is still
+    pip-installed in the launcher's Python, TraceRmi negotiation fails
+    with ``VersionMismatchError: Front-end: 12.1, back-end: 12.0`` —
+    observed twice in this release cycle. The wheel lives inside the
+    Ghidra install (not on PyPI), so a vanilla ``pip install`` against
+    requirements-debugger.txt can't cover it.
+
+    Returns 0 on success / no-op, nonzero on installer failure.
+    """
+    wheel_dir = ghidra_path / "Ghidra" / "Debug" / "Debugger-rmi-trace" / "pypkg" / "dist"
+    wheels = sorted(wheel_dir.glob("ghidratrace-*-py3-none-any.whl"))
+    if not wheels:
+        print(f"  No ghidratrace wheel found under {wheel_dir} — skipping debugger Python sync")
+        return 0
+    wheel = wheels[-1]
+
+    debugger_python = _resolve_debugger_python(repo_root)
+    if debugger_python is None:
+        print("  Could not resolve a debugger Python (set GHIDRA_DEBUGGER_PYTHON) — skipping")
+        return 0
+
+    if dry_run:
+        print(f"DRY RUN: {debugger_python} -m pip install --force-reinstall {wheel}")
+        print(f"DRY RUN: {debugger_python} -m pip install --upgrade 'protobuf>=6.31.0'")
+        return 0
+
+    # protobuf>=6.31.0 is gated separately by ghidratrace.setuputils — install
+    # it before the wheel so the post-install setuputils check doesn't trip.
+    pb = subprocess.run(
+        [str(debugger_python), "-m", "pip", "install", "--upgrade", "protobuf>=6.31.0"],
+        check=False, capture_output=True, text=True,
+    )
+    if pb.returncode != 0:
+        print(f"  protobuf install failed: {pb.stderr.strip()[:200]}")
+        return pb.returncode
+
+    gt = subprocess.run(
+        [str(debugger_python), "-m", "pip", "install", "--force-reinstall", str(wheel)],
+        check=False, capture_output=True, text=True,
+    )
+    if gt.returncode != 0:
+        print(f"  ghidratrace install failed: {gt.stderr.strip()[:200]}")
+        return gt.returncode
+
+    print(f"  Installed {wheel.name} into {debugger_python}")
+    return 0
 
 
 def install_ghidra_dependencies(
@@ -1792,6 +2086,15 @@ def install_ghidra_dependencies(
         completed = subprocess.run(command, cwd=repo_root, check=False)
         if completed.returncode != 0:
             return completed.returncode
+
+    # Keep the debugger launcher's Python in sync with the installed
+    # Ghidra version's ghidratrace wheel. Without this, a Ghidra version
+    # bump leaves a stale ghidratrace pip-installed in the launcher's
+    # Python and TraceRmi negotiation fails with the back-end reporting
+    # the old version. Best-effort: a failure here does NOT block the
+    # main JAR-install dependency setup since most users don't use the
+    # live debugger.
+    install_ghidratrace_for_debugger(repo_root, ghidra_path, dry_run=dry_run)
 
     return 0
 
@@ -1912,7 +2215,8 @@ def deploy_to_ghidra(
                 f"DRY RUN: copy {dotenv_source} -> {ghidra_path / dotenv_source.name}"
             )
         install_user_extension(repo_root, ghidra_path, archive_path, dry_run=True)
-        patch_ghidra_user_configs(user_base_dir, dry_run=True)
+        target_user_dir = resolve_ghidra_user_dir(ghidra_path, user_base_dir)
+        patch_ghidra_user_configs(user_base_dir, target_user_dir, dry_run=True)
         if _deploy_tests_use_benchmark(test_modes):
             clear_restored_benchmark_tools(repo_root, dry_run=True)
         start_ghidra(ghidra_path, repo_root=repo_root, dry_run=True)
@@ -1947,7 +2251,8 @@ def deploy_to_ghidra(
         print(f"Copied .env to {dotenv_destination}")
 
     install_user_extension(repo_root, ghidra_path, archive_path)
-    patch_ghidra_user_configs(user_base_dir)
+    target_user_dir = resolve_ghidra_user_dir(ghidra_path, user_base_dir)
+    patch_ghidra_user_configs(user_base_dir, target_user_dir)
     if _deploy_tests_use_benchmark(test_modes):
         clear_restored_benchmark_tools(repo_root)
     start_ghidra(ghidra_path, repo_root=repo_root)

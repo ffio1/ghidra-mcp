@@ -388,15 +388,36 @@ def _short_jsonish(value, limit=1000):
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def _http_log_verbose():
+    return os.environ.get("FUN_DOC_HTTP_LOG_VERBOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _log_ghidra_http_event(entry):
-    """Persist detailed Ghidra HTTP diagnostics without cluttering stdout."""
+    """Persist Ghidra HTTP diagnostics without cluttering stdout.
+
+    Routed through log_rotation.write_jsonl_rotating so the file is bounded
+    (pre-rotation it grew unbounded at ~50 MB/day and hit 1+ GB).
+
+    Successful calls (ok=True) are the overwhelming bulk of this log and are
+    rarely useful after the fact — the diagnostic value (e.g. the 2026-04-24
+    bridge deadlock) lives in errors/timeouts/offline events, which are always
+    kept. Skip ok=True events by default to keep the series small; set
+    FUN_DOC_HTTP_LOG_VERBOSE=1 to record every call (e.g. for latency analysis).
+    """
+    from log_rotation import write_jsonl_rotating
+
+    if entry.get("ok") and not _http_log_verbose():
+        return
+
     try:
-        LOG_DIR.mkdir(exist_ok=True)
-        with _http_log_lock:
-            with open(GHIDRA_HTTP_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, default=str) + "\n")
+        line = json.dumps(entry, default=str)
     except Exception:
-        pass
+        return
+    write_jsonl_rotating(GHIDRA_HTTP_LOG_FILE, line)
 
 
 def _parse_response(r):
@@ -752,22 +773,23 @@ def check_archive_for_match(func, func_name, live_score, run_id):
 
     try:
         if new_name and not new_name.startswith("FUN_"):
+            # /rename_function_by_address: function_address + new_name are
+            # BODY params (ParamSource.BODY), program is QUERY. Sending the
+            # body params as query made this silently no-op — the endpoint
+            # saw null function_address and errored (#207).
             ghidra_post(
                 "/rename_function_by_address",
-                params={
-                    "address": address,
-                    "program": program,
-                    "new_name": new_name,
-                },
+                data={"function_address": address, "new_name": new_name},
+                params={"program": program},
             )
         if plate:
+            # /batch_set_comments takes address + plate_comment as BODY
+            # params (plus optional decompiler_comments / disassembly_comments
+            # arrays). The old `items=[{address,type,text}]` shape is not an
+            # API this endpoint ever had — the plate write silently no-op'd.
             ghidra_post(
                 "/batch_set_comments",
-                data={
-                    "items": [
-                        {"address": address, "type": "PLATE", "text": plate}
-                    ]
-                },
+                data={"address": address, "plate_comment": plate},
                 params={"program": program},
             )
         ghidra_post("/save_program", params={"program": program})
@@ -828,8 +850,8 @@ def try_launch_ghidra():
         candidates.append(Path(env_dir))
     # Common install locations
     candidates += [
-        Path("F:/ghidra_12.0.4_PUBLIC"),
-        Path("C:/ghidra_12.0.4_PUBLIC"),
+        Path("F:/ghidra_12.1_PUBLIC"),
+        Path("C:/ghidra_12.1_PUBLIC"),
         Path("C:/Program Files/ghidra"),
         Path(os.path.expanduser("~/ghidra")),
     ]
@@ -914,9 +936,22 @@ _storage_repo_failed = False  # cache import-time failure to avoid retry storm
 def _get_storage_repo():
     """Return the storage Repository, lazily building it on first use.
 
-    Returns None if the storage layer can't be loaded (missing sqlalchemy,
-    misconfigured URL, etc.). Callers fall back to the legacy state.json
-    path in that case so a partially-installed environment still functions.
+    Returns None only when the test fixture has explicitly flipped
+    `_storage_repo_failed = True` to exercise the legacy state.json path
+    (see tests/performance/test_state_atomicity.py). At runtime the
+    function loud-fails via sys.exit(1) if the SQL backend can't be
+    opened — silently degrading to state.json was the v5.9.0 release-day
+    failure mode that the sqlalchemy import guard above only half-fixed.
+
+    The import guard catches the "package missing" case at startup. Any
+    error reached here is a real misconfiguration that the legacy
+    fallback would only hide:
+      * priority_queue.json `config.storage` block malformed → bad URL
+      * Postgres unreachable / wrong credentials → connection refused
+      * Schema migration broken → bootstrap_schema() raises
+      * SQLite path unwritable → operational error on open
+    All of these would let the dashboard run on a flat state.json while
+    the user thinks they have a working SQL backend.
     """
     global _storage_repo, _storage_repo_failed
     if _storage_repo is not None:
@@ -939,15 +974,33 @@ def _get_storage_repo():
         _storage_repo.bootstrap_schema()
         return _storage_repo
     except Exception as e:
-        _storage_repo_failed = True
-        print(
-            f"WARNING: storage backend unavailable ({type(e).__name__}: {e}); "
-            f"falling back to state.json. Install sqlalchemy and run "
-            f"scripts/migrate_state_to_sql.py to enable the SQL backend.",
-            file=sys.stderr,
-            flush=True,
+        # Loud fail — see docstring. Don't return None here; that path is
+        # reserved for the test fixture's explicit override.
+        sys.stderr.write(
+            "ERROR: fun-doc storage backend failed to open.\n"
+            "\n"
+            f"  {type(e).__name__}: {e}\n"
+            "\n"
+            "sqlalchemy is installed (the import guard at the top of fun_doc.py\n"
+            "would have exited already otherwise), so this is a real backend\n"
+            "misconfiguration -- not a missing dependency. Common causes:\n"
+            "\n"
+            "  * Postgres host/port unreachable\n"
+            "      → check FUN_DOC_DB_URL or priority_queue.json config.storage.url\n"
+            "  * Wrong credentials\n"
+            "      → check the username/password in the URL\n"
+            "  * Schema migration broken or partially applied\n"
+            "      → run: python fun-doc/scripts/migrate_state_to_sql.py --verify\n"
+            "  * SQLite path unwritable (default backend)\n"
+            "      → check filesystem permissions on fun-doc/state.db\n"
+            "\n"
+            "Refusing to start rather than silently falling back to legacy\n"
+            "state.json. That fallback would accept worker writes but leave the\n"
+            "SQL-backed dashboard reading stale data -- exactly the v5.9.0\n"
+            "release-day failure mode the import guard above only half-fixed.\n"
         )
-        return None
+        sys.stderr.flush()
+        sys.exit(1)
 
 
 # Field mapping between the state.json dict shape and the SQL row.
@@ -984,6 +1037,13 @@ _STATE_DIRECT_FIELDS = (
     "snapshot_provider",
     "snapshot_model",
     "snapshot_max_turns",
+    # name-source provenance (#204) — flows through state.json migration
+    # and selector skip-gate. Default 'scan' for everything; the
+    # propagation scripts + backfill_name_source.py CLI paint the
+    # 'propagation' rows in bulk.
+    "name_source",
+    "name_source_binary",
+    "name_confidence",
 )
 
 
@@ -1174,16 +1234,19 @@ def _ts_to_iso(value):
 
 
 def load_state():
-    """Load state from the SQL backend, with a state.json fallback.
+    """Load state from the SQL backend.
 
-    SQL backend is the runtime path (see Q4-A in the storage migration plan).
-    Returns the same dict shape callers have always expected:
+    SQL backend is the only runtime path. Returns the same dict shape
+    callers have always expected:
         {project_folder, last_scan, active_binary, current_session,
          sessions: list, functions: {key: record}}
 
-    Falls back to reading state.json directly only if the storage layer
-    can't be loaded (missing sqlalchemy, misconfigured URL). This keeps a
-    half-installed environment functional during the cutover window.
+    The state.json fallback below is now test-only scaffolding (reached
+    only when the test fixture flips ``_storage_repo_failed = True``).
+    At runtime the import guard (line ~109) and the storage-init
+    loud-fail (line ~987) sys.exit(1) before this point is ever reached
+    with a missing backend. See test_state_atomicity.py for the
+    fixture's exercise of the fallback.
     """
     repo = _get_storage_repo()
     if repo is not None:
@@ -1266,7 +1329,10 @@ def _atomic_write_state(state):
 
 
 def save_state(state):
-    """Persist state to the SQL backend (or state.json fallback).
+    """Persist state to the SQL backend.
+
+    (state.json fallback path below is test-only scaffolding; runtime
+    loud-fail above prevents reaching it without an explicit test flag.)
 
     The legacy contract was 'rewrite the entire state.json from this dict.'
     Under the SQL backend that maps to:
@@ -1367,8 +1433,10 @@ def update_function_state(func_key, updated_func):
     "I just finished a run" signal. Other shapes fall back to the workflow
     UPDATE alone.
 
-    Falls back to the legacy state.json RMW when the storage layer isn't
-    available.
+    State.json RMW path below is test-only scaffolding (test fixtures
+    set ``_storage_repo_failed = True`` to exercise it). At runtime the
+    sqlalchemy import guard + storage-init loud-fail ensure the repo
+    is always available before this point.
     """
     repo = _get_storage_repo()
     if repo is not None:
@@ -2236,6 +2304,7 @@ def fetch_function_data(program, address, mode="FIX"):
         "fixable_categories": [],
         "decompile_timeout": False,
         "ghidra_offline": False,
+        "not_a_function": False,
     }
 
     # Navigation removed — was calling /tool/goto_address on every function,
@@ -2321,6 +2390,30 @@ def fetch_function_data(program, address, mode="FIX"):
                 data["decompile_timeout"] = True
                 return data
         data["analyze_for_doc"] = afd
+
+    # Pre-flight: detect addresses that aren't functions at all (raw data,
+    # PRIMITIVE-typed regions, dead code that the priority queue lists with
+    # a stale score). Without this signal the worker falls through to the
+    # LLM, which then burns 100K-500K input tokens confirming "this is
+    # data, not code." Observed in production: 21 archive-applied loops on
+    # a single data address in one hour. The caller marks the function
+    # `not_a_function` so the selector won't re-pick.
+    #
+    # Definitive when BOTH the decompile call and the completeness call
+    # came back with no usable result and neither timed out / went
+    # offline (those are retryable). Conservative — if either returned
+    # SOMETHING, the LLM might still extract value, so we don't short-
+    # circuit.
+    if not data["decompile_timeout"] and not data["ghidra_offline"]:
+        decompiled_is_error = _is_error_response(data.get("decompiled"))
+        completeness = data.get("completeness")
+        completeness_missing_name = (
+            not completeness
+            or not (isinstance(completeness, dict)
+                    and completeness.get("function_name"))
+        )
+        if decompiled_is_error and completeness_missing_name:
+            data["not_a_function"] = True
 
     return data
 
@@ -2594,6 +2687,19 @@ DEFAULT_QUEUE_CONFIG = {
 }
 
 PRIORITY_QUEUE_FILE = SCRIPT_DIR / "priority_queue.json"
+
+# Selector confidence floor for propagation-sourced names (#204). A
+# function with name_source='propagation' and name_confidence below
+# this threshold is treated as untrusted and skipped by the selector
+# unless the user pins it. Set to 0.5 so a half-confident archive
+# match (Q5-D gate signal) is enough to admit the name, while a
+# null/zero confidence (the default for fresh propagated names) keeps
+# the function out of LLM scoring. Tunable via env so a user with a
+# very-confidence-poor archive can tighten or loosen it without a
+# rebuild.
+_PROPAGATION_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("FUN_DOC_PROPAGATION_CONFIDENCE_THRESHOLD", "0.5")
+)
 
 
 def _normalize_provider_models(raw_models):
@@ -2894,6 +3000,55 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
         # paths as the other one-shots; pinning bypasses.
         if func.get("library_code") and not is_pinned:
             continue
+
+        # Archive-apply terminal: when the cross-version doc archive (re-kb)
+        # matches and writes name + plate via the Q5-D gate, the function
+        # is done from this worker's perspective even though the score
+        # may stay below good_enough (the archive-applied score reflects
+        # what the archive provided, not a fresh local re-score). Without
+        # this skip the selector re-picks the same function every cycle:
+        # the score doesn't change, no consecutive_fails increment (archive
+        # apply is "success"), and the next archive lookup hits the same
+        # match. Observed in production: 21 archive_applied loops on a
+        # single data address in one hour, burning ~1.4M input tokens.
+        # Cleared by refresh / re-scan paths (same as the other one-shots).
+        # Pinned bypasses for "re-document this even though archive matched."
+        if func.get("last_result") == "archive_applied" and not is_pinned:
+            continue
+
+        # Not-a-function one-shot: addresses that the priority queue thinks
+        # are functions but Ghidra disagrees with (raw data regions, dead
+        # code that was never disassembled). Without this guard the
+        # selector keeps picking them and the worker falls through to the
+        # LLM, which then burns 100K-500K input tokens to confirm "this is
+        # data, not code." Set by process_function when fetch_function_data
+        # returns no decompiled body and no function_name in completeness.
+        # Cleared by refresh / re-scan paths so post-analysis changes
+        # (Ghidra recovering a function at that address) get re-evaluated.
+        if func.get("not_a_function") and not is_pinned:
+            continue
+
+        # Propagation-provenance skip (#204): when a function's name came
+        # from cross-version hash propagation and has no high-confidence
+        # archive backing, treat it as untrusted. Cross-version
+        # propagation gives plausible D2-style names like
+        # `DATATBLS_SerializeJsonValue` to statically-linked nlohmann::json
+        # template instantiations, std::map operations, and iostream
+        # parsers — code that doesn't exist in the binary's authored
+        # source. ~10M input tokens were burned on the top 7 such
+        # misidentifications in BH.dll's last 24h before this gate
+        # landed; the heuristic detector can't catch them because the
+        # propagator gave the callees plausible names too.
+        #
+        # name_source values: 'scan' (default) | 'manual' | 'propagation'
+        #                     | 'pdb' | 'archive'
+        # Skip rule: propagation AND (no confidence OR < threshold) AND
+        # not pinned. Pinning bypasses for "I know this is real, please
+        # document it anyway". Cleared by re-scan / refresh paths.
+        if not is_pinned and func.get("name_source") == "propagation":
+            conf = func.get("name_confidence")
+            if conf is None or conf < _PROPAGATION_CONFIDENCE_THRESHOLD:
+                continue
 
         # Stagnation safety net: blacklist functions that have completed 3+
         # runs in a row with no meaningful progress (delta <= 1%) OR with
@@ -4506,14 +4661,20 @@ def _wrap_result(result):
 
 
 def _provider_timeout_seconds(provider, complexity_tier=None):
+    # Base 300s (was 900s): a hung/slow provider call previously tied up a worker for
+    # 15-25 min, which surfaced as the bridge_counter_stall "workers active, no progress"
+    # pattern. 5 min is ample for a normal documentation pass; genuinely large functions
+    # still get the extra budget below (complex +300 -> 600s, massive +600 -> 900s).
+    # Override per-provider via FUNDOC_<PROVIDER>_TIMEOUT_SECS or globally via
+    # FUNDOC_PROVIDER_TIMEOUT_SECS.
     env_key = f"FUNDOC_{str(provider or AI_PROVIDER).upper()}_TIMEOUT_SECS"
     raw_timeout = os.environ.get(env_key) or os.environ.get(
-        "FUNDOC_PROVIDER_TIMEOUT_SECS", "900"
+        "FUNDOC_PROVIDER_TIMEOUT_SECS", "300"
     )
     try:
         timeout_secs = max(60, int(raw_timeout))
     except (TypeError, ValueError):
-        timeout_secs = 900
+        timeout_secs = 300
 
     if complexity_tier == "massive":
         timeout_secs += 600
@@ -5070,14 +5231,21 @@ def _invoke_codex(prompt, model=None, max_turns=25):
 
 
 def _invoke_gemini(prompt, model=None, max_turns=25):
-    """Invoke Gemini via the gemini-cli-sdk with native MCP tool support."""
+    """Invoke Gemini via the vendored gemini_agent_sdk with native MCP tool support."""
     import asyncio
 
     model = _require_model_name(model, "gemini")
 
+    # The Gemini SDK is vendored under fun-doc/vendored/gemini_agent_sdk/
+    # (see fun-doc/vendored/gemini_agent_sdk/_VENDORED.md). It's not a pip
+    # dependency: the upstream package is GitHub-only (the obvious PyPI
+    # name belongs to an unrelated project) and git-install is fragile in
+    # locked-down environments, so fun-doc ships the source directly.
+    # Import failure here means the vendored tree was deleted/corrupted,
+    # not a missing pip install.
     try:
-        from gemini_cli_sdk import GeminiCli, GeminiOptions
-        from gemini_cli_sdk.events import (
+        from vendored.gemini_agent_sdk import GeminiCli, GeminiOptions
+        from vendored.gemini_agent_sdk.events import (
             InitEvent,
             MessageEvent,
             ToolUseEvent,
@@ -5085,9 +5253,22 @@ def _invoke_gemini(prompt, model=None, max_turns=25):
             ErrorEvent,
             ResultEvent,
         )
-    except ImportError:
+    except ImportError as e:
         print(
-            "ERROR: gemini-cli-sdk not installed. Run: pip install gemini-cli-sdk",
+            f"ERROR: vendored gemini_agent_sdk import failed ({e}).\n"
+            f"\n"
+            f"  The Gemini SDK is vendored at\n"
+            f"  fun-doc/vendored/gemini_agent_sdk/ and should always be\n"
+            f"  importable. This error means the vendored tree is missing\n"
+            f"  or corrupted. Restore it with:\n"
+            f"\n"
+            f"    python -m scripts.sync_vendored_gemini\n"
+            f"\n"
+            f"  (run from fun-doc/, with a checkout of\n"
+            f"  github.com/bethington/gemini-agent-sdk as a sibling repo)\n"
+            f"\n"
+            f"  Or switch fun-doc's primary provider in priority_queue.json\n"
+            f"  to 'minimax', 'claude', or 'codex' to avoid Gemini entirely.\n",
             file=sys.stderr,
         )
         return None
@@ -6436,11 +6617,13 @@ def _audit_hungarian_compliance(address, program):
         "/get_function_variables",
         params={"function_name": f"FUN_{address}", "program": program},
     )
-    # Try address-based lookup if name-based fails
+    # Try address-based lookup if name-based fails. /get_function_variables
+    # has a dedicated `address` param — the old fallback passed the address
+    # string as `function_name`, which can't resolve (#207).
     if not vars_data:
         vars_data = ghidra_get(
             "/get_function_variables",
-            params={"function_name": f"0x{address}", "program": program},
+            params={"address": f"0x{address}", "program": program},
         )
     if not vars_data or not isinstance(vars_data, dict):
         return [], 0
@@ -6521,54 +6704,68 @@ def _rescore_and_sync(func, address, program):
 
 
 def _append_run_log(entry):
-    """Append a single JSONL entry to the run log. Thread-safe."""
+    """Append a single JSONL entry to the run log.
+
+    Routed through log_rotation.write_jsonl_rotating for bounded disk;
+    the helper owns its own per-path RLock so we no longer hold
+    _state_lock during file I/O (was serializing every storage write
+    behind the run-log append). The helper also never raises — its
+    return value reports whether the write landed — so this function's
+    outer error path is just for the bus_emit / event-log / cost-history
+    side-effects that follow.
+    """
+    from log_rotation import write_jsonl_rotating
+
     try:
-        LOG_DIR.mkdir(exist_ok=True)
-        with _state_lock:
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, default=str) + "\n")
-        bus_emit("run_logged", entry)
-        # Also emit a structured event so the canonical audit trail
-        # captures every run attempt. Mirrors the key fields only —
-        # the full row is still in runs.jsonl.
-        try:
-            from event_log import log_event
-
-            log_event(
-                "run.logged",
-                run_id=entry.get("run_id"),
-                worker_id=entry.get("worker_id"),
-                program=entry.get("program"),
-                address=entry.get("address"),
-                function=entry.get("function"),
-                provider=entry.get("provider"),
-                mode=entry.get("mode"),
-                result=entry.get("result"),
-                score_before=entry.get("score_before"),
-                score_after=entry.get("score_after"),
-                score_delta=entry.get("score_delta"),
-                tool_calls=entry.get("tool_calls"),
-                input_tokens=entry.get("input_tokens"),
-                output_tokens=entry.get("output_tokens"),
-                missing_artifacts=entry.get("missing_artifacts"),
-            )
-        except Exception:
-            pass  # never let event logging break run logging
-
-        # Update per-function cost history for thrashing detection.
-        # Best-effort — failures do not block run logging.
-        try:
-            _update_function_cost_history(entry)
-        except Exception:
-            pass
+        line = json.dumps(entry, default=str)
     except Exception as e:
-        print(f"  WARNING: Failed to write run log: {e}", flush=True)
+        # Bad payload — can't serialize. Log and bail before touching
+        # anything else; downstream consumers will see the gap as a
+        # missing run row, which is the right signal.
+        print(f"  WARNING: Failed to serialize run-log entry: {e}", flush=True)
         try:
             from event_log import log_event
-
             log_event("run.log_failed", error=str(e), error_type=type(e).__name__)
         except Exception:
             pass
+        return
+
+    write_jsonl_rotating(LOG_FILE, line)
+    bus_emit("run_logged", entry)
+
+    # Also emit a structured event so the canonical audit trail
+    # captures every run attempt. Mirrors the key fields only —
+    # the full row is still in runs.jsonl.
+    try:
+        from event_log import log_event
+
+        log_event(
+            "run.logged",
+            run_id=entry.get("run_id"),
+            worker_id=entry.get("worker_id"),
+            program=entry.get("program"),
+            address=entry.get("address"),
+            function=entry.get("function"),
+            provider=entry.get("provider"),
+            mode=entry.get("mode"),
+            result=entry.get("result"),
+            score_before=entry.get("score_before"),
+            score_after=entry.get("score_after"),
+            score_delta=entry.get("score_delta"),
+            tool_calls=entry.get("tool_calls"),
+            input_tokens=entry.get("input_tokens"),
+            output_tokens=entry.get("output_tokens"),
+            missing_artifacts=entry.get("missing_artifacts"),
+        )
+    except Exception:
+        pass  # never let event logging break run logging
+
+    # Update per-function cost history for thrashing detection.
+    # Best-effort — failures do not block run logging.
+    try:
+        _update_function_cost_history(entry)
+    except Exception:
+        pass
 
 
 def _update_function_cost_history(entry):
@@ -6725,6 +6922,38 @@ def _inject_tool_block(prompt):
     return prompt + "\n" + tool_block
 
 
+def _extract_marker_reason(output: str, marker: str, max_chars: int = 200) -> str | None:
+    """Pull the human-readable hint after a model output marker.
+
+    The model's structured output uses markers like `BLOCKED: <reason>`,
+    `NEEDS REDO: <issue>`, and natural-language rate-limit phrases. The
+    text immediately after the marker (up to end of line) explains the
+    outcome — but until v5.9.1 the worker discarded it and wrote
+    `reason: ""` to runs.jsonl, leaving operators with no signal about
+    what went wrong.
+
+    Returns the first non-empty line after the marker, trimmed to
+    `max_chars`, or None if the marker isn't actually present (the model
+    may mention "rate limit" while documenting code that talks about rate
+    limiting — we filter via case-insensitive lookup but stay generous).
+    """
+    if not output or not marker:
+        return None
+    lower_output = output.lower()
+    lower_marker = marker.lower()
+    idx = lower_output.find(lower_marker)
+    if idx < 0:
+        return None
+    # Pull the slice starting right after the marker so we can extract the
+    # first non-empty line.
+    tail = output[idx + len(marker):]
+    for line in tail.splitlines():
+        s = line.strip()
+        if s:
+            return s[:max_chars]
+    return None
+
+
 def process_function(
     func_key,
     func,
@@ -6797,6 +7026,30 @@ def process_function(
         if run_log_written:
             return
         run_log_written = True
+        # Ghidra being offline is an infrastructure outage, not a documentation
+        # outcome. During a multi-hour outage the worker re-picks the same
+        # function on every backoff cycle (by design — it must stay re-pickable,
+        # not parked), so writing a full ~40-field run row per attempt floods
+        # runs.jsonl with hundreds of identical rows per function (one 2026-06-07
+        # outage wrote 210 rows for a single address) and spams the dashboard run
+        # feed. Record a single lightweight event for the audit trail and skip the
+        # row. The worker's own check_ghidra_online() backoff drives recovery, and
+        # the function_complete bus event (emitted at the call site) keeps the
+        # dashboard's offline state in sync.
+        if logged_result == "ghidra_offline":
+            try:
+                from event_log import log_event
+
+                log_event(
+                    "ghidra.offline",
+                    run_id=run_id,
+                    program=program,
+                    address=address,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+            return
         final_score = new_score if score_after is None else score_after
         score_delta = (
             (final_score - live_score)
@@ -6807,8 +7060,21 @@ def process_function(
         if _debug_ctx.get().get("enabled", False):
             path = _debug_get_log_path()
             debug_path = str(path) if path else None
+        # Stamp the worker_id from the event-bus thread-local so per-worker
+        # filtering in the dashboard and audit attribution in logs/events.jsonl
+        # work. Before this fix the run.logged events carried worker_id=null
+        # even when heartbeats from the same thread carried a real worker_id,
+        # so the dashboard's per-worker run filter silently dropped every row.
+        # The CLI / non-dashboard path leaves worker_id unset (None), which is
+        # the right behavior — there's no worker context to attribute to.
+        try:
+            from event_bus import get_worker_id as _get_worker_id
+            _worker_id = _get_worker_id()
+        except Exception:
+            _worker_id = None
         entry = {
             "run_id": run_id,
+            "worker_id": _worker_id,
             "timestamp": datetime.now().isoformat(),
             "program": program,
             "address": address,
@@ -6890,29 +7156,26 @@ def process_function(
                     "  Ghidra did not come online within 120s. Skipping function.",
                     flush=True,
                 )
-                func["last_result"] = "ghidra_offline"
-                func["last_processed"] = datetime.now().isoformat()
-                update_function_state(func_key, func)
+                # Environmental failure, not the function's fault — do NOT park it
+                # (no sticky last_result/last_processed) so the selector re-picks it
+                # once Ghidra recovers. Return the distinct "ghidra_offline" result so
+                # the worker loop backs off and waits instead of churning the queue.
                 bus_emit(
                     "function_complete",
                     {"key": func_key, "result": "ghidra_offline", "score": None},
                 )
                 return _finish(
-                    "failed",
-                    logged_result="ghidra_offline",
+                    "ghidra_offline",
                     reason="Ghidra did not come online within 120s",
                 )
         else:
-            func["last_result"] = "ghidra_offline"
-            func["last_processed"] = datetime.now().isoformat()
-            update_function_state(func_key, func)
+            # Environmental failure — do NOT park (see note above); leave re-pickable.
             bus_emit(
                 "function_complete",
                 {"key": func_key, "result": "ghidra_offline", "score": None},
             )
             return _finish(
-                "failed",
-                logged_result="ghidra_offline",
+                "ghidra_offline",
                 reason=f"server not reachable at {GHIDRA_URL}",
             )
 
@@ -6962,12 +7225,11 @@ def process_function(
     # recovery_pass_done.
     if data.get("ghidra_offline"):
         print(
-            f"  GHIDRA OFFLINE — cannot fetch function data. Skipping until Ghidra is reachable.",
+            f"  GHIDRA OFFLINE — cannot fetch function data. Will retry when Ghidra is reachable.",
             flush=True,
         )
-        func["last_result"] = "ghidra_offline"
-        func["last_processed"] = datetime.now().isoformat()
-        update_function_state(func_key, func)
+        # Environmental failure — do NOT park (see note above); leave re-pickable so
+        # the function is retried automatically once Ghidra recovers.
         bus_emit(
             "function_complete",
             {
@@ -6977,8 +7239,7 @@ def process_function(
             },
         )
         return _finish(
-            "failed",
-            logged_result="ghidra_offline",
+            "ghidra_offline",
             score_after=live_score,
             reason="cannot fetch function data",
         )
@@ -7009,19 +7270,62 @@ def process_function(
             reason="decompile-heavy endpoint hit read timeout",
         )
 
+    if data.get("not_a_function"):
+        # The priority queue thinks 0x{address} is a function, but Ghidra
+        # came back with no decompiled body AND no function_name in the
+        # completeness response — the address is data (or dead code that
+        # was never disassembled). Mark it so the selector skips it
+        # until an explicit refresh re-evaluates whether it became a
+        # function in the meantime (rare but possible after analysis
+        # re-runs on the binary).
+        func["not_a_function"] = True
+        func["not_a_function_at"] = datetime.now().isoformat()
+        func["last_processed"] = datetime.now().isoformat()
+        func["last_result"] = "not_a_function"
+        print(
+            f"  NOT A FUNCTION — 0x{address} has no decompiled body and "
+            f"no function_name. Marking and skipping. "
+            f"Will be excluded from selector until next refresh.",
+            flush=True,
+        )
+        update_function_state(func_key, func)
+        bus_emit(
+            "function_complete",
+            {
+                "key": func_key,
+                "result": "not_a_function",
+                "score": live_score,
+            },
+        )
+        return _finish(
+            "blocked",
+            logged_result="not_a_function",
+            score_after=live_score,
+            reason=f"address 0x{address} is not a function",
+        )
+
     # Library-code auto-classification: detect statically-linked MSVC CRT /
     # STL / iostream / SEH code before invoking the LLM. Pinned functions
     # bypass (user explicitly queued them — respect their judgment). The
     # check runs after the decompile fetch so the detector has body text
     # for callee-substring fallback when call-graph data isn't populated.
-    queue_for_library = load_priority_queue()
-    cfg_for_library = queue_for_library.get("config") or DEFAULT_QUEUE_CONFIG
+    #
+    # v5.11.5 hot-path optimization: previously this branch loaded
+    # priority_queue.json from disk on EVERY processed function (Copilot
+    # review #3) — across N workers × M functions/min that was a real
+    # I/O bottleneck and contention point. Now:
+    #   * skip_library_code reads from config_snapshot (already frozen
+    #     at worker start; lifetime-stable per worker)
+    #   * pinned-check is deferred until AFTER detect_library_code says
+    #     "library" — for the vast majority of (non-library) functions
+    #     the disk read never happens at all.
     skip_library = (
-        cfg_for_library.get("skip_library_code", True) if config_snapshot is None
-        else config_snapshot.get("skip_library_code", True)
+        config_snapshot.get("skip_library_code", True)
+        if config_snapshot is not None
+        else (load_priority_queue().get("config") or DEFAULT_QUEUE_CONFIG)
+            .get("skip_library_code", True)
     )
-    is_pinned_for_library = func_key in set(queue_for_library.get("pinned", []))
-    if skip_library and not manual and not is_pinned_for_library:
+    if skip_library and not manual:
         decomp_text = data.get("decompiled")
         if decomp_text and not _is_error_response(decomp_text):
             detection = detect_library_code(
@@ -7030,48 +7334,63 @@ def process_function(
                 callees=func.get("callees"),
             )
             if detection.is_library:
-                plate_text = format_library_plate(detection)
-                # Best-effort plate stamp via MCP — failure is non-fatal,
-                # the flag itself is the primary skip mechanism.
-                try:
-                    ghidra_post(
-                        "/batch_set_comments",
-                        params={"program": program},
-                        data={
-                            "function_address": f"0x{address}",
-                            "plate_comment": plate_text,
-                        },
-                    )
-                except Exception as e:
+                # Deferred pinned check: only consult the queue if the
+                # detector wants to skip. Saves one priority_queue.json
+                # disk read per non-library function (the common case).
+                if func_key in set(load_priority_queue().get("pinned", [])):
+                    # User explicitly pinned this function — respect the
+                    # override, fall through to the normal LLM workflow
+                    # below. Drop into the same code path we would have
+                    # without the library_code branch.
+                    pass
+                else:
+                    plate_text = format_library_plate(detection)
+                    # Best-effort plate stamp via MCP — failure is non-fatal,
+                    # the flag itself is the primary skip mechanism.
+                    try:
+                        # /batch_set_comments' address param is named `address`,
+                        # not `function_address` (#207 — fun-doc had it wrong, so
+                        # the generic library-code plate silently never landed;
+                        # the library_code flag is the real skip mechanism so the
+                        # gate still worked, but the plate was missing).
+                        ghidra_post(
+                            "/batch_set_comments",
+                            params={"program": program},
+                            data={
+                                "address": f"0x{address}",
+                                "plate_comment": plate_text,
+                            },
+                        )
+                    except Exception as e:
+                        print(
+                            f"  LIBRARY-CODE plate stamp failed (non-fatal): {e}",
+                            flush=True,
+                        )
+                    func["library_code"] = True
+                    func["library_code_at"] = datetime.now().isoformat()
+                    func["library_code_reasons"] = detection.reasons
+                    func["last_processed"] = datetime.now().isoformat()
+                    func["last_result"] = "library_code"
                     print(
-                        f"  LIBRARY-CODE plate stamp failed (non-fatal): {e}",
+                        f"  LIBRARY CODE — auto-classified ({', '.join(detection.reasons)}). "
+                        f"Stamped generic plate, marked for selector skip.",
                         flush=True,
                     )
-                func["library_code"] = True
-                func["library_code_at"] = datetime.now().isoformat()
-                func["library_code_reasons"] = detection.reasons
-                func["last_processed"] = datetime.now().isoformat()
-                func["last_result"] = "library_code"
-                print(
-                    f"  LIBRARY CODE — auto-classified ({', '.join(detection.reasons)}). "
-                    f"Stamped generic plate, marked for selector skip.",
-                    flush=True,
-                )
-                update_function_state(func_key, func)
-                bus_emit(
-                    "function_complete",
-                    {
-                        "key": func_key,
-                        "result": "library_code",
-                        "score": live_score,
-                        "reasons": detection.reasons,
-                    },
-                )
-                return _finish(
-                    "library_code",
-                    score_after=live_score,
-                    reason=f"library-code detector: {','.join(detection.reasons)}",
-                )
+                    update_function_state(func_key, func)
+                    bus_emit(
+                        "function_complete",
+                        {
+                            "key": func_key,
+                            "result": "library_code",
+                            "score": live_score,
+                            "reasons": detection.reasons,
+                        },
+                    )
+                    return _finish(
+                        "library_code",
+                        score_after=live_score,
+                        reason=f"library-code detector: {','.join(detection.reasons)}",
+                    )
 
     # Refine mode based on live score and completeness context
     mode = determine_mode(live_score, data.get("deductions"), data.get("completeness"))
@@ -7595,6 +7914,14 @@ def process_function(
 
     # Parse result
     result = "completed"
+    # result_reason captures a short, human-readable hint about why a non-
+    # success outcome was chosen. Plumbed into _log_run_once below so the
+    # `reason` field in runs.jsonl/SQL runs is non-empty for blocked,
+    # rate_limited, and needs_redo outcomes. (v5.9.1: the user observed
+    # 1431 "blocked" runs in JSONL with empty reason/error fields — the
+    # block cause was being thrown away even though it was right there in
+    # the model's output as text after the "BLOCKED:" marker.)
+    result_reason: str | None = None
     if output:
         # Check success markers FIRST — models sometimes mention rate limits,
         # blocked states, etc. in their reasoning text while ultimately
@@ -7615,13 +7942,25 @@ def process_function(
             # not the model discussing "rate limiting" in game code analysis.
             print(f"  RATE LIMITED on this function", flush=True)
             result = "rate_limited"
+            # Match-phrase + a snippet so the reason field shows which
+            # specific phrase tripped detection (helps disambiguate genuine
+            # rate-limit messages from false positives in game-code text).
+            matched_phrase = next(
+                (p for p in rate_limit_phrases if p in output.lower()), None
+            )
+            result_reason = (
+                _extract_marker_reason(output, matched_phrase)
+                if matched_phrase else None
+            ) or "rate-limit phrase in provider output"
         elif "BLOCKED:" in output:
             # Check BLOCKED after DONE — models sometimes mention a previous
             # BLOCKED attempt in their reasoning text before ultimately
             # succeeding with a DONE marker. DONE takes priority.
             result = "blocked"
+            result_reason = _extract_marker_reason(output, "BLOCKED:")
         elif "NEEDS REDO:" in output:
             result = "needs_redo"
+            result_reason = _extract_marker_reason(output, "NEEDS REDO:")
     elif tool_calls_made >= 1 or tool_calls_made == -1:
         # Empty output (no final text block) but the model made tool calls
         # (or the provider doesn't report tool counts, i.e. -1). The writes
@@ -8063,8 +8402,11 @@ def process_function(
         func["partial_runs"] = func.get("partial_runs", 0) + 1
 
     # Log this run for audit trail. Early exits use the same helper so
-    # runs.jsonl explains skips/config/offline failures too.
-    _log_run_once(result)
+    # runs.jsonl explains skips/config/offline failures too. `result_reason`
+    # carries the human-readable hint extracted from the model output for
+    # blocked/rate_limited/needs_redo outcomes (v5.9.1 fix — was being
+    # silently dropped on the main worker path).
+    _log_run_once(result, reason=result_reason)
 
     bus_emit(
         "score_update",
@@ -8352,7 +8694,7 @@ def main():
         from event_bus import get_bus
 
         bus = get_bus()
-        app, socketio = create_app(STATE_FILE, event_bus=bus)
+        app, socketio = create_app(STATE_FILE, event_bus=bus, dashboard_port=args.web_port)
         dashboard_url = f"http://127.0.0.1:{args.web_port}"
         print(f"Starting web dashboard at {dashboard_url}", flush=True)
 
@@ -8419,7 +8761,7 @@ def main():
             from event_bus import get_bus
 
             bus = get_bus()
-            dash_app, dash_socketio = create_app(STATE_FILE, event_bus=bus)
+            dash_app, dash_socketio = create_app(STATE_FILE, event_bus=bus, dashboard_port=dash_port)
             dashboard_url = f"http://127.0.0.1:{dash_port}"
 
             # Run Flask-SocketIO in a daemon thread (auto-exits when main process exits)
@@ -8624,7 +8966,7 @@ def main():
                         session["functions"].append(key)
                     elif result == "skipped":
                         session["skipped"] += 1
-                    elif result == "failed" or result == "blocked":
+                    elif result in ("failed", "blocked", "ghidra_offline"):
                         session["failed"] += 1
                     elif result == "partial":
                         session["partial"] += 1
@@ -8647,7 +8989,7 @@ def main():
                         session["functions"].append(key)
                     elif result == "skipped":
                         session["skipped"] += 1
-                    elif result == "failed" or result == "blocked":
+                    elif result in ("failed", "blocked", "ghidra_offline"):
                         session["failed"] += 1
                     elif result == "partial":
                         session["partial"] += 1
@@ -8706,7 +9048,7 @@ def main():
                 session["functions"].append(key)
             elif result == "skipped":
                 session["skipped"] += 1
-            elif result == "failed" or result == "blocked":
+            elif result in ("failed", "blocked", "ghidra_offline"):
                 session["failed"] += 1
             elif result == "partial":
                 session["partial"] += 1

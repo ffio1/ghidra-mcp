@@ -2,9 +2,9 @@
 
 ## Overview
 
-MCP server bridging Ghidra reverse engineering with AI tools. 243 MCP tools for binary analysis.
+MCP server bridging Ghidra reverse engineering with AI tools. 249 MCP tools for binary analysis.
 
-- **Package**: `com.xebyte` | **Version**: 5.9.0 | **Java**: 21 LTS | **Ghidra**: 12.0.4
+- **Package**: `com.xebyte` | **Version**: 5.13.1 | **Java**: 21 LTS | **Ghidra**: 12.1
 
 ## Boil the ocean
 
@@ -17,11 +17,11 @@ AI Tools <-> MCP Bridge (bridge_mcp_ghidra.py) <-> Ghidra Plugin (GhidraMCPPlugi
 ```
 
 - **Plugin**: `src/main/java/com/xebyte/GhidraMCPPlugin.java` -- HTTP server, delegates to services
-- **Bridge**: `bridge_mcp_ghidra.py` (~2,200 lines) -- dynamic tool registration from `/mcp/schema` + static tools (~7 knowledge DB + 22 debugger proxy via `GHIDRA_DEBUGGER_URL`)
+- **Bridge**: `bridge_mcp_ghidra.py` (~2,200 lines) -- dynamic tool registration from `/mcp/schema` + static tools (7 instance/tool-group/import: `list_instances`, `connect_instance`, `list_tool_groups`, `load_tool_group`, `unload_tool_group`, `check_tools`, `import_file`; + 22 debugger proxy via `GHIDRA_DEBUGGER_URL`)
 - **Service Layer**: `src/main/java/com/xebyte/core/` -- 14 service classes (~20K lines), `@McpTool`/`@Param` annotated. v5.4.0 adds `EmulationService` (P-code emulation), `DebuggerService` (TraceRmi wrapping — GUI-only)
 - **Debugger (Python)**: `debugger/` -- standalone HTTP server on port 8099 (engine, protocol, tracing, address_map, d2/ conventions). Bridge proxies via `GHIDRA_DEBUGGER_URL` env var.
 - **Headless**: `src/main/java/com/xebyte/headless/` -- standalone server without GUI. Includes `HeadlessManagementService` for program/project lifecycle.
-- **fun-doc**: `fun-doc/` -- AI-driven function documentation workflow (separate from MCP tools). `fun_doc.py` (~5,700 lines) manages a priority queue of functions, routes LLM scoring, and persists per-function workflow state, run history, and inventories to a SQL store via `fun-doc/storage/` (SQLAlchemy Core abstraction; SQLite default at `fun-doc/state.db`, Postgres opt-in via `FUN_DOC_DB_URL` or `priority_queue.json -> config.storage`). The `fun_doc` Postgres schema is sibling to `re_kb` in the same `bsim` instance — see [RE-Universe](https://github.com/bethington/re-universe) for the published API. Migration tooling lives in `fun-doc/scripts/migrate_state_to_sql.py` + `verify_migration.py` (zero-diff gate); see `~/.claude/plans/fun-doc-postgres-storage-migration.md` for the design. `web.py` is the web dashboard. Sibling modules: `inventory_scorer.py` (idle-time daemon filling missing completeness scores; persists to `fun_doc.inventory`) and `provider_pause.py` (per-(provider, model) quota-wall detector backed by `fun-doc/provider_pauses.json`). Workers freeze a config snapshot at start so live edits don't affect running workers. Legacy `state.json` is read only as a fallback when the SQL backend can't be loaded. Not exposed as MCP tools — internal curation subsystem. See `tests/performance/test_state_atomicity.py` (legacy fallback) and `test_storage_*.py` (SQL backend) for regression coverage.
+- **fun-doc**: `fun-doc/` -- AI-driven function documentation workflow (separate from MCP tools). `fun_doc.py` (~9,800 lines) manages a priority queue of functions, routes LLM scoring, and persists per-function workflow state, run history, and inventories to a SQL store via `fun-doc/storage/` (SQLAlchemy Core abstraction; SQLite default at `fun-doc/state.db`, Postgres opt-in via `FUN_DOC_DB_URL` or `priority_queue.json -> config.storage`). The `fun_doc` Postgres schema is sibling to `re_kb` in the same `bsim` instance — see [RE-Universe](https://github.com/bethington/re-universe) for the published API. Migration tooling lives in `fun-doc/scripts/migrate_state_to_sql.py` + `verify_migration.py` (zero-diff gate); see `~/.claude/plans/fun-doc-postgres-storage-migration.md` for the design. `web.py` is the web dashboard. Sibling modules: `inventory_scorer.py` (idle-time daemon filling missing completeness scores; persists to `fun_doc.inventory`) and `provider_pause.py` (per-(provider, model) quota-wall detector backed by `fun-doc/provider_pauses.json`). Workers freeze a config snapshot at start so live edits don't affect running workers. Legacy `state.json` is read only as a fallback when the SQL backend can't be loaded. Not exposed as MCP tools — internal curation subsystem. See `tests/performance/test_state_atomicity.py` (legacy fallback) and `test_storage_*.py` (SQL backend) for regression coverage.
 - **Annotation Scanner**: `AnnotationScanner.java` discovers `@McpTool` methods, generates `/mcp/schema`
 
 Services use constructor injection: `ProgramProvider` + `ThreadingStrategy`.
@@ -32,7 +32,7 @@ Services use constructor injection: `ProgramProvider` + `ThreadingStrategy`.
 
 Do not try to keep the full tool list in this file.
 
-- **Authoritative repo snapshot**: `tests/endpoints.json` (225 endpoints, categories, descriptions)
+- **Authoritative repo snapshot**: `tests/endpoints.json` (249 endpoints, categories, descriptions)
 - **Authoritative runtime schema**: `/mcp/schema` from the running server
 - **Usage patterns / operator guide**: `docs/prompts/TOOL_USAGE_GUIDE.md`
 
@@ -40,35 +40,35 @@ Use this file for architecture, conventions, and implementation guidance; use th
 
 ## Build & Deploy
 
-Two backends are supported. Maven is the default; Gradle is the new primary path. Switch with `TOOLS_SETUP_BACKEND=gradle`.
+Two backends are supported. Maven is the default used by `tools.setup`; Gradle is available through the wrapper when Maven is not installed or when testing the migration path. Switch with `TOOLS_SETUP_BACKEND=gradle`.
 
-**Gradle (set `TOOLS_SETUP_BACKEND=gradle` or invoke directly):**
+**Gradle fallback / migration path (set `TOOLS_SETUP_BACKEND=gradle` or invoke directly):**
 
 ```text
 # Direct Gradle invocation — no tools.setup required
-./gradlew buildExtension -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-./gradlew preflight      -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-./gradlew deploy         -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-./gradlew startGhidra    -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
+./gradlew buildExtension -PGHIDRA_INSTALL_DIR=F:\ghidra_12.1_PUBLIC
+./gradlew preflight      -PGHIDRA_INSTALL_DIR=F:\ghidra_12.1_PUBLIC
+./gradlew deploy         -PGHIDRA_INSTALL_DIR=F:\ghidra_12.1_PUBLIC
+./gradlew startGhidra    -PGHIDRA_INSTALL_DIR=F:\ghidra_12.1_PUBLIC
 
 # Via tools.setup facade (same commands, Gradle backend)
 $env:TOOLS_SETUP_BACKEND = "gradle"
 python -m tools.setup build
-python -m tools.setup preflight --ghidra-path F:\ghidra_12.0.4_PUBLIC
-python -m tools.setup deploy    --ghidra-path F:\ghidra_12.0.4_PUBLIC
+python -m tools.setup preflight --ghidra-path F:\ghidra_12.1_PUBLIC
+python -m tools.setup deploy    --ghidra-path F:\ghidra_12.1_PUBLIC
 ```
 
 **Maven (default — existing tooling unchanged):**
 
 ```text
 python -m tools.setup build
-python -m tools.setup preflight      --ghidra-path F:\ghidra_12.0.4_PUBLIC
-python -m tools.setup ensure-prereqs --ghidra-path F:\ghidra_12.0.4_PUBLIC
-python -m tools.setup deploy         --ghidra-path F:\ghidra_12.0.4_PUBLIC
+python -m tools.setup preflight      --ghidra-path F:\ghidra_12.1_PUBLIC
+python -m tools.setup ensure-prereqs --ghidra-path F:\ghidra_12.1_PUBLIC
+python -m tools.setup deploy         --ghidra-path F:\ghidra_12.1_PUBLIC
 ```
 
 - Maven: `C:\Users\benam\tools\apache-maven-3.9.6\bin\mvn.cmd`
-- Ghidra install: `F:\ghidra_12.0.4_PUBLIC`
+- Ghidra install: `F:\ghidra_12.1_PUBLIC`
 - `tools.setup` delegates to Maven by default; set `TOOLS_SETUP_BACKEND=gradle` to route the same commands to Gradle
 - Deploy handles: build, extension install, FrontEndTool.xml patching, Ghidra restart
 - Migration plan: `docs/project-management/GRADLE_MIGRATION_CHECKLIST.md`
@@ -85,7 +85,7 @@ Release floor before tagging or publishing:
 python -m tools.setup verify-version
 python -m tools.setup build
 pytest tests/unit/ -v --no-cov
-python -m tools.setup deploy --ghidra-path F:\ghidra_12.0.4_PUBLIC --test release
+python -m tools.setup deploy --ghidra-path F:\ghidra_12.1_PUBLIC --test release
 ```
 
 Run UI-touching deploy/regression only after confirming the current Ghidra UI
@@ -183,7 +183,7 @@ pytest tests/unit/ --no-cov
 
 ```text
 # Gradle
-./gradlew test --tests 'com.xebyte.offline.*' -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
+./gradlew test --tests 'com.xebyte.offline.*' -PGHIDRA_INSTALL_DIR=F:\ghidra_12.1_PUBLIC
 # Maven
 mvn test -Dtest='com.xebyte.offline.*Test'
 ```
@@ -205,16 +205,12 @@ pytest tests/performance/ \
 
 ```text
 # Java
-./gradlew test -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC   # or: mvn test
+./gradlew test -PGHIDRA_INSTALL_DIR=F:\ghidra_12.1_PUBLIC   # or: mvn test
 # Python — subset by marker
 pytest tests/ -m readonly          # safe, no writes
 pytest tests/ -m safe_write        # identity writes only
 pytest tests/                      # full suite, includes mutating tests
 ```
-
-### Known pre-existing failures
-
-- `tests/performance/test_worker_watchdog.py` — three tests reference `WorkerManager._watchdog_stop`, which no longer exists. Failures are unrelated to most changes; ignore unless editing the watchdog itself.
 
 ### Catalog drift
 

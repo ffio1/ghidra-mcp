@@ -101,6 +101,15 @@ _DIRECT_FIELDS = {
     "is_thrashing",
     "deductions",
     "callees",
+    "library_code",
+    "library_code_reasons",
+    # name-source provenance (#204) — kept here so a state.json that
+    # was already marked with propagation source folds cleanly into
+    # state.db. Defaults to 'scan' / null at the schema level for
+    # never-touched rows.
+    "name_source",
+    "name_source_binary",
+    "name_confidence",
 }
 
 # Renamed columns (state key → DB column).
@@ -109,6 +118,7 @@ _RENAMED_FIELDS = {
     "last_audited": "last_audited_at",
     "last_escalated": "last_escalated_at",
     "decompile_timeout_at": "decompile_timeout_at",
+    "library_code_at": "library_code_at",
 }
 
 
@@ -169,17 +179,31 @@ def function_record_to_row(rec: dict) -> dict:
     for key in _DIRECT_FIELDS:
         if key in rec:
             out[key] = rec[key]
+    # Rename + timestamp-parse in one pass. Any destination column whose
+    # name ends in ``_at`` is treated as a timestamp and parsed via
+    # parse_ts; ``last_processed`` is also a timestamp despite its name
+    # not ending in _at (legacy state.json schema predates the suffix
+    # convention). Everything else is copied as-is.
+    #
+    # Pre-v5.11.5 this loop ran a fuzzy substring check ("audited" in dest
+    # or "escalated" in dest or "timeout" in dest) and then three explicit
+    # post-loop blocks re-assigned last_processed, decompile_timeout_at,
+    # and library_code_at via parse_ts. That produced double-assignments
+    # — last_processed and decompile_timeout_at got the same value
+    # written twice (wasted CPU), while library_code_at first got the
+    # raw string from _maybe_ts and then was overwritten by the datetime
+    # from parse_ts (correct end-state, confusing flow). The unified
+    # check below removes all three duplicate assignments.
+    _ts_destinations = {"last_processed"}  # explicit non-_at exceptions
     for src, dest in _RENAMED_FIELDS.items():
-        if src in rec:
-            out[dest] = parse_ts(rec[src]) if "audited" in dest or "escalated" in dest or "timeout" in dest else _maybe_ts(rec[src], dest)
-    # last_result / last_processed are special: state.json stores them as the
-    # last_result string and last_processed ISO timestamp respectively.
+        if src not in rec:
+            continue
+        if dest.endswith("_at") or dest in _ts_destinations:
+            out[dest] = parse_ts(rec[src])
+        else:
+            out[dest] = _maybe_ts(rec[src], dest)
     if "last_result" in rec:
         out["last_result"] = rec["last_result"]
-    if "last_processed" in rec:
-        out["last_processed"] = parse_ts(rec["last_processed"])
-    if "decompile_timeout_at" in rec:
-        out["decompile_timeout_at"] = parse_ts(rec["decompile_timeout_at"])
     # ``attempts`` int column = len(inline attempts list). Migrating the
     # list contents into the runs table happens after the bulk upsert.
     inline = rec.get("attempts")

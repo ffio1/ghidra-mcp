@@ -7,8 +7,11 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.Pointer;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
@@ -1224,7 +1227,12 @@ public class FunctionService {
                                + "Intermediate namespaces are created if they don't exist. "
                                + "When provided, uses setNameAndNamespace() to correctly re-parent the symbol "
                                + "in the Symbol Tree — unlike a plain rename which only changes the display name.") String namespacePath,
-            @Param(value = "program", defaultValue = "") String programName) {
+            @Param(value = "program", defaultValue = "") String programName,
+            @Param(value = "strict_mode", source = ParamSource.BODY, defaultValue = "",
+                   description = "Optional per-call override for naming enforcement: 'enforce' (reject "
+                               + "low-quality names), 'warn' (write goes through with warnings), or 'off' "
+                               + "(skip validation entirely). Omit to use the project/global setting.")
+                    String strictModeArg) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
@@ -1242,6 +1250,10 @@ public class FunctionService {
             return Response.err("No function found for " + functionAddrStr);
         }
 
+        // Per-call strict_mode override. The AutoCloseable returned by
+        // scopedRequestMode() clears the override on close — even if the
+        // body throws — so it never leaks across HTTP requests.
+        try (AutoCloseable ignored = NamingPolicy.getInstance().scopedRequestMode(strictModeArg)) {
         boolean enforceStrictNaming = NamingPolicy.getInstance().isStrictNamingEnforcement();
         List<String> enforcementWarnings = new ArrayList<>();
 
@@ -1327,14 +1339,23 @@ public class FunctionService {
             return Response.ok(data);
         }
         return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
+        } catch (Exception e) {
+            // try-with-resources close path: scopedRequestMode's close()
+            // is declared on AutoCloseable so the compiler requires us to
+            // handle a checked Exception here. Re-wrap as runtime since
+            // none of the body throws checked exceptions.
+            throw new RuntimeException(e);
+        }
+    }
+
+    /** Three-arg overload preserving the pre-v5.11.2 signature for the
+     * registry + headless dispatcher + bare programmatic callers. */
+    public Response renameFunctionByAddress(String functionAddrStr, String newName, String programName) {
+        return renameFunctionByAddress(functionAddrStr, newName, "", programName, null);
     }
 
     public Response renameFunctionByAddress(String functionAddrStr, String newName) {
-        return renameFunctionByAddress(functionAddrStr, newName, null, null);
-    }
-
-    public Response renameFunctionByAddress(String functionAddrStr, String newName, String programName) {
-        return renameFunctionByAddress(functionAddrStr, newName, null, programName);
+        return renameFunctionByAddress(functionAddrStr, newName, "", null, null);
     }
 
     // ========================================================================
@@ -1620,9 +1641,9 @@ public class FunctionService {
             String cc = callingConvention != null ? callingConvention : "";
             boolean protoHasThiscall = prototype != null && (prototype.contains("__thiscall") || cc.contains("__thiscall"));
             if (protoHasThiscall && prototype != null && !prototype.contains("void *this") && !prototype.contains("void * this")) {
-                msg += "\n\nWARNING: __thiscall ECX auto-parameter 'this' cannot be retyped via API. "
-                     + "Ghidra accepts the prototype but the decompiler will still show 'this' as void*. "
-                     + "Document the intended type in the plate comment Parameters section instead.";
+                msg += "\n\nNOTE: For __thiscall/__fastcall member functions, also call set_function_this_type "
+                     + "with the concrete struct/class pointer (e.g. MyWidget *) so the decompiler "
+                     + "uses typed 'this' field access instead of void*.";
             }
             if (!result.getErrorMessage().isEmpty()) {
                 msg += "\n\nWarnings/Debug Info:\n" + result.getErrorMessage();
@@ -1827,6 +1848,56 @@ public class FunctionService {
     // ========================================================================
 
     /**
+     * Build the decompiler-default-name guidance appended to a "variable not found"
+     * error from set_local_variable_type. Pure function of the requested name and the
+     * current high-symbol names, so it is unit-testable without a live decompile.
+     *
+     * <p>Ghidra default names follow {@code <prefix>Var<digits>} (uVar1, puVar3, iVar5,
+     * psVar7, ...). When such a name misses, there are two recoverable causes:
+     * <ul>
+     *   <li><b>SSA-renumber drift</b> — same-prefix default names still exist but with
+     *       different digits, because a previous set_local_variable_type call re-decompiled
+     *       and renumbered the temporaries. Fix: batch with set_variables.</li>
+     *   <li><b>Renamed-away / register-resident</b> — no default-named variables remain at
+     *       all (they were renamed, or the function is register/SIMD-heavy so Ghidra names
+     *       them local_&lt;REG&gt;_*). The caller is working from a stale decompilation. Fix:
+     *       re-decompile for current names, or batch with set_variables.</li>
+     * </ul>
+     *
+     * @return the hint sentence (with trailing space), or "" when no hint applies.
+     */
+    public static String buildVariableNameHint(String variableName, List<String> availableNames) {
+        if (variableName == null || !variableName.matches("^[a-z]+Var\\d+$")) {
+            return "";
+        }
+        if (availableNames == null) {
+            availableNames = java.util.Collections.emptyList();
+        }
+        String prefix = variableName.replaceAll("\\d+$", "");
+        boolean hasSamePrefix = availableNames.stream()
+                .anyMatch(n -> n != null && n.startsWith(prefix) && n.matches("^[a-z]+Var\\d+$"));
+        if (hasSamePrefix) {
+            return "Hint: this looks like SSA-renumber drift from a previous "
+                    + "set_local_variable_type call in the same function. "
+                    + "Use set_variables for ALL variable type+rename changes in one "
+                    + "atomic call to avoid this — individual set_local_variable_type "
+                    + "calls trigger re-decompilation that renumbers SSA temporaries. ";
+        }
+        boolean hasAnyDefaultName = availableNames.stream()
+                .anyMatch(n -> n != null && n.matches("^[a-z]+Var\\d+$"));
+        if (!hasAnyDefaultName) {
+            return "Hint: '" + variableName + "' is a Ghidra decompiler default name, but no "
+                    + "default-named (uVarN/iVarN/puVarN) variables remain in this function — "
+                    + "they have been renamed already, or the variables are register-resident "
+                    + "(e.g. local_ESI_*, local_MM*) in a register/SIMD-heavy function. You are "
+                    + "likely working from a stale decompilation: re-decompile to read the current "
+                    + "names from the Available list above, then retype — or use set_variables to "
+                    + "rename+retype in one atomic call. ";
+        }
+        return "";
+    }
+
+    /**
      * Set a local variable's type using HighFunctionDBUtil.updateDBVariable.
      */
     @McpTool(path = "/set_local_variable_type", method = "POST", description = "Set the data type of a local variable. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
@@ -1912,27 +1983,10 @@ public class FunctionService {
                                     .append(". ");
                         }
 
-                        // SSA churn hint: when the failed name follows the
-                        // <prefix><digit>+ pattern of a Ghidra SSA temporary
-                        // (iVar5, psVar7, puVar2, ...) and there is a similar
-                        // name in the available list with a *different* digit,
-                        // the most likely cause is that a previous
-                        // set_local_variable_type call retyped a variable in
-                        // the same function and re-decompilation renumbered
-                        // SSA temporaries. Recommend the atomic batch tool
-                        // explicitly rather than leaving the worker to guess.
-                        if (variableName.matches("^[a-z]+Var\\d+$")) {
-                            String prefix = variableName.replaceAll("\\d+$", "");
-                            boolean hasSamePrefix = availableNames.stream()
-                                    .anyMatch(n -> n.startsWith(prefix) && n.matches("^[a-z]+Var\\d+$"));
-                            if (hasSamePrefix) {
-                                resultMsg.append("Hint: this looks like SSA-renumber drift from a previous ")
-                                        .append("set_local_variable_type call in the same function. ")
-                                        .append("Use set_variables for ALL variable type+rename changes in one ")
-                                        .append("atomic call to avoid this — individual set_local_variable_type ")
-                                        .append("calls trigger re-decompilation that renumbers SSA temporaries. ");
-                            }
-                        }
+                        // Decompiler-default-name guidance (SSA churn / renamed-away /
+                        // register-resident). Pure function of the requested name + the
+                        // available high-symbol names — see buildVariableNameHint.
+                        resultMsg.append(buildVariableNameHint(variableName, availableNames));
 
                         // Check if variable exists in low-level API but not high-level (phantom variable)
                         Variable[] lowLevelVars = func.getLocalVariables();
@@ -2048,7 +2102,266 @@ public class FunctionService {
             @Param(value = "parameter_name", source = ParamSource.BODY) String parameterName,
             @Param(value = "new_type", source = ParamSource.BODY) String newType,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        if ("this".equals(parameterName)) {
+            return setFunctionThisType(functionAddress, newType, programName);
+        }
         return setLocalVariableType(functionAddress, parameterName, newType, programName);
+    }
+
+    /**
+     * Retype the implicit {@code this} pointer for {@code __thiscall} / {@code __fastcall} member
+     * functions so decompilation shows {@code this->field} with the correct struct/class type.
+     */
+    @McpTool(path = "/set_function_this_type", method = "POST",
+            description = "Type the implicit 'this' of a __thiscall/__fastcall member function by associating the function with its class. Ghidra's auto-'this' (ECX on x86) is an immutable auto-parameter; with auto-storage it derives its type from the function's parent Class namespace, matched by name to a same-named structure. This tool finds/creates a class namespace for the struct and moves the function into it (no custom storage). Pass 'MyClass *' or 'MyClass'; the structure MyClass must already exist (create_struct). On programs with multiple address spaces, prefix function_address with the space name (mem:1000).",
+            category = "function")
+    public Response setFunctionThisType(
+            @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Function entry address (0x<hex> or <space>:<hex>).") String functionAddrStr,
+            @Param(value = "this_type", source = ParamSource.BODY,
+                   description = "Class type for this, e.g. 'MyWidget *' or 'MyWidget'. The base struct name becomes the function's class.") String thisType,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+
+        if (functionAddrStr == null || functionAddrStr.isEmpty()) {
+            return Response.err("Function address is required");
+        }
+        if (thisType == null || thisType.isEmpty()) {
+            return Response.err("this_type is required");
+        }
+        if (thisType.startsWith("undefined")) {
+            return Response.err("Rejected: this_type must be a concrete struct/class pointer, not " + thisType);
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address addr = ServiceUtils.parseAddress(program, functionAddrStr);
+        if (addr == null) return Response.err(ServiceUtils.getLastParseError());
+
+        final StringBuilder resultMsg = new StringBuilder();
+        final AtomicBoolean success = new AtomicBoolean(false);
+
+        try {
+            threadingStrategy.executeWrite(program, "Associate function with class for 'this'", () -> {
+                Function func = ServiceUtils.getFunctionForAddress(program, addr);
+                if (func == null) {
+                    resultMsg.append("Error: No function found at ").append(functionAddrStr);
+                    return null;
+                }
+
+                // The this_type names the owning class. Its base must be an existing structure,
+                // because Ghidra derives the auto-'this' type from a class namespace that is
+                // associated by name with a same-named struct.
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType pointerType = resolveThisPointerType(dtm, thisType);
+                if (!(pointerType instanceof Pointer)) {
+                    resultMsg.append("Error: Could not resolve this_type '").append(thisType)
+                            .append("' to a pointer. Create the structure first with create_struct, then retry.");
+                    return null;
+                }
+                DataType base = ((Pointer) pointerType).getDataType();
+                if (!(base instanceof Structure)) {
+                    resultMsg.append("Error: 'this' must point to a structure/class type; '")
+                            .append(base != null ? base.getName() : "void")
+                            .append("' is not a structure. Ghidra derives the 'this' type from a same-named struct.");
+                    return null;
+                }
+                String className = base.getName();
+
+                // The member function must already have an implicit 'this'; that only exists for a
+                // hasThis convention (__thiscall/__fastcall). Bail out before mutating anything so
+                // non-member functions are not silently re-parented into a class.
+                Parameter thisParam = findAutoThisParameter(func);
+                if (thisParam == null) {
+                    String cc;
+                    try {
+                        cc = func.getCallingConventionName();
+                    } catch (Exception ignored) {
+                        cc = "";
+                    }
+                    resultMsg.append("Error: ").append(func.getName())
+                            .append(" has no implicit 'this' parameter (calling convention '")
+                            .append(cc == null || cc.isEmpty() ? "(default)" : cc)
+                            .append("'). Set it to __thiscall with set_function_prototype, then retry.");
+                    return null;
+                }
+
+                // Auto-parameters are immutable via the API; the 'this' auto-parameter instead
+                // obtains its type from the function's parent Class namespace (auto-storage). So we
+                // place the function in a GhidraClass named after the struct rather than retyping
+                // 'this' directly. This is the same model as the decompiler's "Auto Fill in Class
+                // Structure" / re-parenting via the Symbol Tree — no custom storage required.
+                SymbolTable st = program.getSymbolTable();
+                Namespace global = program.getGlobalNamespace();
+                GhidraClass classNs;
+                Namespace existing = st.getNamespace(className, global);
+                if (existing == null) {
+                    classNs = st.createClass(global, className, SourceType.USER_DEFINED);
+                } else if (existing instanceof GhidraClass) {
+                    classNs = (GhidraClass) existing;
+                } else {
+                    classNs = st.convertNamespaceToClass(existing);
+                }
+
+                Namespace currentNs = func.getParentNamespace();
+                boolean alreadyInClass = currentNs instanceof GhidraClass
+                        && className.equals(currentNs.getName());
+                if (!alreadyInClass) {
+                    func.getSymbol().setNamespace(classNs);
+                }
+
+                // Re-read the auto-'this' so we report the type Ghidra now derives from the class.
+                thisParam = findAutoThisParameter(func);
+                DataType resolvedThis = thisParam != null ? thisParam.getDataType() : pointerType;
+                String resolvedName = resolvedThis != null ? resolvedThis.getDisplayName() : (className + " *");
+                success.set(true);
+                resultMsg.append(alreadyInClass ? "Confirmed " : "Moved ").append(func.getName())
+                        .append(alreadyInClass ? " in class " : " into class ").append(className)
+                        .append("; 'this' types as ").append(resolvedName)
+                        .append(" (auto-storage). Call get_decompiled_code or force_decompile to refresh output.");
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("set_function_this_type failed: " + e.getMessage());
+        }
+
+        if (success.get()) {
+            return Response.ok(JsonHelper.mapOf("status", "success", "message", resultMsg.toString()));
+        }
+        String text = resultMsg.length() > 0 ? resultMsg.toString() : "Failed to set 'this' type";
+        return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
+    }
+
+    /** Locate the implicit {@code this} (auto-parameter or explicit) on a member function. */
+    static Parameter findAutoThisParameter(Function func) {
+        if (func == null) {
+            return null;
+        }
+        for (Parameter param : func.getParameters()) {
+            if (param.isAutoParameter() && param.getAutoParameterType() == AutoParameterType.THIS) {
+                return param;
+            }
+            if ("this".equals(param.getName())) {
+                return param;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Alias for {@link #setLocalVariableType} — name matches Ghidra UI "Retype Variable".
+     */
+    @McpTool(path = "/set_decompiler_variable_type", method = "POST",
+            description = "Set a decompiler (high-level) variable or parameter type by name. Same as set_local_variable_type. For __thiscall 'this', prefer set_function_this_type.",
+            category = "function")
+    public Response setDecompilerVariableType(
+            @Param(value = "function_address", paramType = "address", source = ParamSource.BODY) String functionAddress,
+            @Param(value = "variable_name", source = ParamSource.BODY) String variableName,
+            @Param(value = "new_type", source = ParamSource.BODY) String newType,
+            @Param(value = "program", defaultValue = "") String programName) {
+        if ("this".equals(variableName)) {
+            return setFunctionThisType(functionAddress, newType, programName);
+        }
+        return setLocalVariableType(functionAddress, variableName, newType, programName);
+    }
+
+    static DataType resolveThisPointerType(DataTypeManager dtm, String thisType) {
+        if (dtm == null) {
+            return null;
+        }
+        String normalized = thisType.trim();
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        if (!normalized.contains("*")) {
+            normalized = normalized + " *";
+        }
+        return ServiceUtils.resolveDataType(dtm, normalized);
+    }
+
+    @McpTool(path = "/list_class_members", method = "GET",
+            description = "List the member functions of a C++ class. A function counts as a member if it lives in the class's namespace (e.g. after set_function_this_type re-parents it) OR its implicit 'this' parameter types as '<class> *'. Each result reports how it matched (namespace / this_type / both). Replaces the manual 'search __thiscall functions then read each signature' workflow.",
+            category = "function")
+    public Response listClassMembers(
+            @Param(value = "class_name",
+                   description = "Class / struct name, e.g. 'UnitAny'.") String className,
+            @Param(value = "offset", defaultValue = "0") int offset,
+            @Param(value = "limit", defaultValue = "200") int limit,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        if (className == null || className.trim().isEmpty()) {
+            return Response.err("class_name is required");
+        }
+        final String cls = className.trim();
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            return threadingStrategy.executeRead(() -> {
+                SymbolTable st = program.getSymbolTable();
+                Namespace global = program.getGlobalNamespace();
+                Namespace classNs = st.getNamespace(cls, global);
+                boolean isGhidraClass = classNs instanceof GhidraClass;
+
+                List<Map<String, Object>> members = new ArrayList<>();
+                for (Function func : program.getFunctionManager().getFunctions(true)) {
+                    // (1) namespace membership: function lives under a non-global namespace
+                    //     named after the class (GhidraClass or plain namespace).
+                    Namespace parent = func.getParentNamespace();
+                    boolean byNamespace = parent != null && !parent.isGlobal()
+                            && cls.equals(parent.getName());
+
+                    // (2) this-type membership: the implicit 'this' points at the class struct.
+                    boolean byThis = false;
+                    String thisTypeName = null;
+                    Parameter thisParam = findAutoThisParameter(func);
+                    if (thisParam != null) {
+                        DataType dt = thisParam.getDataType();
+                        if (dt instanceof Pointer) {
+                            DataType base = ((Pointer) dt).getDataType();
+                            if (base != null && cls.equals(base.getName())) {
+                                byThis = true;
+                                thisTypeName = dt.getDisplayName();
+                            }
+                        }
+                    }
+
+                    if (byNamespace || byThis) {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("address", func.getEntryPoint().toString(false));
+                        m.put("name", func.getName(true));
+                        m.put("matched_by", (byNamespace && byThis) ? "both"
+                                : byNamespace ? "namespace" : "this_type");
+                        if (thisTypeName != null) m.put("this_type", thisTypeName);
+                        members.add(m);
+                    }
+                }
+
+                int total = members.size();
+                int from = Math.max(0, offset);
+                int pageLimit = Math.max(1, limit);
+                int to = Math.min(total, from + pageLimit);
+                List<Map<String, Object>> page = from < to
+                        ? new ArrayList<>(members.subList(from, to)) : new ArrayList<>();
+
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("class_name", cls);
+                result.put("class_namespace_exists", isGhidraClass);
+                result.put("total_members", total);
+                result.put("offset", from);
+                result.put("limit", pageLimit);
+                result.put("members", page);
+                if (total == 0) {
+                    result.put("note", "No members found. A function matches if it is in the '" + cls
+                            + "' namespace or its 'this' parameter types as '" + cls + " *'. Create the "
+                            + "struct (create_struct) and associate functions with set_function_this_type.");
+                }
+                return Response.ok(result);
+            });
+        } catch (Exception e) {
+            return Response.err("list_class_members failed: " + e.getMessage());
+        }
     }
 
     /**
@@ -3055,7 +3368,7 @@ public class FunctionService {
      * @param restrictToExecuteMemory If true, restricts disassembly to executable memory (default: true)
      * @return JSON result with disassembly status
      */
-    @McpTool(path = "/disassemble_bytes", method = "POST", description = "Disassemble a range of bytes. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/disassemble_bytes", method = "POST", description = "Disassemble a range of bytes. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. Returns the disassembled instruction text (mnemonic + operands + bytes) when `include_instructions` is true (default), so callers working on custom processor definitions (#205) can read back what Ghidra produced without a follow-up call.", category = "function")
     public Response disassembleBytes(
             @Param(value = "start_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -3071,6 +3384,10 @@ public class FunctionService {
                                + "address is unambiguous.") String endAddress,
             @Param(value = "length", source = ParamSource.BODY, defaultValue = "0") Integer length,
             @Param(value = "restrict_to_execute_memory", source = ParamSource.BODY, defaultValue = "true") boolean restrictToExecuteMemory,
+            @Param(value = "include_instructions", source = ParamSource.BODY, defaultValue = "true",
+                   description = "Return the disassembled instruction list (mnemonic, operands, raw bytes, address) in the response. Disable for byte ranges where you only need the success/byte-count summary.") boolean includeInstructions,
+            @Param(value = "max_instructions", source = ParamSource.BODY, defaultValue = "1000",
+                   description = "Cap on number of instructions returned when include_instructions is true. Protects against runaway payload for large ranges; if the actual count exceeds this, the response sets truncated=true and instructions_total reports the real count.") int maxInstructions,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -3178,13 +3495,65 @@ public class FunctionService {
                     if (cmd.applyTo(program, ghidra.util.task.TaskMonitor.DUMMY)) {
                         // Success - build result
                         Msg.debug(this, "disassembleBytes: Successfully disassembled " + numBytes + " byte(s) from " + start + " to " + end);
-                        resultData.set(JsonHelper.mapOf(
-                            "success", true,
-                            "start_address", start.toString(),
-                            "end_address", end.toString(),
-                            "bytes_disassembled", numBytes,
-                            "message", "Successfully disassembled " + numBytes + " byte(s)"
-                        ));
+                        Map<String, Object> result = new java.util.LinkedHashMap<>();
+                        result.put("success", true);
+                        result.put("start_address", start.toString());
+                        result.put("end_address", end.toString());
+                        result.put("bytes_disassembled", numBytes);
+                        result.put("message", "Successfully disassembled " + numBytes + " byte(s)");
+
+                        // Issue #205: surface the actual instruction text so
+                        // callers working on custom processor definitions can
+                        // read back what Ghidra produced without a follow-up
+                        // /disassemble_function call.
+                        if (includeInstructions) {
+                            List<Map<String, Object>> instructions = new java.util.ArrayList<>();
+                            int truncatedLimit = Math.max(1, maxInstructions);
+                            int totalCount = 0;
+                            Listing listing = program.getListing();
+                            ghidra.program.model.listing.InstructionIterator instIter =
+                                listing.getInstructions(addressSet, true);
+                            while (instIter.hasNext()) {
+                                ghidra.program.model.listing.Instruction inst = instIter.next();
+                                totalCount++;
+                                if (instructions.size() < truncatedLimit) {
+                                    Map<String, Object> instJson = new java.util.LinkedHashMap<>();
+                                    instJson.put("address", inst.getAddress().toString());
+                                    instJson.put("mnemonic", inst.getMnemonicString());
+                                    // Operands joined with comma to match the
+                                    // visible listing format users see in the GUI.
+                                    String[] operands = new String[inst.getNumOperands()];
+                                    for (int i = 0; i < operands.length; i++) {
+                                        operands[i] = inst.getDefaultOperandRepresentation(i);
+                                    }
+                                    instJson.put("operands", String.join(", ", operands));
+                                    instJson.put("length", inst.getLength());
+                                    // Raw bytes as lowercase hex string for
+                                    // emulator / encoder verification.
+                                    try {
+                                        byte[] bytes = inst.getBytes();
+                                        StringBuilder hex = new StringBuilder(bytes.length * 2);
+                                        for (byte b : bytes) {
+                                            hex.append(String.format("%02x", b));
+                                        }
+                                        instJson.put("bytes", hex.toString());
+                                    } catch (Exception e) {
+                                        instJson.put("bytes", null);
+                                    }
+                                    instructions.add(instJson);
+                                }
+                            }
+                            result.put("instructions", instructions);
+                            result.put("instructions_total", totalCount);
+                            if (totalCount > instructions.size()) {
+                                result.put("truncated", true);
+                                result.put("truncation_note", "max_instructions=" + truncatedLimit
+                                    + " reached; raise the cap to get the rest.");
+                            } else {
+                                result.put("truncated", false);
+                            }
+                        }
+                        resultData.set(result);
                         success = true;
                     } else {
                         errorMsg.set("Disassembly failed: " + cmd.getStatusMsg());
@@ -3219,9 +3588,23 @@ public class FunctionService {
         return Response.err("Unknown failure");
     }
 
+    /**
+     * Back-compat overloads for callers that don't care about the
+     * include_instructions / max_instructions options added for issue #205.
+     * Default to the new behavior (instructions included, 1000-instruction cap)
+     * so the headless and registry paths surface the same data as the MCP
+     * endpoint.
+     */
     public Response disassembleBytes(String startAddress, String endAddress, Integer length,
                                    boolean restrictToExecuteMemory) {
-        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory, null);
+        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory,
+                                true, 1000, null);
+    }
+
+    public Response disassembleBytes(String startAddress, String endAddress, Integer length,
+                                   boolean restrictToExecuteMemory, String programName) {
+        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory,
+                                true, 1000, programName);
     }
 
     // ========================================================================
