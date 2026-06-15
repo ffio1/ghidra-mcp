@@ -5,12 +5,17 @@ import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.lang.OperandType;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.*;
 import ghidra.util.Msg;
 
 import java.util.*;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -1153,6 +1158,662 @@ public class ListingService {
                 "ptr_size", ptrSize,
                 "slots", slots
         ));
+    }
+
+    @McpTool(path = "/get_call_site_constants", description = "For a function, extract each CALL site's constant-argument fingerprint: the callee (direct target name, an indirect vtable 'slot:0xNN', or 'reg:NAME'), and the forwarded x86-32 PUSH-chain arguments as signed integer constants or placeholders ('reg:NAME'/'mem'). The constant vector is a compiler-invariant fingerprint that disambiguates sibling wrappers across the clang/MSVC gap (e.g. operator new forwards 1,0,-1,0 with hint|0x400 vs _Malloc 5,0,-1,0). Pair with the Mac build to recover a misnamed wrapper's real name (see /re-id-function). Read-only.", category = "listing")
+    public Response getCallSiteConstants(
+            @Param(value = "function_address", description = "Address within the target function (hex)") String addressStr,
+            @Param(value = "max_args", description = "Max PUSH args to capture per call site", defaultValue = "12") int maxArgs,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address addr = ServiceUtils.parseAddress(program, addressStr);
+        if (addr == null) return Response.err("Invalid address: " + ServiceUtils.getLastParseError());
+        FunctionManager funcMgr = program.getFunctionManager();
+        Function fn = funcMgr.getFunctionContaining(addr);
+        if (fn == null) return Response.err("No function containing " + addressStr);
+
+        Listing listing = program.getListing();
+        List<Instruction> insns = new ArrayList<>();
+        InstructionIterator iit = listing.getInstructions(fn.getBody(), true);
+        while (iit.hasNext()) insns.add(iit.next());
+
+        List<Map<String, Object>> sites = extractCallSites(funcMgr, insns, maxArgs);
+
+        return Response.ok(JsonHelper.mapOf(
+                "function", fn.getName(true),
+                "entry", fn.getEntryPoint().toString(false),
+                "call_sites", sites
+        ));
+    }
+
+    /**
+     * Shared call-site extraction used by {@code get_call_site_constants} and
+     * {@code get_function_fingerprint}. For each CALL in {@code insns}, resolves the callee
+     * (direct name / vtable "slot:0xNN via REG" / "reg:NAME") and walks the preceding PUSH
+     * chain to recover the forwarded constant-argument vector. The returned per-site maps
+     * carry {@code address}, {@code kind}, {@code callee}, {@code const_vector}, and {@code args}.
+     * Compiler-invariant fingerprint logic — keep identical to the inlined original.
+     */
+    private List<Map<String, Object>> extractCallSites(FunctionManager funcMgr,
+            List<Instruction> insns, int maxArgs) {
+        List<Map<String, Object>> sites = new ArrayList<>();
+        for (int i = 0; i < insns.size(); i++) {
+            Instruction call = insns.get(i);
+            if (!"CALL".equalsIgnoreCase(call.getMnemonicString())) continue;
+
+            // resolve callee
+            String kind, callee;
+            int ot0 = call.getNumOperands() > 0 ? call.getOperandType(0) : 0;
+            Address tgt = null;
+            for (Reference r : call.getReferencesFrom()) {
+                if (r.getReferenceType().isCall()) { tgt = r.getToAddress(); break; }
+            }
+            if ((ot0 & OperandType.DYNAMIC) != 0) {
+                long disp = 0; String base = null;
+                for (Object o : call.getOpObjects(0)) {
+                    if (o instanceof Scalar) disp = ((Scalar) o).getValue();
+                    else if (o instanceof Register) base = ((Register) o).getName();
+                }
+                kind = "vtable-slot";
+                callee = "slot:0x" + Long.toHexString(disp) + (base != null ? " via " + base : "");
+            } else if (tgt != null) {
+                Function tf = funcMgr.getFunctionAt(tgt);
+                kind = "direct";
+                callee = tf != null ? tf.getName(true) : tgt.toString(false);
+            } else if ((ot0 & OperandType.REGISTER) != 0) {
+                String base = null;
+                for (Object o : call.getOpObjects(0)) if (o instanceof Register) base = ((Register) o).getName();
+                // Backtrace the call register: `CALL EDX` where EDX <- MOV EDX,[ECX+disp]
+                // is a virtual dispatch through vtable slot 0xdisp. Recover it.
+                String resolved = resolveReg(insns, i, base, 5);
+                Matcher mm = MEM_PAT.matcher(resolved);
+                if (mm.matches()) {
+                    String viaReg = mm.group(1);
+                    long disp = mm.group(2) == null ? 0 : Long.parseLong(mm.group(2), 16);
+                    kind = "vtable-slot";
+                    callee = "slot:0x" + Long.toHexString(disp) + " via " + viaReg;
+                } else {
+                    kind = "indirect-reg";
+                    callee = resolved.startsWith("reg:") ? resolved : "reg:" + base + " (" + resolved + ")";
+                }
+            } else {
+                kind = "unknown";
+                callee = call.getNumOperands() > 0 ? call.getDefaultOperandRepresentation(0) : "?";
+            }
+
+            // walk back collecting PUSH args until the previous CALL (PUSH is right-to-left)
+            List<String> args = new ArrayList<>();
+            List<String> consts = new ArrayList<>();
+            for (int j = i - 1; j >= 0 && args.size() < maxArgs; j--) {
+                Instruction p = insns.get(j);
+                String pm = p.getMnemonicString();
+                if ("CALL".equalsIgnoreCase(pm)) break;
+                if (!"PUSH".equalsIgnoreCase(pm)) continue;
+                int pt = p.getNumOperands() > 0 ? p.getOperandType(0) : 0;
+                if ((pt & OperandType.SCALAR) != 0 && (pt & OperandType.DYNAMIC) == 0) {
+                    Scalar sc = null;
+                    for (Object o : p.getOpObjects(0)) if (o instanceof Scalar) sc = (Scalar) o;
+                    String v = sc != null ? Long.toString(sc.getSignedValue()) : "?";
+                    args.add(v); consts.add(v);
+                } else if ((pt & OperandType.REGISTER) != 0 && (pt & OperandType.DYNAMIC) == 0) {
+                    String rn = null;
+                    for (Object o : p.getOpObjects(0)) if (o instanceof Register) rn = ((Register) o).getName();
+                    // Backtrace the pushed register to its symbolic source:
+                    // LEA -> &[mem], MOV-from-mem -> [mem] (+ folded |0xN hint), MOV-imm -> scalar.
+                    args.add(resolveReg(insns, j, rn, 6));
+                } else if ((pt & OperandType.DYNAMIC) != 0) {
+                    String mr = opMem(p, 0);
+                    args.add(mr + scanImmArith(insns, j, mr));
+                } else {
+                    args.add("mem");
+                }
+            }
+            // walk was right-to-left (nearest-the-call PUSH = arg1), so the lists are
+            // already in C-argument order (arg1 first) — matches the documented
+            // operator-new fingerprint 1,0,-1,0. Do NOT reverse.
+
+            Map<String, Object> site = new LinkedHashMap<>();
+            site.put("address", call.getAddress().toString(false));
+            site.put("kind", kind);
+            site.put("callee", callee);
+            site.put("const_vector", String.join(",", consts));
+            site.put("args", args);
+            sites.add(site);
+        }
+        return sites;
+    }
+
+    @McpTool(path = "/get_function_fingerprint", description = "Compute a compact cross-build comparison vector for one function: {entry, name, size, retType, paramCount, callingConvention, strings (referenced literals), directCallees (named call targets), vtableSlotsCalled (indirect-call displacements like '+0xb4 via EDX'), constVectors (forwarded PUSH constant vectors per call site — same extraction as get_call_site_constants), fieldOffsets (ordered distinct this/ECX+0xNN access offsets)}. This is the shared primitive for cross-build function matching (/re-cross-twin, /re-id-function, /re-class-port). Read-only.", category = "listing")
+    public Response getFunctionFingerprint(
+            @Param(value = "function_address", description = "Address within the target function (hex)") String addressStr,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address addr = ServiceUtils.parseAddress(program, addressStr);
+        if (addr == null) return Response.err("Invalid address: " + ServiceUtils.getLastParseError());
+        FunctionManager funcMgr = program.getFunctionManager();
+        Function fn = funcMgr.getFunctionContaining(addr);
+        if (fn == null) return Response.err("No function containing " + addressStr);
+
+        Listing listing = program.getListing();
+        ghidra.program.model.symbol.ReferenceManager refMgr = program.getReferenceManager();
+
+        List<Instruction> insns = new ArrayList<>();
+        InstructionIterator iit = listing.getInstructions(fn.getBody(), true);
+        while (iit.hasNext()) insns.add(iit.next());
+
+        // Referenced string literals (data references whose target is string data).
+        List<String> strings = new ArrayList<>();
+        // Distinct this/ECX +0xNN field-access offsets, in first-seen order.
+        List<String> fieldOffsets = new ArrayList<>();
+        Set<String> seenOffsets = new LinkedHashSet<>();
+        for (Instruction insn : insns) {
+            for (Reference r : insn.getReferencesFrom()) {
+                if (!r.getReferenceType().isData()) continue;
+                Data d = listing.getDataAt(r.getToAddress());
+                if (d != null && ServiceUtils.isStringData(d)) {
+                    String v = d.getValue() != null ? d.getValue().toString() : "";
+                    if (!v.isEmpty() && !strings.contains(v)) strings.add(v);
+                }
+            }
+            // Field access through ECX/this: any operand rendered as "[ECX + 0xNN]".
+            for (int op = 0; op < insn.getNumOperands(); op++) {
+                if ((insn.getOperandType(op) & OperandType.DYNAMIC) == 0) continue;
+                Matcher fm = FIELD_PAT.matcher(opMem(insn, op));
+                if (fm.matches()) {
+                    String off = "+0x" + (fm.group(1) == null ? "0" : fm.group(1).toLowerCase());
+                    if (seenOffsets.add(off)) fieldOffsets.add(off);
+                }
+            }
+        }
+
+        // Call sites: split into named direct callees, indirect vtable-slot calls, and const vectors.
+        List<Map<String, Object>> sites = extractCallSites(funcMgr, insns, 12);
+        List<String> directCallees = new ArrayList<>();
+        List<String> vtableSlotsCalled = new ArrayList<>();
+        List<String> constVectors = new ArrayList<>();
+        for (Map<String, Object> site : sites) {
+            String kind = (String) site.get("kind");
+            String callee = (String) site.get("callee");
+            String cv = (String) site.get("const_vector");
+            if (cv != null && !cv.isEmpty() && !constVectors.contains(cv)) constVectors.add(cv);
+            if ("direct".equals(kind)) {
+                if (callee != null && !callee.startsWith("FUN_") && !directCallees.contains(callee)) {
+                    directCallees.add(callee);
+                }
+            } else if ("vtable-slot".equals(kind)) {
+                // Normalize "slot:0x4 via EDX" -> "+0x4 via EDX" for cross-build comparison.
+                String norm = callee != null ? callee.replaceFirst("^slot:0x", "+0x") : callee;
+                if (norm != null && !vtableSlotsCalled.contains(norm)) vtableSlotsCalled.add(norm);
+            }
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("entry", fn.getEntryPoint().toString(false));
+        result.put("name", fn.getName(true));
+        result.put("size", fn.getBody().getNumAddresses());
+        result.put("retType", fn.getReturnType() != null ? fn.getReturnType().getDisplayName() : "undefined");
+        result.put("paramCount", fn.getParameterCount());
+        String cc;
+        try { cc = fn.getCallingConventionName(); } catch (Exception e) { cc = null; }
+        result.put("callingConvention", cc);
+        result.put("strings", strings);
+        result.put("directCallees", directCallees);
+        result.put("vtableSlotsCalled", vtableSlotsCalled);
+        result.put("constVectors", constVectors);
+        result.put("fieldOffsets", fieldOffsets);
+        return Response.ok(result);
+    }
+
+    // Matches "[ECX + 0xNN]" / "[ECX]" — the 'this' field-access pattern. The base register
+    // (ECX/RCX/this) is non-capturing; group(1) = the hex offset (null when the access is [ECX]).
+    private static final Pattern FIELD_PAT =
+            Pattern.compile("\\[(?:ECX|RCX|this)(?:\\s*\\+\\s*0x([0-9a-fA-F]+))?\\]",
+                    Pattern.CASE_INSENSITIVE);
+
+    @McpTool(path = "/get_class_layout_signature", description = "Compute a class's destructor-derived LAYOUT fingerprint for cross-build layout matching: {class_name, dtorAddr, opDeleteSize (size immediate passed to operator delete / the scalar-deleting destructor), baseChain (first super-dtor call target name(s)), memberFreeOffsets (this+0xNN offsets that get a refcount-release vtable call or a buffer free in the dtor), memberCount (from the class namespace), highestMemberOffset (largest this+0xNN write seen)}. Locates the scalar-deleting / D1 destructor by name within the class namespace. Powers /re-layout-invariance (the client compares two signatures). Read-only.", category = "listing")
+    public Response getClassLayoutSignature(
+            @Param(value = "class_name", description = "C++ class / namespace name, e.g. 'efd::DataStore'") String className,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        if (className == null || className.trim().isEmpty()) return Response.err("class_name is required");
+        final String cls = className.trim();
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        SymbolTable st = program.getSymbolTable();
+        Namespace global = program.getGlobalNamespace();
+        Namespace classNs = st.getNamespace(cls, global);
+        if (classNs == null || classNs.isGlobal()) {
+            return Response.err("No namespace named '" + cls + "'. Use list_classes to find the exact class name.");
+        }
+
+        FunctionManager funcMgr = program.getFunctionManager();
+        Listing listing = program.getListing();
+
+        // Collect the class's member functions; find the destructor (scalar-deleting / D1).
+        int memberCount = 0;
+        Function dtor = null;
+        for (Symbol sym : st.getSymbols(classNs)) {
+            Function f = funcMgr.getFunctionAt(sym.getAddress());
+            if (f == null || !classNs.equals(f.getParentNamespace())) continue;
+            memberCount++;
+            String n = f.getName();
+            // Prefer a name that looks like a destructor; tolerate Ghidra/Itanium spellings.
+            if (dtor == null && isDestructorName(n, cls)) dtor = f;
+        }
+        if (dtor == null) {
+            // Second pass: a member literally named like the class with a leading '~'.
+            for (Symbol sym : st.getSymbols(classNs)) {
+                Function f = funcMgr.getFunctionAt(sym.getAddress());
+                if (f == null) continue;
+                if (f.getName().contains("~") || f.getName().toLowerCase().contains("destructor")) { dtor = f; break; }
+            }
+        }
+        if (dtor == null) {
+            return Response.err("No destructor found in class '" + cls + "'. Looked for ~" + cls
+                    + " / *destructor* / scalar_deleting_destructor in the class namespace.");
+        }
+
+        List<Instruction> insns = new ArrayList<>();
+        InstructionIterator iit = listing.getInstructions(dtor.getBody(), true);
+        while (iit.hasNext()) insns.add(iit.next());
+
+        // opDeleteSize: the size immediate forwarded to operator delete. In MSVC the scalar-deleting
+        // destructor does `PUSH <size>` then calls operator delete; capture the constant pushed
+        // nearest a call whose target name mentions "delete"/"free". Fallback: any size near such a call.
+        Long opDeleteSize = null;
+        List<String> baseChain = new ArrayList<>();
+        List<String> memberFreeOffsets = new ArrayList<>();
+        Set<String> seenFree = new LinkedHashSet<>();
+        long highestMemberOffset = -1;
+
+        for (int i = 0; i < insns.size(); i++) {
+            Instruction insn = insns.get(i);
+            String mn = insn.getMnemonicString();
+
+            // Track this+0xNN writes for highestMemberOffset and member-free offset capture.
+            if (insn.getNumOperands() >= 1 && (insn.getOperandType(0) & OperandType.DYNAMIC) != 0) {
+                Matcher fm = FIELD_PAT.matcher(opMem(insn, 0));
+                if (fm.matches() && fm.group(1) != null) {
+                    long off = Long.parseLong(fm.group(1), 16);
+                    if (off > highestMemberOffset) highestMemberOffset = off;
+                }
+            }
+
+            if (!"CALL".equalsIgnoreCase(mn)) continue;
+            Address tgt = null;
+            for (Reference r : insn.getReferencesFrom()) {
+                if (r.getReferenceType().isCall()) { tgt = r.getToAddress(); break; }
+            }
+            Function tf = tgt != null ? funcMgr.getFunctionAt(tgt) : null;
+            String tname = tf != null ? tf.getName(true) : null;
+            String lname = tname != null ? tname.toLowerCase() : "";
+
+            // operator delete / free: capture the size immediate pushed for this call.
+            if (lname.contains("delete") || lname.equals("free") || lname.endsWith("::free")
+                    || lname.contains("operator.delete")) {
+                Long sz = nearestPushedScalar(insns, i);
+                if (sz != null && opDeleteSize == null) opDeleteSize = sz;
+            }
+
+            // Base-class chain: a CALL to another class's destructor.
+            if (tf != null && isDestructorName(tf.getName(), tf.getParentNamespace() != null
+                    ? tf.getParentNamespace().getName() : "")) {
+                if (!baseChain.contains(tname)) baseChain.add(tname);
+            }
+
+            // Member-free / refcount-release: a vtable-slot call or free dispatched on this+0xNN.
+            // The freed member is the ECX/this offset loaded just before the call.
+            String memOff = memberOffsetBeforeCall(insns, i);
+            if (memOff != null && (isDestructorName(tname, "") || lname.contains("release")
+                    || lname.contains("free") || lname.contains("delete") || lname.contains("decref")
+                    || lname.contains("removeref") || (tname == null && memOff != null))) {
+                if (seenFree.add(memOff)) memberFreeOffsets.add(memOff);
+            }
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("class_name", cls);
+        result.put("dtorAddr", dtor.getEntryPoint().toString(false));
+        result.put("opDeleteSize", opDeleteSize);
+        result.put("baseChain", baseChain);
+        result.put("memberFreeOffsets", memberFreeOffsets);
+        result.put("memberCount", memberCount);
+        result.put("highestMemberOffset", highestMemberOffset >= 0 ? "+0x" + Long.toHexString(highestMemberOffset) : null);
+        return Response.ok(result);
+    }
+
+    /** Heuristic: does {@code fnName} look like a destructor for class {@code cls}? */
+    private static boolean isDestructorName(String fnName, String cls) {
+        if (fnName == null) return false;
+        String n = fnName;
+        if (n.contains("~")) return true;
+        String lower = n.toLowerCase();
+        if (lower.contains("destructor")) return true;          // scalar_deleting_destructor, ~Class_destructor
+        if (lower.contains("_dtor") || lower.endsWith("dtor")) return true;
+        // Itanium-style D0/D1/D2 complete/deleting destructors sometimes survive as suffixes.
+        if (n.endsWith("D0Ev") || n.endsWith("D1Ev") || n.endsWith("D2Ev")) return true;
+        return false;
+    }
+
+    /**
+     * Walk back from a CALL at {@code callIdx} for the nearest PUSH of an immediate scalar
+     * (the operator-delete size argument). Stops at the previous CALL. Returns null if none.
+     */
+    private Long nearestPushedScalar(List<Instruction> insns, int callIdx) {
+        for (int j = callIdx - 1; j >= 0; j--) {
+            Instruction p = insns.get(j);
+            String pm = p.getMnemonicString();
+            if ("CALL".equalsIgnoreCase(pm)) break;
+            if (!"PUSH".equalsIgnoreCase(pm)) continue;
+            int pt = p.getNumOperands() > 0 ? p.getOperandType(0) : 0;
+            if ((pt & OperandType.SCALAR) != 0 && (pt & OperandType.DYNAMIC) == 0) {
+                Scalar sc = firstScalar(p.getOpObjects(0));
+                if (sc != null) return sc.getValue();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * If the dispatch register for the CALL at {@code callIdx} (or a nearby ECX setup) was loaded
+     * from {@code [ECX + 0xNN]} / {@code [this + 0xNN]}, return "+0xNN"; else null. Used to attribute
+     * a member-release/free call to the owning field offset.
+     */
+    private String memberOffsetBeforeCall(List<Instruction> insns, int callIdx) {
+        for (int j = callIdx; j >= 0 && j >= callIdx - 8; j--) {
+            Instruction p = insns.get(j);
+            String m = p.getMnemonicString();
+            if (j != callIdx && "CALL".equalsIgnoreCase(m)) break;
+            // Look for a MOV/LEA whose memory operand is [ECX/this + 0xNN].
+            for (int op = 0; op < p.getNumOperands(); op++) {
+                if ((p.getOperandType(op) & OperandType.DYNAMIC) == 0) continue;
+                Matcher fm = FIELD_PAT.matcher(opMem(p, op));
+                if (fm.matches() && fm.group(1) != null) {
+                    return "+0x" + fm.group(1).toLowerCase();
+                }
+            }
+        }
+        return null;
+    }
+
+    @McpTool(path = "/get_vtable_slot_target", description = "Resolve a single vtable slot to the named function it points to. Accepts a vtable ADDRESS or a class name (resolves the class's vtable label '<class>::vftable' / '<class>_vtable'), and a slot given as a byte offset ('0xfc') or a slot index ('5'). Returns {vtable_address, slot_index, slot_offset, pointer, name}. Thin convenience over the same per-slot read as get_vtable_at (overlaps get_vtable_at, which dumps ALL slots). Read-only.", category = "listing")
+    public Response getVtableSlotTarget(
+            @Param(value = "class_or_vtable", description = "A vtable address (hex) OR a class name to resolve its vftable") String classOrVtable,
+            @Param(value = "slot_offset", description = "Byte offset like '0xfc' or a slot index like '5'") String slotOffsetStr,
+            @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        if (classOrVtable == null || classOrVtable.trim().isEmpty()) return Response.err("class_or_vtable is required");
+        if (slotOffsetStr == null || slotOffsetStr.trim().isEmpty()) return Response.err("slot_offset is required");
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        int ptrSize = program.getDefaultPointerSize();
+        if (ptrSize != 4 && ptrSize != 8) return Response.err("Unsupported pointer size: " + ptrSize);
+
+        // Resolve the vtable base: try as an address first, else as a class name.
+        Address vtableAddr = ServiceUtils.parseAddress(program, classOrVtable.trim());
+        String resolvedVia = "address";
+        if (vtableAddr == null) {
+            vtableAddr = resolveVtableByClassName(program, classOrVtable.trim());
+            resolvedVia = "class-name";
+            if (vtableAddr == null) {
+                return Response.err("Could not resolve '" + classOrVtable + "' as a vtable address or a "
+                        + "class vftable symbol. Tried labels '" + classOrVtable.trim() + "::vftable', '"
+                        + classOrVtable.trim() + "_vtable', and similar.");
+            }
+        }
+
+        // slot_offset: a byte offset ("0x..", or a value that is a multiple of ptrSize) vs a slot index.
+        String so = slotOffsetStr.trim();
+        long slotIndex;
+        long byteOffset;
+        boolean hex = so.toLowerCase().startsWith("0x");
+        long raw;
+        try {
+            raw = hex ? Long.parseLong(so.substring(2), 16) : Long.parseLong(so);
+        } catch (NumberFormatException e) {
+            return Response.err("Invalid slot_offset '" + slotOffsetStr + "': expected hex byte offset (0xNN) or decimal slot index");
+        }
+        // A hex value, or any value that is a nonzero multiple of the pointer size, is a byte offset;
+        // otherwise treat as a slot index. (Index 0 / small decimals -> index.)
+        if (hex || (raw != 0 && raw % ptrSize == 0 && raw >= ptrSize)) {
+            byteOffset = raw;
+            slotIndex = raw / ptrSize;
+        } else {
+            slotIndex = raw;
+            byteOffset = raw * ptrSize;
+        }
+
+        ghidra.program.model.mem.Memory memory = program.getMemory();
+        FunctionManager funcMgr = program.getFunctionManager();
+        try {
+            Address slotAddr = vtableAddr.add(byteOffset);
+            long fnPtr = (ptrSize == 4) ? (memory.getInt(slotAddr) & 0xFFFFFFFFL) : memory.getLong(slotAddr);
+            Address fnAddr = program.getAddressFactory().getDefaultAddressSpace().getAddress(fnPtr);
+            Function fn = funcMgr.getFunctionAt(fnAddr);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("vtable_address", vtableAddr.toString(false));
+            result.put("resolved_via", resolvedVia);
+            result.put("slot_index", slotIndex);
+            result.put("slot_offset", "0x" + Long.toHexString(byteOffset));
+            result.put("pointer", String.format("%08x", fnPtr));
+            result.put("name", fn != null ? fn.getName(true) : "(no function)");
+            return Response.ok(result);
+        } catch (Exception e) {
+            return Response.err("Failed to read slot at offset 0x" + Long.toHexString(byteOffset)
+                    + " of vtable " + vtableAddr.toString(false) + ": " + e.getMessage()
+                    + " (slot may be past the table end or in unmapped memory)");
+        }
+    }
+
+    /** Resolve a class's vtable base address from common vftable label spellings. */
+    private Address resolveVtableByClassName(Program program, String className) {
+        SymbolTable st = program.getSymbolTable();
+        // Candidate flat label spellings, most-specific first.
+        String[] flat = {
+            className + "::vftable", className + "::vtable", className + "_vtable",
+            className + "_vftable", "vtable_" + className, className + "Vtbl"
+        };
+        for (String label : flat) {
+            for (Symbol s : st.getGlobalSymbols(label)) {
+                if (s.getAddress() != null && s.getAddress().isMemoryAddress()) return s.getAddress();
+            }
+        }
+        // Namespaced: a symbol named 'vftable'/'vtable' inside the class namespace.
+        Namespace ns = st.getNamespace(className, program.getGlobalNamespace());
+        if (ns != null && !ns.isGlobal()) {
+            for (Symbol s : st.getSymbols(ns)) {
+                String n = s.getName();
+                if ("vftable".equalsIgnoreCase(n) || "vtable".equalsIgnoreCase(n) || n.endsWith("vftable")) {
+                    if (s.getAddress() != null && s.getAddress().isMemoryAddress()) return s.getAddress();
+                }
+            }
+        }
+        return null;
+    }
+
+    @McpTool(path = "/rename_class", method = "POST", description = "Atomically rename a C++ class: (a) the namespace symbol 'old_name' (which re-parents all member functions) AND (b) the this-type struct DataType '/old_name' if it exists. ABORTS if a namespace OR datatype named 'new_name' already exists (no blind merge). Returns {renamed_namespace, members_reparented, renamed_datatype, struct_size}. Runs in a transaction.", category = "rename")
+    public Response renameClass(
+            @Param(value = "old_name", source = ParamSource.BODY, description = "Existing class name") String oldName,
+            @Param(value = "new_name", source = ParamSource.BODY, description = "New class name") String newName,
+            @Param(value = "program", defaultValue = "") String programName) {
+        if (oldName == null || oldName.trim().isEmpty()) return Response.err("old_name is required");
+        if (newName == null || newName.trim().isEmpty()) return Response.err("new_name is required");
+        final String oldN = oldName.trim();
+        final String newN = newName.trim();
+        if (oldN.equals(newN)) return Response.err("old_name and new_name are identical");
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        SymbolTable st = program.getSymbolTable();
+        Namespace global = program.getGlobalNamespace();
+        DataTypeManager dtm = program.getDataTypeManager();
+
+        // Locate the source namespace and/or datatype — at least one must exist.
+        Namespace oldNs = st.getNamespace(oldN, global);
+        if (oldNs != null && oldNs.isGlobal()) oldNs = null;
+        DataType oldDt = ServiceUtils.findDataTypeByNameInAllCategories(dtm, oldN);
+        if (oldNs == null && oldDt == null) {
+            return Response.err("Neither a namespace nor a datatype named '" + oldN + "' exists.");
+        }
+
+        // Guard: refuse to merge into an existing target (namespace OR datatype).
+        Namespace existingNs = st.getNamespace(newN, global);
+        if (existingNs != null && !existingNs.isGlobal()) {
+            return Response.err("A namespace named '" + newN + "' already exists — refusing to merge. "
+                    + "Choose a different new_name or merge manually.");
+        }
+        if (ServiceUtils.findDataTypeByNameInAllCategories(dtm, newN) != null) {
+            return Response.err("A datatype named '" + newN + "' already exists — refusing to merge. "
+                    + "Choose a different new_name or merge manually.");
+        }
+
+        boolean renamedNs = false;
+        boolean renamedDt = false;
+        int membersReparented = 0;
+        Integer structSize = null;
+
+        int tx = program.startTransaction("Rename class " + oldN + " -> " + newN);
+        boolean commit = false;
+        try {
+            if (oldNs != null) {
+                // Count members BEFORE rename (they follow the namespace symbol automatically).
+                FunctionManager funcMgr = program.getFunctionManager();
+                for (Symbol s : st.getSymbols(oldNs)) {
+                    Function f = funcMgr.getFunctionAt(s.getAddress());
+                    if (f != null && oldNs.equals(f.getParentNamespace())) membersReparented++;
+                }
+                oldNs.getSymbol().setName(newN, SourceType.USER_DEFINED);
+                renamedNs = true;
+            }
+            if (oldDt != null) {
+                if (oldDt instanceof ghidra.program.model.data.Structure) {
+                    structSize = ((ghidra.program.model.data.Structure) oldDt).getLength();
+                }
+                oldDt.setName(newN);
+                renamedDt = true;
+            }
+            commit = true;
+        } catch (Exception e) {
+            return Response.err("rename_class failed: " + e.getMessage());
+        } finally {
+            // Commit on success, roll back on any failure (both the catch path and any
+            // exception thrown while the catch's Response is built).
+            program.endTransaction(tx, commit);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("renamed_namespace", renamedNs);
+        result.put("members_reparented", membersReparented);
+        result.put("renamed_datatype", renamedDt);
+        result.put("struct_size", structSize);
+        return Response.ok(result);
+    }
+
+    // Matches a memory reference like "[EDX + 0x4]" or "[ECX]" (positive displacement only;
+    // vtable slot offsets are non-negative). group(1)=base register, group(2)=hex displacement.
+    private static final Pattern MEM_PAT =
+            Pattern.compile("\\[([A-Za-z0-9]+)(?:\\s*\\+\\s*0x([0-9a-fA-F]+))?\\]");
+
+    /**
+     * Backward dataflow: what does {@code reg} hold at instruction index {@code useIdx}?
+     * Scans upward within the function for the nearest writer of {@code reg} and renders it
+     * symbolically — {@code &[mem]} for LEA, {@code [mem](+|0xN)} for a MOV-from-memory whose
+     * source was OR/AND/etc. with an immediate, a signed scalar for MOV-imm, or follows a
+     * MOV reg,reg2 alias. Falls back to {@code reg:NAME} when the source can't be resolved.
+     */
+    private String resolveReg(List<Instruction> insns, int useIdx, String reg, int budget) {
+        if (reg == null || budget <= 0) return "reg:" + reg;
+        for (int j = useIdx - 1; j >= 0; j--) {
+            Instruction p = insns.get(j);
+            String m = p.getMnemonicString();
+            if ("CALL".equalsIgnoreCase(m)) break; // a call clobbers volatile regs — stop
+            if (p.getNumOperands() < 1) continue;
+            int t0 = p.getOperandType(0);
+            boolean op0IsReg = (t0 & OperandType.REGISTER) != 0 && (t0 & OperandType.DYNAMIC) == 0;
+            if (!op0IsReg) continue;
+            Register dst = firstReg(p.getOpObjects(0));
+            if (dst == null || !dst.getName().equalsIgnoreCase(reg)) continue;
+            // p defines reg
+            if ("LEA".equalsIgnoreCase(m)) {
+                return "&" + opMem(p, 1);
+            }
+            if ("MOV".equalsIgnoreCase(m)) {
+                int t1 = p.getNumOperands() > 1 ? p.getOperandType(1) : 0;
+                if ((t1 & OperandType.SCALAR) != 0 && (t1 & OperandType.DYNAMIC) == 0) {
+                    Scalar s = firstScalar(p.getOpObjects(1));
+                    return s != null ? Long.toString(s.getSignedValue()) : "reg:" + reg;
+                } else if ((t1 & OperandType.DYNAMIC) != 0) {
+                    String mr = opMem(p, 1);
+                    return mr + scanImmArith(insns, j, mr);
+                } else if ((t1 & OperandType.REGISTER) != 0) {
+                    Register src = firstReg(p.getOpObjects(1));
+                    if (src == null) return "reg:" + reg;
+                    return resolveReg(insns, j, src.getName(), budget - 1);
+                }
+                return "reg:" + reg;
+            }
+            return "reg:" + reg; // ADD/SUB/XOR/POP/... — don't fabricate a value
+        }
+        return "reg:" + reg;
+    }
+
+    /** Render a memory operand as "[base + disp]", stripping any "dword ptr" size prefix. */
+    private String opMem(Instruction p, int opIdx) {
+        String rep = p.getDefaultOperandRepresentation(opIdx);
+        if (rep == null) return "mem";
+        int b = rep.indexOf('[');
+        return b >= 0 ? rep.substring(b) : rep;
+    }
+
+    /**
+     * Scan upward from {@code defIdx} for the nearest immediate arithmetic/logic op that wrote
+     * the same memory location {@code memStr} (e.g. {@code OR [EBP+0xc],0x400}), and return a
+     * compact annotation like "|0x400". Returns "" if the value was last set by a plain MOV or
+     * nothing matched. Folds the operator-new hint bit into the forwarded flags argument.
+     */
+    private String scanImmArith(List<Instruction> insns, int defIdx, String memStr) {
+        if (memStr == null || !memStr.startsWith("[")) return "";
+        for (int j = defIdx - 1; j >= 0; j--) {
+            Instruction p = insns.get(j);
+            if (p.getNumOperands() < 2) continue;
+            int t0 = p.getOperandType(0);
+            if ((t0 & OperandType.DYNAMIC) == 0) continue;
+            if (!memStr.equals(opMem(p, 0))) continue;
+            Scalar s = firstScalar(p.getOpObjects(1));
+            if (s == null) return ""; // wrote mem from a non-immediate — stop, can't fold
+            String v = "0x" + Long.toHexString(s.getValue());
+            switch (p.getMnemonicString().toUpperCase()) {
+                case "OR":  return "|" + v;
+                case "AND": return "&" + v;
+                case "ADD": return "+" + v;
+                case "SUB": return "-" + v;
+                case "XOR": return "^" + v;
+                default:    return ""; // MOV/other replaced the value — no fold
+            }
+        }
+        return "";
+    }
+
+    private static Register firstReg(Object[] objs) {
+        if (objs == null) return null;
+        for (Object o : objs) if (o instanceof Register) return (Register) o;
+        return null;
+    }
+
+    private static Scalar firstScalar(Object[] objs) {
+        if (objs == null) return null;
+        for (Object o : objs) if (o instanceof Scalar) return (Scalar) o;
+        return null;
     }
 
     @McpTool(path = "/find_functions_referencing_string", description = "Find all functions that reference strings matching a regex pattern. Returns function name, address, and the matching string(s). Fast path to naming functions by their log/error messages.", category = "listing")

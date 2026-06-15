@@ -1,7 +1,7 @@
 {
   "version": "5.13.1",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 249,
+  "total_endpoints": 254,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -1133,6 +1133,27 @@
       "description": "Get xrefs for multiple addresses"
     },
     {
+      "path": "/get_call_site_constants",
+      "method": "GET",
+      "category": "getter",
+      "params": [
+        "function_address",
+        "max_args",
+        "program"
+      ],
+      "description": "For each CALL site in a function, extract the callee (direct name, vtable 'slot:0xNN via REG', or 'reg:NAME') and the forwarded x86-32 PUSH-chain constant-arg vector - a compiler-invariant fingerprint for matching misnamed wrappers to the Mac build (/re-id-function). Read-only. Parity fixture: function_address=0x8f9d40 on Rocksmith2014_dump.exe -> dominant call 'slot:0x4 via EDX' with const_vector '1,0,-1,0'."
+    },
+    {
+      "path": "/get_class_layout_signature",
+      "method": "GET",
+      "category": "getter",
+      "params": [
+        "class_name",
+        "program"
+      ],
+      "description": "Compute a class's destructor-derived LAYOUT fingerprint for cross-build layout matching: {class_name, dtorAddr, opDeleteSize (size immediate passed to operator delete / scalar-deleting destructor), baseChain (first super-dtor call target name(s)), memberFreeOffsets (this+0xNN offsets freed/refcount-released in the dtor), memberCount (from the class namespace), highestMemberOffset (largest this+0xNN write seen)}. Locates the scalar-deleting / D1 destructor by name within the class namespace. Powers /re-layout-invariance. Read-only."
+    },
+    {
       "path": "/get_current_address",
       "method": "GET",
       "category": "getter",
@@ -1292,6 +1313,16 @@
         "program"
       ],
       "description": "Export function documentation"
+    },
+    {
+      "path": "/get_function_fingerprint",
+      "method": "GET",
+      "category": "getter",
+      "params": [
+        "function_address",
+        "program"
+      ],
+      "description": "Compute a compact cross-build comparison vector for one function: {entry, name, size, retType, paramCount, callingConvention, strings, directCallees, vtableSlotsCalled (indirect-call displacements like '+0xb4 via EDX'), constVectors (forwarded PUSH constant vectors per call site, same extraction as get_call_site_constants), fieldOffsets (ordered distinct this/ECX+0xNN access offsets)}. Shared primitive for cross-build function matching (/re-cross-twin, /re-id-function, /re-class-port). Read-only."
     },
     {
       "path": "/get_function_hash",
@@ -1458,6 +1489,17 @@
       "category": "utility",
       "params": [],
       "description": "Get plugin version"
+    },
+    {
+      "path": "/get_vtable_slot_target",
+      "method": "GET",
+      "category": "getter",
+      "params": [
+        "class_or_vtable",
+        "slot_offset",
+        "program"
+      ],
+      "description": "Resolve a single vtable slot to the named function it points to. Accepts a vtable ADDRESS or a class name (resolves '<class>::vftable' / '<class>_vtable'), and a slot as a byte offset ('0xfc') or slot index ('5'). Returns {vtable_address, slot_index, slot_offset, pointer, name}. Thin convenience over the same per-slot read as get_vtable_at (which dumps ALL slots). Read-only."
     },
     {
       "path": "/get_xrefs_from",
@@ -1981,6 +2023,17 @@
         "program"
       ],
       "description": "Remove struct field"
+    },
+    {
+      "path": "/rename_class",
+      "method": "POST",
+      "category": "rename",
+      "params": [
+        "old_name",
+        "new_name",
+        "program"
+      ],
+      "description": "Atomically rename a C++ class: (a) the namespace symbol 'old_name' (re-parents all member functions) AND (b) the this-type struct DataType '/old_name' if it exists. ABORTS if a namespace OR datatype named 'new_name' already exists (no blind merge). Returns {renamed_namespace, members_reparented, renamed_datatype, struct_size}. Runs in a transaction."
     },
     {
       "path": "/rename_data",
