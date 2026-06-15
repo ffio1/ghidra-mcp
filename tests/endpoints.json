@@ -1,7 +1,7 @@
 {
   "version": "5.13.1",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 254,
+  "total_endpoints": 279,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -147,6 +147,16 @@
         "program"
       ],
       "description": "Analyze documentation completeness"
+    },
+    {
+      "path": "/analyze_global",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "address",
+        "program"
+      ],
+      "description": "Analyze a global variable (DAT_ address) by examining all reads and writes. "
     },
     {
       "path": "/analyze_struct_field_usage",
@@ -313,6 +323,16 @@
       "description": "Delete multiple labels"
     },
     {
+      "path": "/batch_get_callers",
+      "method": "POST",
+      "category": "xref",
+      "params": [
+        "addresses",
+        "program"
+      ],
+      "description": "Get callers for multiple functions in one call. Pass a JSON array of addresses. Returns a map of address -> list of {caller_name, caller_address}. Much cheaper than N individual get_function_callers calls."
+    },
+    {
       "path": "/batch_remove_function_tags",
       "method": "POST",
       "category": "function",
@@ -371,6 +391,41 @@
       "description": "Report of source file strings and their FUN_* functions"
     },
     {
+      "path": "/bulk_classify_by_string",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "pattern",
+        "namespace_group",
+        "name_group",
+        "namespace_prefix",
+        "overwrite_custom",
+        "limit",
+        "program"
+      ],
+      "description": "Bulk rename functions by string-ref regex. Scans defined strings; for each match with capture groups, renames referencing functions using (namespace_group, name_group). Example: pattern='([A-Za-z]\\\\\\\\w*)::([A-Za-z]\\\\\\\\w*)' on string 'GRMusicService::Play' renames the referencing function to GRMusicService::Play. Server-side loop replaces per-function round trip of the re-string-hunt workflow. Use dry_run=true first to preview."
+    },
+    {
+      "path": "/bulk_fix_prototypes",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "fixes",
+        "program"
+      ],
+      "description": "Batch-fix function prototypes: set calling convention, return type, and/or parameter "
+    },
+    {
+      "path": "/bulk_fix_return_types",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "fixes",
+        "program"
+      ],
+      "description": "Batch-set return types on multiple functions without rewriting full prototypes. "
+    },
+    {
       "path": "/bulk_fuzzy_match",
       "method": "GET",
       "category": "documentation",
@@ -383,6 +438,16 @@
         "filter"
       ],
       "description": "Bulk cross-binary function matching"
+    },
+    {
+      "path": "/bulk_rename_globals",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "renames",
+        "program"
+      ],
+      "description": "Batch rename and retype global variables (DAT_ addresses). "
     },
     {
       "path": "/can_rename_at_address",
@@ -452,6 +517,18 @@
       "description": "Close the currently open project"
     },
     {
+      "path": "/compare_function_with_program",
+      "method": "GET",
+      "category": "documentation",
+      "params": [
+        "address",
+        "reference_address",
+        "reference_program",
+        "program"
+      ],
+      "description": "Compare an unknown function in the source program with a function at a known "
+    },
+    {
       "path": "/compare_programs_documentation",
       "method": "GET",
       "category": "utility",
@@ -480,6 +557,18 @@
         "size"
       ],
       "description": "Convert number between bases"
+    },
+    {
+      "path": "/count_functions_in_range",
+      "method": "GET",
+      "category": "listing",
+      "params": [
+        "start_address",
+        "end_address",
+        "name_filter",
+        "program"
+      ],
+      "description": "Count functions in an address range, optionally filtered by name prefix. Cheap probe — use before committing a full sweep."
     },
     {
       "path": "/create_array_type",
@@ -616,6 +705,8 @@
       "params": [
         "name",
         "fields",
+        "category",
+        "size",
         "replace_placeholder",
         "program"
       ],
@@ -800,7 +891,8 @@
       "params": [
         "address",
         "program",
-        "timeout"
+        "timeout",
+        "max_lines"
       ],
       "description": "Decompile function"
     },
@@ -1011,6 +1103,18 @@
       "description": "Find anti-analysis techniques"
     },
     {
+      "path": "/find_bad_return_types",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_callers",
+        "limit",
+        "name_pattern",
+        "program"
+      ],
+      "description": "Find functions with 'undefined' return type that have many callers — these cause "
+    },
+    {
       "path": "/find_code_gaps",
       "method": "GET",
       "category": "analysis",
@@ -1033,6 +1137,18 @@
       "description": "Find dead code"
     },
     {
+      "path": "/find_functions_referencing_string",
+      "method": "GET",
+      "category": "listing",
+      "params": [
+        "pattern",
+        "offset",
+        "limit",
+        "program"
+      ],
+      "description": "Find all functions that reference strings matching a regex pattern. Returns function name, address, and the matching string(s). Fast path to naming functions by their log/error messages."
+    },
+    {
       "path": "/find_next_undefined_function",
       "method": "GET",
       "category": "analysis",
@@ -1044,6 +1160,17 @@
         "program"
       ],
       "description": "Find next undefined function"
+    },
+    {
+      "path": "/find_register_params",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_callers",
+        "limit",
+        "program"
+      ],
+      "description": "Find functions that use ESI/EDI/EBX as implicit parameters — first instruction "
     },
     {
       "path": "/find_similar_functions",
@@ -1070,6 +1197,31 @@
       "description": "Cross-binary fuzzy function matching. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution."
     },
     {
+      "path": "/find_struct_candidates",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "vtable_address",
+        "class_name",
+        "min_methods",
+        "limit",
+        "program"
+      ],
+      "description": "Find classes/structs by scanning __thiscall functions for field accesses at "
+    },
+    {
+      "path": "/find_undefined_params",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_callers",
+        "min_params",
+        "limit",
+        "program"
+      ],
+      "description": "Find functions where all parameters are undefined4 (untyped). "
+    },
+    {
       "path": "/find_undocumented_by_string",
       "method": "GET",
       "category": "utility",
@@ -1078,6 +1230,43 @@
         "program"
       ],
       "description": "Find undocumented functions referencing string"
+    },
+    {
+      "path": "/find_unnamed_globals",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_xrefs",
+        "segment",
+        "limit",
+        "program"
+      ],
+      "description": "Find DAT_ global variables with default names, sorted by xref count. "
+    },
+    {
+      "path": "/find_vmp_stubs",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "max_body_size",
+        "exclude_named",
+        "type",
+        "program"
+      ],
+      "description": "Scan for VMProtect stub patterns. Finds two types: "
+    },
+    {
+      "path": "/find_wrong_calling_conventions",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_callers",
+        "limit",
+        "start_address",
+        "end_address",
+        "program"
+      ],
+      "description": "Find functions where the calling convention doesn't match the assembly. "
     },
     {
       "path": "/force_decompile",
@@ -1491,6 +1680,17 @@
       "description": "Get plugin version"
     },
     {
+      "path": "/get_vtable_at",
+      "method": "GET",
+      "category": "listing",
+      "params": [
+        "address",
+        "slot_count",
+        "program"
+      ],
+      "description": "Read a vtable at the given address: returns slot index, pointer value, and current function name for each entry. Useful for mapping class virtual method tables in 32-bit and 64-bit binaries."
+    },
+    {
       "path": "/get_vtable_slot_target",
       "method": "GET",
       "category": "getter",
@@ -1538,7 +1738,9 @@
       "category": "datatype",
       "params": [
         "source",
-        "format"
+        "format",
+        "category",
+        "program"
       ],
       "description": "Import data types from GDT"
     },
@@ -1554,6 +1756,16 @@
         "auto_analyze"
       ],
       "description": "Import a binary file from disk into the current Ghidra project and open it. For raw firmware binaries, specify language (e.g. 'ARM:LE:32:Cortex') and optionally compiler_spec (e.g. 'default')."
+    },
+    {
+      "path": "/infer_param_types",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "address",
+        "program"
+      ],
+      "description": "Analyze a function's assembly to infer parameter types from usage patterns. "
     },
     {
       "path": "/inspect_memory_content",
@@ -1721,6 +1933,23 @@
         "program"
       ],
       "description": "List functions with metadata"
+    },
+    {
+      "path": "/list_functions_in_range",
+      "method": "GET",
+      "category": "listing",
+      "params": [
+        "start_address",
+        "end_address",
+        "offset",
+        "limit",
+        "name_filter",
+        "min_size",
+        "max_size",
+        "format",
+        "program"
+      ],
+      "description": "List functions whose entry point falls within [start_address, end_address). Much faster than list_functions for agents working a specific address range."
     },
     {
       "path": "/list_globals",
@@ -1969,6 +2198,19 @@
       "description": "Temporarily enable, disable, or query scoped automation prompt handling"
     },
     {
+      "path": "/propagate_types",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "seed_address",
+        "max_depth",
+        "dry_run",
+        "limit",
+        "program"
+      ],
+      "description": "Propagate parameter types across the call graph via pcode analysis. For each seed "
+    },
+    {
       "path": "/read_memory",
       "method": "GET",
       "category": "analysis",
@@ -1987,6 +2229,20 @@
         "program"
       ],
       "description": "Trigger full auto-analysis on a program"
+    },
+    {
+      "path": "/reconstruct_struct",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "vtable_address",
+        "struct_name",
+        "category",
+        "apply_to_methods",
+        "dry_run",
+        "program"
+      ],
+      "description": "Create a Ghidra struct from a vtable or class name. Scans all methods for "
     },
     {
       "path": "/recreate_struct",
@@ -2075,6 +2331,7 @@
       "params": [
         "function_address",
         "new_name",
+        "namespace",
         "program",
         "strict_mode"
       ],
@@ -2277,6 +2534,7 @@
         "sort_by",
         "offset",
         "limit",
+        "format",
         "program"
       ],
       "description": "Advanced function search"
@@ -2667,6 +2925,18 @@
       "description": "Suggest field names"
     },
     {
+      "path": "/summarize_function",
+      "method": "GET",
+      "category": "function",
+      "params": [
+        "address",
+        "program",
+        "max_callees",
+        "max_strings"
+      ],
+      "description": "Compact single-call function digest: addr, qualified name, size, in-xref count, calling convention, prototype, direct callees (addr:name), string refs. Token-efficient replacement for the xref+callees+disassemble cascade — use first when inquiring 'what is this function?'. Returns plain text, not JSON."
+    },
+    {
       "path": "/switch_program",
       "method": "GET",
       "category": "program",
@@ -2732,6 +3002,38 @@
         "program"
       ],
       "description": "Validate function prototype"
+    },
+    {
+      "path": "/verify_cdecl_param_counts",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_callers",
+        "limit",
+        "program"
+      ],
+      "description": "Verify __cdecl function param counts by checking ADD ESP,N at call sites. "
+    },
+    {
+      "path": "/verify_function_abi",
+      "method": "GET",
+      "category": "function",
+      "params": [
+        "address",
+        "program"
+      ],
+      "description": "Extract structured ABI info (RET imm consistency, prologue register reads, callee-saved pushes, max stack-arg offset) from a function's instruction stream. Use BEFORE writing a naked detour / shim to verify exact calling convention — replaces the error-prone 'agent paraphrases the disasm' workflow. Returns plain text."
+    },
+    {
+      "path": "/verify_param_counts",
+      "method": "GET",
+      "category": "analysis",
+      "params": [
+        "min_callers",
+        "limit",
+        "program"
+      ],
+      "description": "Find functions where the parameter count doesn't match RET N + calling convention. "
     }
   ]
 }
