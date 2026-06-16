@@ -1678,28 +1678,9 @@ public class FunctionService {
                 return;
             }
 
-            Msg.info(this, "Setting prototype for function " + func.getName() + ": " + prototype);
-
-            // v3.0.1: Save existing plate comment before prototype change (which may wipe it)
-            String savedPlateComment = func.getComment();
-
-            // Use ApplyFunctionSignatureCmd to parse and apply the signature
+            // parseFunctionSignatureAndApply opens the transaction and delegates to the shared
+            // applyPrototypeToFunction core, which also preserves the plate comment across the change.
             parseFunctionSignatureAndApply(program, addr, prototype, callingConvention, success, errorMessage);
-
-            // v3.0.1: Restore plate comment if it was wiped by prototype change
-            if (savedPlateComment != null && !savedPlateComment.isEmpty()) {
-                String currentComment = func.getComment();
-                if (currentComment == null || currentComment.isEmpty() ||
-                    currentComment.startsWith("Setting prototype:")) {
-                    int txRestore = program.startTransaction("Restore plate comment after prototype");
-                    try {
-                        func.setComment(savedPlateComment);
-                        Msg.info(this, "Restored plate comment after prototype change for " + func.getName());
-                    } finally {
-                        program.endTransaction(txRestore, true);
-                    }
-                }
-            }
 
         } catch (Exception e) {
             String msg = "Error setting function prototype: " + e.getMessage();
@@ -1713,75 +1694,34 @@ public class FunctionService {
      */
     void parseFunctionSignatureAndApply(Program program, Address addr, String prototype,
                                               String callingConvention, AtomicBoolean success, StringBuilder errorMessage) {
-        // Use ApplyFunctionSignatureCmd to parse and apply the signature
-        int txProto = program.startTransaction("Set function prototype");
-        boolean signatureApplied = false;
+        // Single-tool path: open ONE transaction and delegate the parse+apply+convention work to
+        // the shared, transaction-free applyPrototypeToFunction core (the same core the batch tool
+        // reuses). Signature and convention are applied in one transaction here; ordering (signature
+        // first, then convention) — not separate transactions — is what keeps the convention from
+        // being overridden by ApplyFunctionSignatureCmd.
+        Function func = ServiceUtils.getFunctionForAddress(program, addr);
+        if (func == null) {
+            String msg = "Could not find function at address: " + addr;
+            errorMessage.append(msg);
+            Msg.error(this, msg);
+            return;
+        }
+        int tx = program.startTransaction("Set function prototype");
+        boolean applied = false;
         try {
-            // Get data type manager
-            DataTypeManager dtm = program.getDataTypeManager();
-
-            // Create function signature parser without DataTypeManagerService
-            // to prevent UI dialogs from popping up (pass null instead of dtms)
-            ghidra.app.util.parser.FunctionSignatureParser parser =
-                new ghidra.app.util.parser.FunctionSignatureParser(dtm, null);
-
-            // Parse the prototype into a function signature
-            ghidra.program.model.data.FunctionDefinitionDataType sig = parser.parse(null, prototype);
-
-            if (sig == null) {
-                String msg = "Failed to parse function prototype";
-                errorMessage.append(msg);
-                Msg.error(this, msg);
-                return;
-            }
-
-            // Create and apply the command
-            ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd =
-                new ghidra.app.cmd.function.ApplyFunctionSignatureCmd(
-                    addr, sig, SourceType.USER_DEFINED);
-
-            // Apply the command to the program
-            boolean cmdResult = cmd.applyTo(program, new ConsoleTaskMonitor());
-
-            if (cmdResult) {
-                signatureApplied = true;
+            PrototypeApplyResult r =
+                applyPrototypeToFunction(program, addr, func, prototype, callingConvention, errorMessage);
+            applied = r.ok;
+            if (r.ok) {
                 Msg.info(this, "Successfully applied function signature");
             } else {
-                String msg = "Command failed: " + cmd.getStatusMsg();
-                errorMessage.append(msg);
-                Msg.error(this, msg);
+                errorMessage.append(r.reason);
+                Msg.error(this, r.reason);
             }
-        } catch (Exception e) {
-            String msg = "Error applying function signature: " + e.getMessage();
-            errorMessage.append(msg);
-            Msg.error(this, msg, e);
         } finally {
-            program.endTransaction(txProto, signatureApplied);
+            program.endTransaction(tx, applied);
         }
-
-        // Apply calling convention in a SEPARATE transaction after signature is committed
-        // This ensures the calling convention isn't overridden by ApplyFunctionSignatureCmd
-        if (signatureApplied && callingConvention != null && !callingConvention.isEmpty()) {
-            int txConv = program.startTransaction("Set calling convention");
-            boolean conventionApplied = false;
-            try {
-                conventionApplied = applyCallingConvention(program, addr, callingConvention, errorMessage);
-                if (conventionApplied) {
-                    success.set(true);
-                } else {
-                    success.set(false);  // Fail if calling convention couldn't be applied
-                }
-            } catch (Exception e) {
-                String msg = "Error in calling convention transaction: " + e.getMessage();
-                errorMessage.append(msg);
-                Msg.error(this, msg, e);
-                success.set(false);
-            } finally {
-                program.endTransaction(txConv, conventionApplied);
-            }
-        } else if (signatureApplied) {
-            success.set(true);
-        }
+        success.set(applied);
     }
 
     /**
@@ -1840,6 +1780,100 @@ public class FunctionService {
             errorMessage.append(msg);
             Msg.error(this, msg, e);
             return false;
+        }
+    }
+
+    /** Outcome of applying a prototype (+ optional convention/rename) to one function. */
+    static final class PrototypeApplyResult {
+        boolean ok;          // signature (and convention, if requested) applied
+        boolean renamed;     // function was renamed by a non-empty 'name'
+        String reason;       // populated when !ok
+
+        static PrototypeApplyResult fail(String reason) {
+            PrototypeApplyResult r = new PrototypeApplyResult();
+            r.ok = false;
+            r.reason = reason;
+            return r;
+        }
+    }
+
+    /**
+     * Core "apply a C prototype to one function" mechanism, factored out of the single
+     * {@link #setFunctionPrototypeEndpoint} path (via {@link #parseFunctionSignatureAndApply})
+     * so {@link #batchSetFunctionPrototype} can reuse it inside one shared transaction.
+     *
+     * <p>Mirrors the single-tool behavior: parse the C signature with
+     * {@link ghidra.app.util.parser.FunctionSignatureParser}, apply it with
+     * {@link ghidra.app.cmd.function.ApplyFunctionSignatureCmd}, then (after the signature is
+     * applied, never before — so it is not overridden) set the calling convention. The existing
+     * plate comment is preserved across the change, matching {@link #applyFunctionPrototype}.</p>
+     *
+     * <p>Callers must already hold an open write transaction on {@code program}; this method does
+     * NOT open its own. It is reused by both the single tool (one tx per call) and the batch tool
+     * (one tx for the whole batch).</p>
+     *
+     * @param prototype          full C signature (return type + params); its name is parse-only.
+     * @param callingConvention  optional convention (e.g. {@code __thiscall}); null/empty = leave.
+     * @param errorMessage       accumulates diagnostics; non-fatal warnings may be appended on ok.
+     * @return ok on success; {@code !ok} with a reason on parse/apply/convention failure.
+     */
+    PrototypeApplyResult applyPrototypeToFunction(Program program, Address addr, Function func,
+                                                  String prototype, String callingConvention,
+                                                  StringBuilder errorMessage) {
+        try {
+            Msg.info(this, "Setting prototype for function " + func.getName() + ": " + prototype);
+
+            // Save existing plate comment before the prototype change (which may wipe it).
+            String savedPlateComment = func.getComment();
+
+            // Parse + apply signature, then convention, inside the caller's transaction.
+            DataTypeManager dtm = program.getDataTypeManager();
+            ghidra.app.util.parser.FunctionSignatureParser parser =
+                new ghidra.app.util.parser.FunctionSignatureParser(dtm, null);
+            ghidra.program.model.data.FunctionDefinitionDataType sig;
+            try {
+                sig = parser.parse(null, prototype);
+            } catch (Exception pe) {
+                return PrototypeApplyResult.fail("could not parse prototype '" + prototype + "': "
+                        + (pe.getMessage() != null ? pe.getMessage() : pe.toString()));
+            }
+            if (sig == null) {
+                return PrototypeApplyResult.fail("could not parse prototype '" + prototype + "'");
+            }
+
+            ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd =
+                new ghidra.app.cmd.function.ApplyFunctionSignatureCmd(
+                    addr, sig, SourceType.USER_DEFINED);
+            boolean cmdResult = cmd.applyTo(program, new ConsoleTaskMonitor());
+            if (!cmdResult) {
+                return PrototypeApplyResult.fail("apply signature failed: " + cmd.getStatusMsg());
+            }
+
+            // Calling convention is applied AFTER the signature (ordering, not a separate tx, is
+            // what keeps it from being overridden by ApplyFunctionSignatureCmd).
+            if (callingConvention != null && !callingConvention.isEmpty()) {
+                boolean conventionApplied = applyCallingConvention(program, addr, callingConvention, errorMessage);
+                if (!conventionApplied) {
+                    return PrototypeApplyResult.fail("calling convention '" + callingConvention
+                            + "' could not be applied (signature WAS applied)");
+                }
+            }
+
+            // Restore plate comment if the prototype change wiped it.
+            if (savedPlateComment != null && !savedPlateComment.isEmpty()) {
+                String currentComment = func.getComment();
+                if (currentComment == null || currentComment.isEmpty()
+                        || currentComment.startsWith("Setting prototype:")) {
+                    func.setComment(savedPlateComment);
+                    Msg.info(this, "Restored plate comment after prototype change for " + func.getName());
+                }
+            }
+
+            PrototypeApplyResult r = new PrototypeApplyResult();
+            r.ok = true;
+            return r;
+        } catch (Exception e) {
+            return PrototypeApplyResult.fail(e.getMessage() != null ? e.getMessage() : e.toString());
         }
     }
 
@@ -2160,65 +2194,16 @@ public class FunctionService {
                             .append("' to a pointer. Create the structure first with create_struct, then retry.");
                     return null;
                 }
-                DataType base = ((Pointer) pointerType).getDataType();
-                if (!(base instanceof Structure)) {
-                    resultMsg.append("Error: 'this' must point to a structure/class type; '")
-                            .append(base != null ? base.getName() : "void")
-                            .append("' is not a structure. Ghidra derives the 'this' type from a same-named struct.");
+
+                ThisTypeResult r = applyThisTypeToFunction(program, func, pointerType);
+                if (!r.ok) {
+                    resultMsg.append("Error: ").append(r.reason);
                     return null;
                 }
-                String className = base.getName();
-
-                // The member function must already have an implicit 'this'; that only exists for a
-                // hasThis convention (__thiscall/__fastcall). Bail out before mutating anything so
-                // non-member functions are not silently re-parented into a class.
-                Parameter thisParam = findAutoThisParameter(func);
-                if (thisParam == null) {
-                    String cc;
-                    try {
-                        cc = func.getCallingConventionName();
-                    } catch (Exception ignored) {
-                        cc = "";
-                    }
-                    resultMsg.append("Error: ").append(func.getName())
-                            .append(" has no implicit 'this' parameter (calling convention '")
-                            .append(cc == null || cc.isEmpty() ? "(default)" : cc)
-                            .append("'). Set it to __thiscall with set_function_prototype, then retry.");
-                    return null;
-                }
-
-                // Auto-parameters are immutable via the API; the 'this' auto-parameter instead
-                // obtains its type from the function's parent Class namespace (auto-storage). So we
-                // place the function in a GhidraClass named after the struct rather than retyping
-                // 'this' directly. This is the same model as the decompiler's "Auto Fill in Class
-                // Structure" / re-parenting via the Symbol Tree — no custom storage required.
-                SymbolTable st = program.getSymbolTable();
-                Namespace global = program.getGlobalNamespace();
-                GhidraClass classNs;
-                Namespace existing = st.getNamespace(className, global);
-                if (existing == null) {
-                    classNs = st.createClass(global, className, SourceType.USER_DEFINED);
-                } else if (existing instanceof GhidraClass) {
-                    classNs = (GhidraClass) existing;
-                } else {
-                    classNs = st.convertNamespaceToClass(existing);
-                }
-
-                Namespace currentNs = func.getParentNamespace();
-                boolean alreadyInClass = currentNs instanceof GhidraClass
-                        && className.equals(currentNs.getName());
-                if (!alreadyInClass) {
-                    func.getSymbol().setNamespace(classNs);
-                }
-
-                // Re-read the auto-'this' so we report the type Ghidra now derives from the class.
-                thisParam = findAutoThisParameter(func);
-                DataType resolvedThis = thisParam != null ? thisParam.getDataType() : pointerType;
-                String resolvedName = resolvedThis != null ? resolvedThis.getDisplayName() : (className + " *");
                 success.set(true);
-                resultMsg.append(alreadyInClass ? "Confirmed " : "Moved ").append(func.getName())
-                        .append(alreadyInClass ? " in class " : " into class ").append(className)
-                        .append("; 'this' types as ").append(resolvedName)
+                resultMsg.append(r.alreadyApplied ? "Confirmed " : "Moved ").append(func.getName())
+                        .append(r.alreadyApplied ? " in class " : " into class ").append(r.className)
+                        .append("; 'this' types as ").append(r.resolvedThisName)
                         .append(" (auto-storage). Call get_decompiled_code or force_decompile to refresh output.");
                 return null;
             });
@@ -2249,6 +2234,557 @@ public class FunctionService {
         return null;
     }
 
+    /** Outcome of applying a {@code this} type to one function (shared by single + batch tools). */
+    static final class ThisTypeResult {
+        boolean ok;
+        boolean alreadyApplied; // first param already pointed at the target struct (counts as skipped)
+        String className;
+        String resolvedThisName;
+        String reason;          // populated when !ok or alreadyApplied
+
+        static ThisTypeResult fail(String reason) {
+            ThisTypeResult r = new ThisTypeResult();
+            r.ok = false;
+            r.reason = reason;
+            return r;
+        }
+
+        static ThisTypeResult skipped(String className, String reason) {
+            ThisTypeResult r = new ThisTypeResult();
+            r.ok = true;
+            r.alreadyApplied = true;
+            r.className = className;
+            r.reason = reason;
+            return r;
+        }
+    }
+
+    /**
+     * Core "set the implicit 'this' type" mechanism, factored out of {@link #setFunctionThisType}
+     * so {@link #batchSetFunctionThisType} can reuse it inside one shared transaction.
+     *
+     * <p>Mirrors the single-tool behavior exactly: Ghidra auto-'this' is immutable, so the function
+     * is re-parented into a {@code GhidraClass} named after the struct that {@code pointerType}
+     * points at; Ghidra then derives the auto-'this' type from that class by name. Callers must
+     * already hold an open write transaction on {@code program}.</p>
+     *
+     * @param pointerType a resolved {@link Pointer} whose base is the target struct/class.
+     * @return ok with className/resolvedThisName on success; {@code alreadyApplied} when the
+     *         function is already in the target class (counts as skipped); {@code !ok} on error.
+     */
+    static ThisTypeResult applyThisTypeToFunction(Program program, Function func, DataType pointerType) {
+        if (!(pointerType instanceof Pointer)) {
+            return ThisTypeResult.fail("this_type did not resolve to a pointer");
+        }
+        DataType base = ((Pointer) pointerType).getDataType();
+        if (!(base instanceof Structure)) {
+            return ThisTypeResult.fail("'this' must point to a structure/class type; '"
+                    + (base != null ? base.getName() : "void")
+                    + "' is not a structure. Ghidra derives the 'this' type from a same-named struct.");
+        }
+        String className = base.getName();
+
+        // The member function must already have an implicit 'this'; that only exists for a
+        // hasThis convention (__thiscall/__fastcall). Bail out before mutating anything so
+        // non-member (static) functions are not silently re-parented into a class.
+        Parameter thisParam = findAutoThisParameter(func);
+        if (thisParam == null) {
+            String cc;
+            try {
+                cc = func.getCallingConventionName();
+            } catch (Exception ignored) {
+                cc = "";
+            }
+            return ThisTypeResult.fail(func.getName() + " has no implicit 'this' parameter (calling convention '"
+                    + (cc == null || cc.isEmpty() ? "(default)" : cc)
+                    + "'). Set it to __thiscall with set_function_prototype, then retry.");
+        }
+
+        // Skip when the first/this param already types as the target struct pointer — nothing to do.
+        DataType existingThis = thisParam.getDataType();
+        if (existingThis instanceof Pointer) {
+            DataType existingBase = ((Pointer) existingThis).getDataType();
+            Namespace curNs = func.getParentNamespace();
+            boolean nsMatches = curNs instanceof GhidraClass && className.equals(curNs.getName());
+            if (existingBase != null && className.equals(existingBase.getName()) && nsMatches) {
+                ThisTypeResult r = ThisTypeResult.skipped(className, "'this' already types as " + className + " *");
+                r.resolvedThisName = existingThis.getDisplayName();
+                return r;
+            }
+        }
+
+        // Auto-parameters are immutable via the API; the 'this' auto-parameter instead obtains its
+        // type from the function's parent Class namespace (auto-storage). So we place the function
+        // in a GhidraClass named after the struct rather than retyping 'this' directly.
+        SymbolTable st = program.getSymbolTable();
+        Namespace global = program.getGlobalNamespace();
+        GhidraClass classNs;
+        Namespace existing = st.getNamespace(className, global);
+        try {
+            if (existing == null) {
+                classNs = st.createClass(global, className, SourceType.USER_DEFINED);
+            } else if (existing instanceof GhidraClass) {
+                classNs = (GhidraClass) existing;
+            } else {
+                classNs = st.convertNamespaceToClass(existing);
+            }
+        } catch (Exception e) {
+            return ThisTypeResult.fail("could not create/resolve class namespace '" + className + "': " + e.getMessage());
+        }
+
+        Namespace currentNs = func.getParentNamespace();
+        boolean alreadyInClass = currentNs instanceof GhidraClass && className.equals(currentNs.getName());
+        if (!alreadyInClass) {
+            try {
+                func.getSymbol().setNamespace(classNs);
+            } catch (Exception e) {
+                return ThisTypeResult.fail("could not re-parent " + func.getName() + " into class " + className
+                        + ": " + e.getMessage());
+            }
+        }
+
+        // Re-read the auto-'this' so we report the type Ghidra now derives from the class.
+        thisParam = findAutoThisParameter(func);
+        DataType resolvedThis = thisParam != null ? thisParam.getDataType() : pointerType;
+        ThisTypeResult r = new ThisTypeResult();
+        r.ok = true;
+        r.alreadyApplied = alreadyInClass; // already in class with same-named struct → effectively a no-op
+        r.className = className;
+        r.resolvedThisName = resolvedThis != null ? resolvedThis.getDisplayName() : (className + " *");
+        return r;
+    }
+
+    /**
+     * EXACT-STRUCT force-repoint mechanism (overwrite=true path of {@link #batchSetFunctionThisType}).
+     *
+     * <p>Unlike {@link #applyThisTypeToFunction} — which binds {@code this} BY NAME via a same-named
+     * {@code GhidraClass} and SKIPS functions already typed — this pins {@code this} to the EXACT
+     * resolved struct {@link DataType} (the one {@code pointerType} points at, resolved by full
+     * category path) using CUSTOM VARIABLE STORAGE, and OVERWRITES any prior typing. This is the only
+     * way to (1) supersede a function whose {@code this} is already typed and (2) be immune to leaf-name
+     * collisions (e.g. {@code /Ni/NiObjectNET} 24B vs {@code /RS2014/Gamebryo/NiObjectNET} 32B) — the
+     * GhidraClass mechanism would otherwise re-bind to whichever same-named struct Ghidra picks.</p>
+     *
+     * <p>Conservative by design: if the function has no implicit {@code this} we only force a
+     * {@code __thiscall} convention when the function plausibly IS an instance method (has at least one
+     * param OR lives in a class namespace); otherwise we SKIP with a reason rather than risk mistyping a
+     * static helper. Every mutation is the caller's responsibility to wrap in a transaction; this method
+     * itself does not start one. On any failure the function is left as-is (no half-mutation beyond what
+     * the outer transaction will roll back).</p>
+     *
+     * @param pointerType a resolved {@link Pointer} whose base is the EXACT target struct/class object.
+     * @return {@code ok} (counts as TYPED, never alreadyApplied — it actively repoints) on success;
+     *         {@code alreadyApplied} only when we deliberately skip a likely-static function;
+     *         {@code !ok} on error.
+     */
+    static ThisTypeResult forceThisTypeToFunction(Program program, Function func, DataType pointerType) {
+        if (!(pointerType instanceof Pointer)) {
+            return ThisTypeResult.fail("this_type did not resolve to a pointer");
+        }
+        DataType base = ((Pointer) pointerType).getDataType();
+        if (!(base instanceof Structure)) {
+            return ThisTypeResult.fail("'this' must point to a structure/class type; '"
+                    + (base != null ? base.getName() : "void")
+                    + "' is not a structure.");
+        }
+        String className = base.getName();
+
+        // Determine where 'this' lives. If the function already has an implicit/explicit 'this',
+        // reuse its EXACT existing storage (e.g. ECX for x86 __thiscall) — this is architecture- and
+        // convention-agnostic, no hardcoded register. Otherwise we must establish a hasThis convention
+        // first, but ONLY for functions that plausibly are instance methods.
+        Parameter thisParam = findAutoThisParameter(func);
+        if (thisParam == null) {
+            // Only REPOINT functions that already have an implicit 'this'. We deliberately do NOT
+            // force __thiscall onto no-'this' functions: static helpers frequently live inside a class
+            // namespace (e.g. NiObjectNET::PartialSortByName, a __cdecl sort helper), and forcing
+            // __thiscall on them steals their first real arg into ECX and fabricates a bogus 'this'.
+            // If a no-'this' function is genuinely an instance method, set __thiscall explicitly with
+            // set_function_prototype first, then re-run with overwrite=true.
+            return ThisTypeResult.skipped(className,
+                    func.getName() + " has no implicit 'this' (convention is not hasThis) — not forcing "
+                    + "__thiscall (would corrupt a static helper); set __thiscall first if it is a method");
+        }
+
+        // Capture the EXACT storage Ghidra assigned to 'this' (the this-register, e.g. ECX on x86).
+        // Deriving storage from the live auto-'this' is collision-proof and arch-agnostic.
+        VariableStorage thisStorage = thisParam.getVariableStorage();
+        if (thisStorage == null || thisStorage.isBadStorage() || thisStorage.isUnassignedStorage()) {
+            return ThisTypeResult.fail(func.getName()
+                    + ": could not determine 'this' register storage (got "
+                    + (thisStorage == null ? "null" : thisStorage.toString()) + ")");
+        }
+
+        // Snapshot the OTHER (non-'this') params before we flip to custom storage, so we can preserve
+        // them. Auto-'this' is index 0 under hasThis; we replace it with an EXPLICIT 'this' typed as
+        // the EXACT struct pointer, then re-append the remaining params unchanged.
+        Parameter[] existing = func.getParameters();
+        List<Variable> newParams = new ArrayList<>();
+        try {
+            ParameterImpl explicitThis =
+                    new ParameterImpl("this", pointerType, thisStorage, program);
+            newParams.add(explicitThis);
+            for (Parameter p : existing) {
+                // Skip ALL auto-parameters: the old auto-'this' (replaced by our exact-typed 'this')
+                // AND any other auto-param such as RETURN_STORAGE_PTR (struct-return functions).
+                // Under CUSTOM_STORAGE, reifying a non-'this' auto-param into an explicit param would
+                // be wrong — keep only genuine explicit params plus our new 'this'.
+                if (p.isAutoParameter() || "this".equals(p.getName())) {
+                    continue;
+                }
+                newParams.add(p);
+            }
+        } catch (Exception e) {
+            return ThisTypeResult.fail(func.getName() + ": could not build explicit 'this' parameter: "
+                    + (e.getMessage() != null ? e.getMessage() : e.toString()));
+        }
+
+        // Flip to custom storage and overwrite the parameter list. CUSTOM_STORAGE makes 'this' an
+        // EXPLICIT parameter pinned to the exact DataType + register, so the decompiler shows the
+        // EXACT struct regardless of name collisions and regardless of any prior typing.
+        try {
+            func.setCustomVariableStorage(true);
+            func.replaceParameters(newParams,
+                    Function.FunctionUpdateType.CUSTOM_STORAGE, true, SourceType.USER_DEFINED);
+        } catch (Exception e) {
+            return ThisTypeResult.fail(func.getName()
+                    + ": force-repoint via custom storage failed: "
+                    + (e.getMessage() != null ? e.getMessage() : e.toString()));
+        }
+
+        ThisTypeResult r = new ThisTypeResult();
+        r.ok = true;
+        r.alreadyApplied = false; // force-repoint ALWAYS counts as an active typing, never skipped
+        r.className = className;
+        r.resolvedThisName = pointerType.getDisplayName();
+        return r;
+    }
+
+    /**
+     * Bulk version of {@link #setFunctionThisType}: type the implicit {@code this} of MANY member
+     * functions in ONE MCP call / ONE transaction. Designed for the by-namespace use case
+     * (type every method of a class at once) so a campaign that would otherwise be thousands of
+     * single calls becomes one call with a compact summary.
+     */
+    @McpTool(path = "/batch_set_function_this_type", method = "POST",
+            description = "Bulk-type the implicit 'this' of many __thiscall/__fastcall member functions in ONE call + ONE transaction. "
+                + "Pass 'assignments': a JSON array of entries. Each entry is EITHER "
+                + "{\"namespace\":\"NiObjectNET\",\"type\":\"/Ni/NiObjectNET *\"} — types EVERY function whose current "
+                + "parent namespace/class equals that namespace — OR {\"address\":\"0x008b4b60\",\"type\":\"/Ni/NiObjectNET *\"} "
+                + "— types just that one function. 'type' is resolved by full category path (e.g. /Ni/NiObjectNET); a bare struct "
+                + "path auto-appends ' *'. Per-function: skips statics / functions with no implicit 'this' / functions whose 'this' "
+                + "already types as the target (counted as skipped, not an error). A bad type or missing function is recorded as a "
+                + "per-entry error and does NOT abort the batch. Returns COMPACT counts only (no per-function list): "
+                + "{typed, skipped, errors:[{key,reason}], perNamespace:{ns:count}}. Default mechanism matches set_function_this_type "
+                + "(re-parent into a same-named GhidraClass; auto-'this' derives from it). "
+                + "Set 'overwrite':true for EXACT-STRUCT FORCE-REPOINT: pins 'this' to the EXACT resolved struct (by full "
+                + "category path, NOT by name) via custom variable storage — overwrites any prior typing AND is immune to "
+                + "leaf-name collisions (e.g. /Ni/NiObjectNET 24B vs /RS2014/Gamebryo/NiObjectNET 32B). Use overwrite=true to "
+                + "supersede earlier (often wrong) this-typings. Run force_decompile to refresh output.",
+            category = "function")
+    public Response batchSetFunctionThisType(
+            @Param(value = "assignments", source = ParamSource.BODY,
+                   description = "JSON array of {namespace|address, type} entries. 'namespace' types all functions in that "
+                               + "namespace/class; 'address' (0x<hex> or <space>:<hex>) types one function. 'type' is a full "
+                               + "category path like '/Ni/NiObjectNET *' (bare path auto-pointered).")
+                   List<Map<String, String>> assignments,
+            @Param(value = "overwrite", source = ParamSource.BODY, defaultValue = "false",
+                   description = "When false (default) use the name-based GhidraClass mechanism and skip functions already "
+                               + "typed. When true, FORCE-REPOINT: pin 'this' to the EXACT resolved struct via custom variable "
+                               + "storage, overwriting any existing typing and bypassing leaf-name collisions. Conservatively "
+                               + "skips obvious static helpers (no implicit 'this', no params, not in a class namespace) rather "
+                               + "than forcing __thiscall on them.")
+                   boolean overwrite,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+
+        if (assignments == null || assignments.isEmpty()) {
+            return Response.err("assignments is required (non-empty JSON array of {namespace|address, type} entries)");
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        final AtomicInteger typed = new AtomicInteger(0);
+        final AtomicInteger skipped = new AtomicInteger(0);
+        final List<Map<String, Object>> errors = new ArrayList<>();
+        final Map<String, Integer> perNamespace = new LinkedHashMap<>();
+        final AtomicReference<String> fatal = new AtomicReference<>(null);
+
+        try {
+            threadingStrategy.executeWrite(program, "Batch set function 'this' type", () -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                FunctionManager fm = program.getFunctionManager();
+
+                for (Map<String, String> entry : assignments) {
+                    if (entry == null) {
+                        errors.add(JsonHelper.mapOf("key", "(null)", "reason", "null assignment entry"));
+                        continue;
+                    }
+                    String type = entry.get("type");
+                    String nsName = entry.get("namespace");
+                    String addrStr = entry.get("address");
+                    String key = nsName != null ? nsName : (addrStr != null ? addrStr : "(no namespace/address)");
+
+                    if (type == null || type.trim().isEmpty()) {
+                        errors.add(JsonHelper.mapOf("key", key, "reason", "missing 'type'"));
+                        continue;
+                    }
+                    if (type.trim().startsWith("undefined")) {
+                        errors.add(JsonHelper.mapOf("key", key,
+                                "reason", "type must be a concrete struct/class pointer, not " + type));
+                        continue;
+                    }
+                    if ((nsName == null || nsName.trim().isEmpty())
+                            && (addrStr == null || addrStr.trim().isEmpty())) {
+                        errors.add(JsonHelper.mapOf("key", key, "reason", "entry needs either 'namespace' or 'address'"));
+                        continue;
+                    }
+
+                    // Resolve the type once per entry; an unresolvable type fails just this entry
+                    // (never aborts the whole batch).
+                    DataType pointerType;
+                    try {
+                        pointerType = resolveThisPointerType(dtm, type);
+                    } catch (Exception ex) {
+                        errors.add(JsonHelper.mapOf("key", key,
+                                "reason", "type resolve error for '" + type + "': "
+                                        + (ex.getMessage() != null ? ex.getMessage() : ex.toString())));
+                        continue;
+                    }
+                    if (!(pointerType instanceof Pointer)) {
+                        errors.add(JsonHelper.mapOf("key", key,
+                                "reason", "could not resolve type '" + type + "' to a struct pointer "
+                                        + "(create the struct first, or check the full category path)"));
+                        continue;
+                    }
+
+                    // Build the set of target functions for this entry.
+                    List<Function> targets = new ArrayList<>();
+                    if (addrStr != null && !addrStr.trim().isEmpty()) {
+                        Address addr = ServiceUtils.parseAddress(program, addrStr.trim());
+                        if (addr == null) {
+                            errors.add(JsonHelper.mapOf("key", key,
+                                    "reason", "bad address '" + addrStr + "': " + ServiceUtils.getLastParseError()));
+                            continue;
+                        }
+                        Function f = ServiceUtils.getFunctionForAddress(program, addr);
+                        if (f == null) {
+                            errors.add(JsonHelper.mapOf("key", key, "reason", "no function at " + addrStr));
+                            continue;
+                        }
+                        targets.add(f);
+                    } else {
+                        // Namespace form: every function whose parent namespace/class name == nsName.
+                        String wantNs = nsName.trim();
+                        for (Function f : fm.getFunctions(true)) {
+                            Namespace parent = f.getParentNamespace();
+                            if (parent != null && !parent.isGlobal() && wantNs.equals(parent.getName())) {
+                                targets.add(f);
+                            }
+                        }
+                        if (targets.isEmpty()) {
+                            errors.add(JsonHelper.mapOf("key", key,
+                                    "reason", "no functions found in namespace '" + wantNs + "'"));
+                            continue;
+                        }
+                    }
+
+                    // Apply to each target. Per-function failures are recorded but never abort.
+                    for (Function f : targets) {
+                        ThisTypeResult res;
+                        try {
+                            res = overwrite
+                                    ? forceThisTypeToFunction(program, f, pointerType)
+                                    : applyThisTypeToFunction(program, f, pointerType);
+                        } catch (Exception ex) {
+                            res = ThisTypeResult.fail(ex.getMessage() != null ? ex.getMessage() : ex.toString());
+                        }
+                        if (!res.ok) {
+                            errors.add(JsonHelper.mapOf("key", key + " @ " + f.getEntryPoint().toString(false),
+                                    "reason", res.reason));
+                        } else if (res.alreadyApplied) {
+                            skipped.incrementAndGet();
+                        } else {
+                            typed.incrementAndGet();
+                            perNamespace.merge(res.className, 1, Integer::sum);
+                        }
+                    }
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            fatal.set(e.getMessage() != null ? e.getMessage() : e.toString());
+        }
+
+        if (fatal.get() != null) {
+            return Response.err("batch_set_function_this_type failed: " + fatal.get());
+        }
+
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("typed", typed.get());
+        summary.put("skipped", skipped.get());
+        summary.put("errors", errors);
+        summary.put("perNamespace", perNamespace);
+        return Response.ok(summary);
+    }
+
+    /**
+     * Bulk version of {@link #setFunctionPrototypeEndpoint}: apply a full C prototype (return type +
+     * params + optional calling convention), and optionally rename, to MANY functions in ONE MCP call
+     * / ONE transaction. Designed for the engine-readability campaign so thousands of single
+     * set_function_prototype + rename_function_by_address calls collapse into one call with a compact
+     * summary.
+     */
+    @McpTool(path = "/batch_set_function_prototype", method = "POST",
+            description = "Bulk-apply full C function prototypes (return type + params + optional calling convention), and "
+                + "optionally rename, to many functions in ONE call + ONE transaction. Pass 'assignments': a JSON array of "
+                + "entries. Each entry is {\"address\":\"0x008b4b60\",\"prototype\":\"void f(NiObjectNET * param_1, char * name)\","
+                + "\"calling_convention\":\"__thiscall\" (optional),\"name\":\"NiObjectNET::SetName\" (optional rename)}. "
+                + "'prototype' is a full C signature the single-tool parser accepts; param/return types may reference imported "
+                + "structs. The function name inside 'prototype' is parse-only and does NOT rename — to rename also set 'name' "
+                + "(plain name, or Namespace::Name to re-parent). 'calling_convention' (e.g. __thiscall) is applied after the "
+                + "signature. A bad address / unparseable prototype / unapplicable convention is recorded as a per-entry error "
+                + "and does NOT abort the batch. Returns COMPACT counts only (no per-function list): "
+                + "{applied, renamed, errors:[{key,reason}]}. Run force_decompile to refresh output.",
+            category = "function")
+    public Response batchSetFunctionPrototype(
+            @Param(value = "assignments", source = ParamSource.BODY,
+                   description = "JSON array of {address, prototype, calling_convention?, name?} entries. 'address' is "
+                               + "0x<hex> or <space>:<hex>; 'prototype' is a full C signature; 'calling_convention' is "
+                               + "optional (e.g. __thiscall); 'name' optionally renames (plain or Namespace::Name).")
+                   List<Map<String, String>> assignments,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+
+        if (assignments == null || assignments.isEmpty()) {
+            return Response.err("assignments is required (non-empty JSON array of {address, prototype, ...} entries)");
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        final AtomicInteger applied = new AtomicInteger(0);
+        final AtomicInteger renamed = new AtomicInteger(0);
+        final List<Map<String, Object>> errors = new ArrayList<>();
+        final AtomicReference<String> fatal = new AtomicReference<>(null);
+
+        try {
+            threadingStrategy.executeWrite(program, "Batch set function prototype", () -> {
+                SymbolTable symTable = program.getSymbolTable();
+
+                for (Map<String, String> entry : assignments) {
+                    if (entry == null) {
+                        errors.add(JsonHelper.mapOf("key", "(null)", "reason", "null assignment entry"));
+                        continue;
+                    }
+                    String addrStr = entry.get("address");
+                    String prototype = entry.get("prototype");
+                    String callingConvention = entry.get("calling_convention");
+                    String name = entry.get("name");
+                    String key = addrStr != null ? addrStr : "(no address)";
+
+                    if (addrStr == null || addrStr.trim().isEmpty()) {
+                        errors.add(JsonHelper.mapOf("key", key, "reason", "missing 'address'"));
+                        continue;
+                    }
+                    if (prototype == null || prototype.trim().isEmpty()) {
+                        errors.add(JsonHelper.mapOf("key", key, "reason", "missing 'prototype'"));
+                        continue;
+                    }
+
+                    // Resolve the function; a bad address/missing function fails just this entry.
+                    Address addr = ServiceUtils.parseAddress(program, addrStr.trim());
+                    if (addr == null) {
+                        errors.add(JsonHelper.mapOf("key", key,
+                                "reason", "bad address '" + addrStr + "': " + ServiceUtils.getLastParseError()));
+                        continue;
+                    }
+                    Function func = ServiceUtils.getFunctionForAddress(program, addr);
+                    if (func == null) {
+                        errors.add(JsonHelper.mapOf("key", key, "reason", "no function at " + addrStr));
+                        continue;
+                    }
+
+                    // Extract any inline calling convention from the prototype string (mirrors the
+                    // single tool), so e.g. "void __thiscall f(...)" works without a separate field.
+                    String cleanPrototype = prototype;
+                    String resolvedConvention = callingConvention;
+                    String[] knownConventions = {"__cdecl", "__stdcall", "__thiscall", "__fastcall", "__vectorcall"};
+                    for (String cc : knownConventions) {
+                        if (cleanPrototype.contains(cc)) {
+                            cleanPrototype = cleanPrototype.replace(cc, "").replaceAll("\\s+", " ").trim();
+                            if (resolvedConvention == null || resolvedConvention.isEmpty()) {
+                                resolvedConvention = cc;
+                            }
+                            break;
+                        }
+                    }
+
+                    // Apply the prototype (+ convention) via the shared transaction-free core.
+                    // Per-entry try/catch — a failure here is recorded and never aborts the batch.
+                    PrototypeApplyResult res;
+                    try {
+                        StringBuilder entryWarnings = new StringBuilder();
+                        res = applyPrototypeToFunction(program, addr, func, cleanPrototype,
+                                resolvedConvention, entryWarnings);
+                    } catch (Exception ex) {
+                        res = PrototypeApplyResult.fail(ex.getMessage() != null ? ex.getMessage() : ex.toString());
+                    }
+                    if (!res.ok) {
+                        errors.add(JsonHelper.mapOf("key", key, "reason", res.reason));
+                        continue;
+                    }
+                    applied.incrementAndGet();
+
+                    // Optional rename. Uses the same mechanism rename_function_by_address uses:
+                    // setNameAndNamespace for a Namespace::Name path, else setName. A rename failure
+                    // is recorded but the prototype was already applied (still counts as applied).
+                    if (name != null && !name.trim().isEmpty()) {
+                        String newName = name.trim();
+                        try {
+                            int sep = newName.lastIndexOf("::");
+                            if (sep >= 0) {
+                                String nsPath = newName.substring(0, sep);
+                                String bare = newName.substring(sep + 2);
+                                Namespace ns = program.getGlobalNamespace();
+                                for (String part : nsPath.split("::")) {
+                                    if (part.isEmpty()) continue;
+                                    Namespace child = symTable.getNamespace(part, ns);
+                                    if (child == null) {
+                                        child = symTable.createNameSpace(ns, part, SourceType.USER_DEFINED);
+                                    }
+                                    ns = child;
+                                }
+                                func.getSymbol().setNameAndNamespace(bare, ns, SourceType.USER_DEFINED);
+                            } else {
+                                func.setName(newName, SourceType.USER_DEFINED);
+                            }
+                            renamed.incrementAndGet();
+                        } catch (Exception ex) {
+                            errors.add(JsonHelper.mapOf("key", key,
+                                    "reason", "prototype applied but rename to '" + newName + "' failed: "
+                                            + (ex.getMessage() != null ? ex.getMessage() : ex.toString())));
+                        }
+                    }
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            fatal.set(e.getMessage() != null ? e.getMessage() : e.toString());
+        }
+
+        if (fatal.get() != null) {
+            return Response.err("batch_set_function_prototype failed: " + fatal.get());
+        }
+
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("applied", applied.get());
+        summary.put("renamed", renamed.get());
+        summary.put("errors", errors);
+        return Response.ok(summary);
+    }
+
     /**
      * Alias for {@link #setLocalVariableType} — name matches Ghidra UI "Retype Variable".
      */
@@ -2274,10 +2810,24 @@ public class FunctionService {
         if (normalized.isEmpty()) {
             return null;
         }
-        if (!normalized.contains("*")) {
-            normalized = normalized + " *";
+        // Resolve the BASE type first, then build the pointer. Passing a full category path
+        // WITH a pointer suffix (e.g. "/Ni/NiObjectNET *") to the data-type parser throws
+        // "Paths must have non-empty elements" — so strip the '*' and resolve the base by
+        // path/name, then pointer it via the DTM.
+        int star = normalized.indexOf('*');
+        String basePart = (star >= 0 ? normalized.substring(0, star) : normalized).trim();
+        if (basePart.isEmpty()) {
+            return null;
         }
-        return ServiceUtils.resolveDataType(dtm, normalized);
+        DataType base = ServiceUtils.resolveDataType(dtm, basePart);
+        if (base == null) {
+            // Fall back to an exact category-path lookup (e.g. "/Ni/NiObjectNET").
+            base = dtm.getDataType(basePart);
+        }
+        if (base == null) {
+            return null;
+        }
+        return dtm.getPointer(base);
     }
 
     @McpTool(path = "/list_class_members", method = "GET",

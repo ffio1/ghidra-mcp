@@ -1,7 +1,7 @@
 {
   "version": "5.13.1",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 279,
+  "total_endpoints": 281,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -368,6 +368,26 @@
         "program"
       ],
       "description": "Set multiple comments"
+    },
+    {
+      "path": "/batch_set_function_prototype",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "assignments",
+        "program"
+      ],
+      "description": "Bulk-apply full C function prototypes (return type + params + optional calling convention), and optionally rename, to many functions in one call/transaction. 'assignments' is a JSON array of {address, prototype, calling_convention?, name?} entries: 'prototype' is a full C signature, the name inside it is parse-only; set 'name' (plain or Namespace::Name) to also rename; 'calling_convention' (e.g. __thiscall) is applied after the signature. Bad address / unparseable prototype / unapplicable convention is a per-entry error and does not abort the batch. Returns compact {applied, renamed, errors}."
+    },
+    {
+      "path": "/batch_set_function_this_type",
+      "method": "POST",
+      "category": "function",
+      "params": [
+        "assignments",
+        "program"
+      ],
+      "description": "Bulk-type the implicit 'this' of many member functions in one call/transaction. 'assignments' is a JSON array of {namespace|address, type} entries: 'namespace' types every function in that namespace/class, 'address' types one function; 'type' is a full category path (e.g. /Ni/NiObjectNET *). Skips statics / no-this / already-typed (counted as skipped); bad type or missing function is a per-entry error and does not abort the batch. Returns compact {typed, skipped, errors, perNamespace}."
     },
     {
       "path": "/batch_set_variable_types",
