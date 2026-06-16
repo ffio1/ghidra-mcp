@@ -826,6 +826,18 @@ public final class ServiceUtils {
             return wellKnown;
         }
 
+        // ZERO-B: A full category path (e.g. "/Ni/NiObjectNET") resolves exactly. Must run BEFORE the
+        // "/" + typeName builtin lookup below, which would otherwise build "//Ni/NiObjectNET" (an empty
+        // leading path element) and throw "Paths must have non-empty elements". Also disambiguates
+        // name collisions across categories.
+        if (typeName != null && typeName.startsWith("/")) {
+            DataType byPath = dtm.getDataType(typeName);
+            if (byPath != null) {
+                Msg.info(ServiceUtils.class, "Resolved by full category path: " + byPath.getPathName());
+                return byPath;
+            }
+        }
+
         // FIRST: Try Ghidra builtin types in root category
         DataType builtinType = dtm.getDataType("/" + typeName);
         if (builtinType != null) {
@@ -961,6 +973,18 @@ public final class ServiceUtils {
      * Find a data type by name in all categories/folders of the data type manager.
      */
     public static DataType findDataTypeByNameInAllCategories(DataTypeManager dtm, String typeName) {
+        if (typeName == null) {
+            return null;
+        }
+        // A full category path (e.g. "/Ni/NiObjectNET") resolves exactly — this disambiguates
+        // name collisions (multiple structs sharing a leaf name in different categories) and lets
+        // get_struct_layout / modify_struct_field / etc. accept the path form, not just the leaf.
+        if (typeName.startsWith("/")) {
+            DataType byPath = dtm.getDataType(typeName);
+            if (byPath != null) {
+                return byPath;
+            }
+        }
         DataType result = searchByNameInAllCategories(dtm, typeName);
         if (result != null) {
             return result;
