@@ -1161,6 +1161,41 @@ public class ProgramScriptService {
         return runGhidraScript(scriptPath, scriptArgs, (String) null);
     }
 
+    /**
+     * Exact program identity: case-insensitive match on the program's name, its
+     * DomainFile name, or its full project path. Used to enforce strict program
+     * targeting for script execution (the currentProgram-trap fix).
+     */
+    private static boolean matchesExactProgram(Program p, String req) {
+        if (p == null || req == null) return false;
+        if (p.getName().equalsIgnoreCase(req)) return true;
+        ghidra.framework.model.DomainFile df = p.getDomainFile();
+        if (df != null) {
+            if (df.getName().equalsIgnoreCase(req)) return true;
+            if (df.getPathname().equalsIgnoreCase(req)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Resolve a program by EXACT identity only: scan all open programs, then (if the
+     * provider can) open it from the project by exact name/path. Returns null when no
+     * exact match exists — callers fail loudly rather than substitute a different program.
+     */
+    private Program resolveStrictProgram(String req) {
+        Program[] open = programProvider.getAllOpenPrograms();
+        if (open != null) {
+            for (Program p : open) {
+                if (matchesExactProgram(p, req)) return p;
+            }
+        }
+        if (programProvider instanceof FrontEndProgramProvider fpp) {
+            Program opened = fpp.openFromProject(req);
+            if (opened != null && matchesExactProgram(opened, req)) return opened;
+        }
+        return null;
+    }
+
     // Removed from MCP schema — use run_ghidra_script instead (has output capture + timeout)
     public Response runGhidraScript(
             @Param(value = "script_path", source = ParamSource.BODY) String scriptPath,
@@ -1168,7 +1203,31 @@ public class ProgramScriptService {
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
-        Program program = pe.program();
+        Program resolvedProgram = pe.program();
+
+        // Strict program targeting (the currentProgram-trap fix). A script's currentProgram MUST be the
+        // program the operator named. getProgramOrError can fall through to a partial/active program when
+        // the requested one is not in the focused tool's live list (e.g. it was opened by-path by a prior
+        // script). For a SPECIFIC name (contains '.' or '/'), re-resolve EXACTLY or fail — never run a
+        // script against a different program. Short prefix selectors (no '.'/'/') keep the normal
+        // partial-match behavior (e.g. "Rocksmith2014" -> the dump build).
+        if (programName != null && !programName.trim().isEmpty()) {
+            String req = programName.trim();
+            boolean specific = req.indexOf('.') >= 0 || req.indexOf('/') >= 0;
+            if (specific && !matchesExactProgram(resolvedProgram, req)) {
+                Program strict = resolveStrictProgram(req);
+                if (strict != null) {
+                    resolvedProgram = strict;
+                } else {
+                    return Response.err("run_ghidra_script: requested program '" + req
+                        + "' did not resolve to an exact match (resolver returned '" + resolvedProgram.getName()
+                        + "'). Refusing to run a script against the wrong program — open it, or pass the exact name/project path.");
+                }
+            }
+        }
+
+        // Bind the resolved program to a final reference so the Swing lambda below can capture it.
+        final Program program = resolvedProgram;
 
         final StringBuilder resultMsg = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
